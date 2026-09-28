@@ -173,8 +173,27 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.version.outputs.tag }}
         run: gh api "repos/$env:GITHUB_REPOSITORY/git/refs" --method POST --field "ref=refs/tags/$env:RELEASE_TAG" --field "sha=$env:GITHUB_SHA"
-      - name: Publish prerelease
+      - name: Preserve manually promoted releases
         if: steps.ready.outputs.value == 'true'
+        id: release-state
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          $promoted = $false
+          try {
+            $release = Invoke-RestMethod `
+              -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" `
+              -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json' }
+            $promoted = (-not $release.draft) -and (-not $release.prerelease)
+          } catch {
+            if ([int]$_.Exception.Response.StatusCode -ne 404) { throw }
+          }
+          "promoted=$($promoted.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          if ($promoted) { Write-Host "Release was manually promoted; leaving it unchanged." }
+      - name: Publish prerelease
+        if: steps.ready.outputs.value == 'true' && steps.release-state.outputs.promoted != 'true'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.version.outputs.tag }}

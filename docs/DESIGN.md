@@ -134,11 +134,13 @@ manifest unless required to explain a failure.
   package for DEB/RPM/Flatpak/Snap and hand off installation to that package system;
   an AppImage may use a verified replace-after-exit flow. Never overwrite a managed
   package from inside the app or invoke a privileged package command silently.
-- Publish beta releases as GitHub prereleases. Stable publication is a separate,
-  explicit decision after Rin validates a real backup; the release workflow must
-  not silently promote a prerelease to stable. Keep the current `v0.1.N` tag
-  strategy, with `N` based on master commit position, during beta development and
-  revise it deliberately when defining the first stable version.
+- Once the release-ready gate is enabled, every successful master build publishes a
+  GitHub prerelease with validated assets. After Rin validates a real backup, Morgan
+  manually edits that same release to remove its prerelease designation; no new tag
+  or rebuild is needed. CI must never
+  promote automatically or downgrade a manually promoted release on rerun. Keep the
+  current `v0.1.N` tag strategy, with `N` based on master commit position, during
+  beta development and revise it deliberately when defining the first stable version.
 
 ## Architecture and toolchain
 
@@ -222,7 +224,8 @@ the initial baseline, and collector tests must maintain those targets.
    that commit's first-parent position on master, create the tag in CI, and serialize
    retries by commit SHA without replacing builds for other master commits;
    publish the Windows portable `.exe`, NSIS setup installer, and Linux assets as a
-   GitHub beta prerelease with generated notes and SHA-256 checksums. Never publish a
+   GitHub beta prerelease with generated notes and SHA-256 checksums. Morgan promotes
+   the validated release manually without changing its tag or assets. Never publish a
    release from the design-only foundation or without Windows and Linux smoke tests.
 
 ## Acceptance checks

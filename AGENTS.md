@@ -17,10 +17,11 @@ Before a code PR, run `make lint` and `make test`. On Windows, also smoke-test t
 one-file executable when the packaging target exists. Keep README and design docs
 current with user-facing changes.
 
-Releases are beta prereleases until Rin has validated a real diagnostic backup and
-Morgan explicitly chooses a stable release. CI must build and smoke-test the Windows
-portable executable, NSIS installer, and all required Linux packages before tagging
-or publishing. Do not add
+Successful master builds publish beta prereleases. Morgan promotes a validated
+prerelease to a full release manually using the same tag and assets. CI must never
+promote a release or downgrade one back to prerelease on rerun. CI must build and
+smoke-test the Windows portable executable, NSIS installer, and all required Linux
+packages before tagging or publishing. Do not add
 `build/release-ready` until that multi-platform workflow is complete.
 
 PRs require `Lint & Test`, `codecov/project`, and `codecov/patch`. Keep pytest-cov's

@@ -16,6 +16,9 @@ deliberately committed.
 Once releases are enabled, prerelease tags use the master commit position
 (`v0.1.<position minus one>`) so each released merge has a stable tag even when
 builds overlap or are retried.
+Every successful master build publishes a prerelease. After testing and validating
+its assets, Morgan promotes that same GitHub release to a full release manually;
+CI never promotes it and reruns leave a promoted release unchanged.
 
 `make test` writes `coverage.xml` and `junit.xml`; CI preserves both reports and
 uploads coverage and test results to Codecov. Ruff and mypy are the lint checks;

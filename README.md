@@ -11,7 +11,8 @@ adds `build/TempestTrace.spec` and a `--smoke-test` entry point, master merges w
 build and publish a one-file Windows prerelease. Prerelease tags use the master
 commit position (`v0.1.<position minus one>`), so every merge has a stable tag even
 when builds overlap or are retried; version numbers can have gaps before the first
-executable is ready.
+executable is ready. CI serializes retries of one commit but lets different master
+commits build independently.
 
 ## Intended use
 

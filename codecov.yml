@@ -1,0 +1,17 @@
+coverage:
+  status:
+    project:
+      default:
+        target: 80%
+        informational: true  # Design-stage scaffold; enforce after collector tests exist.
+    patch:
+      default:
+        target: 80%
+        informational: true
+
+comment:
+  layout: "reach, diff, flags, files"
+  require_changes: true
+
+ignore:
+  - "tests/**"

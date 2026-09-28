@@ -15,4 +15,4 @@ lintfix:
 	$(PYTHON) -m ruff format src/ scripts/ tests/
 
 test:
-	$(PYTHON) -m pytest tests/
+	$(PYTHON) -m pytest tests/ --cov=src/tempesttrace --cov=scripts --cov-report=term-missing --cov-report=xml:coverage.xml --junitxml=junit.xml

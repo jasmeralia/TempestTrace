@@ -10,9 +10,10 @@ Morgan can inspect. Provide the same collection and redaction behavior on native
 Linux desktops. The result is a single timestamped ZIP file
 under `Dropbox/Jasmeralia and Rin/obs logs/`, produced by the app with no
 command-line step or manual archiving. Collect OBS profiles, scene collections, and
-relevant logs. Keep diagnostic settings
-and Streamlabs source settings intact in the output. Remove credentials such as stream
-keys from the output. Never modify OBS's own files or interrupt an active stream.
+relevant logs. Keep diagnostic settings and Streamlabs source settings intact in the
+output, except for values that match a known credential pattern (such as stream
+keys), which are redacted in place. Never modify OBS's own files or interrupt an
+active stream.
 
 The first release targets Windows 10/11 x64 and native Linux amd64/arm64. Support
 standard OBS Studio installations on both systems and OBS Flatpak on Linux. Portable

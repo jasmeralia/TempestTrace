@@ -5,9 +5,9 @@ Status: design; implementation has not started. Source task: Odoo project.task 5
 
 ## Goal and boundaries
 
-Give Rin a single Windows `.exe` they can launch by double-clicking to create an OBS
-diagnostic backup that Morgan can inspect. Provide the same collection and redaction
-behavior on native Linux desktops. The result is a normal timestamped folder
+Give Rin a Windows NSIS installer for an app that creates an OBS diagnostic backup
+Morgan can inspect. Provide the same collection and redaction behavior on native
+Linux desktops. The result is a normal timestamped folder
 under `Dropbox/Jasmeralia and Rin/obs logs/`, with no ZIP and no command-line step.
 Collect OBS profiles, scene collections, and relevant logs. Keep diagnostic settings
 and Streamlabs source settings intact in the output. Remove credentials such as stream
@@ -30,6 +30,12 @@ outside the first release.
    and `~/.var/app/com.obsproject.Studio/config/obs-studio` for OBS Flatpak, and
    resolves Dropbox from
    `~/.dropbox/info.json`. If multiple OBS trees are found, the user chooses one.
+   When TempestTrace itself runs as a Flatpak, its `$XDG_CONFIG_HOME` points to
+   TempestTrace's sandbox, not the host OBS directory. Resolve native OBS from the
+   host XDG config path (`$HOST_XDG_CONFIG_HOME` when present, otherwise the host
+   default), and resolve OBS Flatpak from its separate app data path. Do not mistake
+   TempestTrace's own configuration for OBS. A folder picker handles nonstandard OBS
+   locations after the sandbox grants access.
    It proposes `Jasmeralia and Rin/obs logs` beneath the selected Dropbox root.
    If either path cannot be resolved or the destination is not writable, show a
    clear error and a folder picker; never silently choose a different destination.
@@ -68,8 +74,10 @@ identifies `%APPDATA%\obs-studio` as the settings folder, and [its log guidance]
 identifies the `logs` subfolder. [Dropbox documents](https://help.dropbox.com/installs/locate-dropbox-folder)
 the `info.json` discovery paths above. [OBS's Linux config handling](https://github.com/obsproject/obs-studio/issues/10450)
 uses `XDG_CONFIG_HOME`, and [OBS's Flatpak example](https://github.com/obsproject/obs-studio/issues/13635)
-shows the separate Flatpak scene directory. Confirm all candidate paths on real
-Windows and Linux installations before shipping.
+shows the separate Flatpak scene directory.
+[Flatpak's XDG conventions](https://docs.flatpak.org/en/latest/conventions.html)
+explain the app-specific sandbox path and host XDG variables. Confirm all candidate
+paths on real Windows and Linux installations before shipping.
 
 ## Redaction contract
 
@@ -123,17 +131,27 @@ manifest unless required to explain a failure.
   reject missing, mismatched, or wrong-platform assets before launch. Keep the
   current version usable if download or application fails. Never put OBS data or
   credentials in update requests or update logs.
-- On Windows, distinguish portable and installed copies. After user confirmation,
-  an installed copy downloads and verifies the NSIS setup asset, waits for
-  TempestTrace to exit, then launches the installer detached. A portable copy uses a
-  detached helper to replace its one-file executable after exit, with rollback
-  available. If the portable location is not writable, offer the verified new
-  executable in Downloads with clear instructions. Updating TempestTrace never
+- On Windows, download and verify the NSIS setup asset after user confirmation,
+  wait for TempestTrace to exit, then launch the installer detached. Keep the
+  installed version usable if the new install fails. Updating TempestTrace never
   closes or restarts OBS.
 - On Linux, check automatically on the same schedule. Offer the matching GitHub
   package for DEB/RPM/Flatpak/Snap and hand off installation to that package system;
-  an AppImage may use a verified replace-after-exit flow. Never overwrite a managed
-  package from inside the app or invoke a privileged package command silently.
+  an AppImage may use a verified replace-after-exit flow with rollback. Detect the
+  installed package type rather than offering a different format as an in-place
+  update. These are GitHub-sideloaded packages, so no distribution repository,
+  Flatpak remote, or Snap Store channel supplies updates in the first release.
+  Automatic **checks** therefore use GitHub Releases for every format. Show the
+  verified local package and the appropriate user-approved package-manager action;
+  do not claim that `apt`, `dnf`, `flatpak update`, or Snap refresh will discover a
+  future GitHub asset on its own. For Flatpak, update the installed app from a new
+  local bundle and retain the app data; for Snap, document the required local-install
+  trust mode and confinement. Never overwrite a managed package from inside the app
+  or invoke a privileged package command silently.
+  [Flatpak's single-file bundle guide](https://docs.flatpak.org/en/latest/single-file-bundles.html)
+  distinguishes bundles from updateable remotes, and
+  [Snap's install-mode guide](https://snapcraft.io/docs/explanation/snap-development/install-modes/)
+  documents the trust and confinement flags for local snaps.
 - Once the release-ready gate is enabled, every successful master build publishes a
   GitHub prerelease with validated assets. After Rin validates a real backup, Morgan
   manually edits that same release to remove its prerelease designation; no new tag
@@ -152,21 +170,29 @@ manifest unless required to explain a failure.
   checks), `snapshot` (read-only copies and consistency), `redaction` (JSON, INI, log
   rules), `verify` (output scan and manifest), `ui` (one-window flow), and `jobs`
   (Qt worker and cancellation).
-- Use PyInstaller `--onefile --windowed` to produce one directly launchable Windows
-  `.exe`, then package it in a per-user NSIS installer with Start Menu and uninstall
-  entries. Publish both assets so Rin can run the portable `.exe` without an installer
-  or choose setup. NSIS must leave OBS, Dropbox, and diagnostic output untouched on
+- Use PyInstaller `--onefile --windowed` to build the executable bundled in a
+  per-user NSIS installer with Start Menu and uninstall entries. Publish the
+  installer as the Windows release asset; keep the bare executable as an internal
+  build input. NSIS must leave OBS, Dropbox, and diagnostic output untouched on
   uninstall. Build sideloadable DEB, RPM, AppImage, Flatpak, and Snap assets for Linux
-  amd64 and arm64, following the sibling repos' packaging conventions. The Linux
-  packages must grant or request access to OBS's
-  config tree and the chosen Dropbox folder; test Flatpak portals and Snap filesystem
-  access rather than assuming sandbox access. State each package's glibc/runtime
-  floor and architecture in release notes. No FFmpeg dependency is needed.
+  amd64 and arm64, following the sibling repos' packaging conventions. Use
+  `tempesttrace` as the DEB/RPM/Snap package name and `io.github.jasmeralia.TempestTrace`
+  as the Flatpak and desktop app ID; all formats need a launcher, icon, version, and
+  architecture. Installed formats need clean uninstall behavior; the AppImage must
+  launch without installation. Pin each format's runtime/base and state its tested
+  distribution and glibc floor in release notes. The Linux
+  packages must grant or request access to OBS's config tree and the chosen Dropbox
+  folder; test Flatpak portals and Snap filesystem access rather than assuming sandbox
+  access. No FFmpeg dependency is needed.
 - Run a Windows smoke test of the built `.exe`, including launch from Explorer and
   a synthetic OBS/Dropbox fixture. Silently install the NSIS asset in CI, smoke-test
   the installed executable, uninstall, and verify removal of installed files.
-  Smoke-test each Linux package on native Linux; test native and Flatpak OBS path
-  discovery and a relocated Dropbox folder.
+  Smoke-test install, launch, fixture collection, and uninstall or replacement of
+  each Linux package on native Linux for both architectures. Test native and Flatpak
+  OBS path discovery, a relocated Dropbox folder, sandbox permissions, and an update
+  from an older GitHub-sideloaded package of the same format. Include a matrix for
+  native TempestTrace with native/Flatpak OBS and Flatpak TempestTrace with
+  native/Flatpak OBS, since the app sandbox changes XDG path resolution.
 - Use `ruff check`, `ruff format --check`, `mypy --strict`, and `pytest` as the lint
   and test gate. Follow the Makefile entry points and GitHub Actions conventions from
   StormFuse and GaleFling. Add targeted redaction and no-source-write tests before
@@ -211,26 +237,28 @@ the initial baseline, and collector tests must maintain those targets.
    of non-secret settings and Streamlabs subtrees, plus rejection of unhandled
    secrets, parse failures, and secrets in all user-visible reports.
 4. **GUI and packaging:** a single clear window, accessible progress/cancellation,
-   completion actions, a Windows one-file build and NSIS installer, and native Linux
-   packages. Test while OBS is running and streaming; confirm no source writes,
-   restarts, or stream interruption on both platforms.
+   completion actions, a Windows one-file build bundled into an NSIS installer,
+   and native Linux packages. Test while OBS is running and streaming; confirm no
+   source writes, restarts, or stream interruption on both platforms.
 5. **Updates and beta channel:** write failing tests for release selection, channel
    preference, checksum validation, interrupted downloads, update rollback, and
    platform-specific application before implementing the updater and UI.
 6. **Release:** expand the current Windows-only workflow to build and smoke-test all
    required Linux assets before adding the `build/release-ready` marker and enabling
-   publication. After CI passes on a master
-   merge, derive a stable version tag from
-   that commit's first-parent position on master, create the tag in CI, and serialize
+   publication. A final release job must depend on successful Windows and every Linux
+   package/architecture job, verify the complete asset matrix and checksums, and only
+   then create the tag and publish assets. A failed or missing package job must leave
+   no partial release. After CI passes on a master merge, derive a stable version tag
+   from that commit's first-parent position on master, create the tag in CI, and serialize
    retries by commit SHA without replacing builds for other master commits;
-   publish the Windows portable `.exe`, NSIS setup installer, and Linux assets as a
+   publish the Windows NSIS setup installer and Linux assets as a
    GitHub beta prerelease with generated notes and SHA-256 checksums. Morgan promotes
    the validated release manually without changing its tag or assets. Never publish a
    release from the design-only foundation or without Windows and Linux smoke tests.
 
 ## Acceptance checks
 
-- Rin can double-click the portable `.exe` or use the NSIS installer, choose/confirm
+- Rin can install the NSIS package, launch the app, choose/confirm
   the Dropbox location, and finish without extracting a ZIP or opening a terminal.
 - The Windows installer supports a clean per-user install, launches the installed app,
   uninstalls only its own files, and never changes OBS, Dropbox, or backup outputs.
@@ -242,6 +270,9 @@ the initial baseline, and collector tests must maintain those targets.
 - The original OBS tree is byte-for-byte unchanged; the app never terminates OBS.
 - Native Linux and Windows produce equivalent sanitized output; Linux packages work
   on both architectures and with native or Flatpak OBS configuration locations.
+- Every Linux format launches from a desktop entry or AppImage entry point, accesses
+  the chosen OBS and Dropbox folders, and supports a verified, user-approved update
+  from a prior GitHub-sideloaded release of the same format.
 - Startup and manual update checks honor stable/beta preferences, verify downloads,
   and leave the installed version usable after an update failure.
 - Each testable behavior has a test written before its implementation; PR CI and all required

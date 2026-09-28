@@ -19,7 +19,8 @@ current with user-facing changes.
 
 Releases are beta prereleases until Rin has validated a real diagnostic backup and
 Morgan explicitly chooses a stable release. CI must build and smoke-test the Windows
-executable and all required Linux packages before tagging or publishing. Do not add
+portable executable, NSIS installer, and all required Linux packages before tagging
+or publishing. Do not add
 `build/release-ready` until that multi-platform workflow is complete.
 
 PRs require `Lint & Test`, `codecov/project`, and `codecov/patch`. Keep pytest-cov's

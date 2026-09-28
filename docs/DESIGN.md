@@ -123,10 +123,11 @@ manifest unless required to explain a failure.
   reject missing, mismatched, or wrong-platform assets before launch. Keep the
   current version usable if download or application fails. Never put OBS data or
   credentials in update requests or update logs.
-- On Windows, the one-file executable cannot replace itself while running. After
-  user confirmation, a detached updater waits for TempestTrace to exit, replaces the
-  old executable in a writable location with rollback available, and launches the
-  new version. If the original location is not writable, offer the verified new
+- On Windows, distinguish portable and installed copies. After user confirmation,
+  an installed copy downloads and verifies the NSIS setup asset, waits for
+  TempestTrace to exit, then launches the installer detached. A portable copy uses a
+  detached helper to replace its one-file executable after exit, with rollback
+  available. If the portable location is not writable, offer the verified new
   executable in Downloads with clear instructions. Updating TempestTrace never
   closes or restarts OBS.
 - On Linux, check automatically on the same schedule. Offer the matching GitHub
@@ -150,15 +151,20 @@ manifest unless required to explain a failure.
   rules), `verify` (output scan and manifest), `ui` (one-window flow), and `jobs`
   (Qt worker and cancellation).
 - Use PyInstaller `--onefile --windowed` to produce one directly launchable Windows
-  `.exe`; no archive or installer step for Rin. Build sideloadable DEB, RPM, AppImage,
-  Flatpak, and Snap assets for Linux amd64 and arm64, following the sibling repos'
-  packaging conventions. The Linux packages must grant or request access to OBS's
+  `.exe`, then package it in a per-user NSIS installer with Start Menu and uninstall
+  entries. Publish both assets so Rin can run the portable `.exe` without an installer
+  or choose setup. NSIS must leave OBS, Dropbox, and diagnostic output untouched on
+  uninstall. Build sideloadable DEB, RPM, AppImage, Flatpak, and Snap assets for Linux
+  amd64 and arm64, following the sibling repos' packaging conventions. The Linux
+  packages must grant or request access to OBS's
   config tree and the chosen Dropbox folder; test Flatpak portals and Snap filesystem
   access rather than assuming sandbox access. State each package's glibc/runtime
   floor and architecture in release notes. No FFmpeg dependency is needed.
 - Run a Windows smoke test of the built `.exe`, including launch from Explorer and
-  a synthetic OBS/Dropbox fixture. Smoke-test each Linux package on native Linux;
-  test native and Flatpak OBS path discovery and a relocated Dropbox folder.
+  a synthetic OBS/Dropbox fixture. Silently install the NSIS asset in CI, smoke-test
+  the installed executable, uninstall, and verify removal of installed files.
+  Smoke-test each Linux package on native Linux; test native and Flatpak OBS path
+  discovery and a relocated Dropbox folder.
 - Use `ruff check`, `ruff format --check`, `mypy --strict`, and `pytest` as the lint
   and test gate. Follow the Makefile entry points and GitHub Actions conventions from
   StormFuse and GaleFling. Add targeted redaction and no-source-write tests before
@@ -203,9 +209,9 @@ the initial baseline, and collector tests must maintain those targets.
    of non-secret settings and Streamlabs subtrees, plus rejection of unhandled
    secrets, parse failures, and secrets in all user-visible reports.
 4. **GUI and packaging:** a single clear window, accessible progress/cancellation,
-   completion actions, a Windows one-file build, and native Linux packages. Test
-   while OBS is running and streaming; confirm no source writes, restarts, or stream
-   interruption on both platforms.
+   completion actions, a Windows one-file build and NSIS installer, and native Linux
+   packages. Test while OBS is running and streaming; confirm no source writes,
+   restarts, or stream interruption on both platforms.
 5. **Updates and beta channel:** write failing tests for release selection, channel
    preference, checksum validation, interrupted downloads, update rollback, and
    platform-specific application before implementing the updater and UI.
@@ -215,14 +221,16 @@ the initial baseline, and collector tests must maintain those targets.
    merge, derive a stable version tag from
    that commit's first-parent position on master, create the tag in CI, and serialize
    retries by commit SHA without replacing builds for other master commits;
-   publish the Windows `.exe` and Linux assets as a GitHub beta prerelease with
-   generated notes and SHA-256 checksums. Never publish a release from the
-   design-only foundation or without Windows and Linux smoke tests.
+   publish the Windows portable `.exe`, NSIS setup installer, and Linux assets as a
+   GitHub beta prerelease with generated notes and SHA-256 checksums. Never publish a
+   release from the design-only foundation or without Windows and Linux smoke tests.
 
 ## Acceptance checks
 
-- Rin can double-click the `.exe`, choose/confirm the Dropbox location, and finish
-  without extracting a ZIP or opening a terminal.
+- Rin can double-click the portable `.exe` or use the NSIS installer, choose/confirm
+  the Dropbox location, and finish without extracting a ZIP or opening a terminal.
+- The Windows installer supports a clean per-user install, launches the installed app,
+  uninstalls only its own files, and never changes OBS, Dropbox, or backup outputs.
 - A completed output has profiles, scene collections, relevant logs, `README.txt`,
   and `manifest.json` in an ordinary folder.
 - Synthetic stream keys, bearer tokens, and passwords are absent from every output

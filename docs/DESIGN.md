@@ -181,8 +181,9 @@ PR CI must run lint and the complete synthetic test suite. Packaging jobs must r
 their platform smoke tests before publication. Manual release testing still covers
 the active-stream case and nontechnical GUI flow, which fixture tests cannot prove.
 `make test` must emit `coverage.xml` with pytest-cov and `junit.xml` with pytest;
-CI uploads both to Codecov using GitHub OIDC and stores the reports as an Actions
-artifact. Codecov enforces 80% project and patch targets; master requires both
+CI uploads both to Codecov using GitHub OIDC for trusted runs and tokenless uploads
+for public fork PRs, then stores the reports as an Actions artifact. Codecov enforces
+80% project and patch targets; master requires both
 Codecov checks alongside `Lint & Test`. Synthetic release-script tests establish
 the initial baseline, and collector tests must maintain those targets.
 

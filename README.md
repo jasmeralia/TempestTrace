@@ -6,7 +6,13 @@ diagnostic backup for troubleshooting Rin's screen flicker issue.
 The [design and implementation plan](docs/DESIGN.md) defines the collection scope,
 redaction rules, user flow, tests, and release criteria. The collector and executable
 have not been implemented yet; this repository currently contains the plan and
-project setup.
+project setup. CI runs lint and tests on PRs and master; after a future implementation
+adds `build/TempestTrace.spec` and a `--smoke-test` entry point, master merges will
+build and publish a one-file Windows prerelease. Prerelease tags use the master
+commit position (`v0.1.<position minus one>`), so every merge has a stable tag even
+when builds overlap or are retried; version numbers can have gaps before the first
+executable is ready. CI serializes retries of one commit but lets different master
+commits build independently.
 
 ## Intended use
 

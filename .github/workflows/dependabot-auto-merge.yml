@@ -22,5 +22,5 @@ jobs:
       - name: Enable auto-merge
         run: gh pr merge --auto --squash "${{ github.event.pull_request.html_url }}"
         env:
-          # A user PAT is required so the merge starts the master release workflow.
+          # A dedicated Dependabot secret is required so the merge starts master CI.
           GH_TOKEN: ${{ secrets.DEPENDABOT_MERGE_TOKEN }}

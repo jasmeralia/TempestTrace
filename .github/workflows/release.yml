@@ -47,10 +47,11 @@ jobs:
             junit.xml
           if-no-files-found: warn
       - name: Upload coverage to Codecov
-        if: success()
+        if: ${{ !cancelled() && hashFiles('coverage.xml') != '' }}
         uses: codecov/codecov-action@v7
         with:
-          use_oidc: true
+          # Fork PRs use Codecov's tokenless public-repository upload path.
+          use_oidc: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
           files: coverage.xml
           flags: unittests
           fail_ci_if_error: true
@@ -58,7 +59,7 @@ jobs:
         if: ${{ !cancelled() && hashFiles('junit.xml') != '' }}
         uses: codecov/codecov-action@v7
         with:
-          use_oidc: true
+          use_oidc: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
           files: junit.xml
           report_type: test_results
           fail_ci_if_error: true

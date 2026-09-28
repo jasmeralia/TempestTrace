@@ -24,4 +24,6 @@ executable and all required Linux packages before tagging or publishing. Do not 
 
 PRs require `Lint & Test`, `codecov/project`, and `codecov/patch`. Keep pytest-cov's
 `coverage.xml` and pytest's `junit.xml` uploads working. Dependabot auto-merge uses
-the dedicated `DEPENDABOT_MERGE_TOKEN` secret so its master merge triggers release CI.
+the dedicated `DEPENDABOT_MERGE_TOKEN` Dependabot secret so its master merge triggers
+release CI. Configure it in Settings → Secrets and variables → Dependabot; an Actions
+secret is not exposed to Dependabot-triggered workflows.

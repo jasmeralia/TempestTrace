@@ -1,0 +1,6 @@
+-e .
+ruff>=0.13
+mypy>=1.18
+pytest>=8.4
+pytest-cov>=6.3
+pyinstaller>=6.15

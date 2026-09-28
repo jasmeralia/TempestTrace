@@ -21,3 +21,7 @@ Releases are beta prereleases until Rin has validated a real diagnostic backup a
 Morgan explicitly chooses a stable release. CI must build and smoke-test the Windows
 executable and all required Linux packages before tagging or publishing. Do not add
 `build/release-ready` until that multi-platform workflow is complete.
+
+PRs require `Lint & Test`, `codecov/project`, and `codecov/patch`. Keep pytest-cov's
+`coverage.xml` and pytest's `junit.xml` uploads working. Dependabot auto-merge uses
+the dedicated `DEPENDABOT_MERGE_TOKEN` secret so its master merge triggers release CI.

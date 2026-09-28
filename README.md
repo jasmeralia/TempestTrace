@@ -16,7 +16,9 @@ tag even when builds overlap or are retried.
 
 `make test` writes `coverage.xml` and `junit.xml`; CI preserves both reports and
 uploads coverage and test results to Codecov. Ruff and mypy are the lint checks;
-pytest runs the tests.
+pytest runs the tests. Master requires green `Lint & Test`, `codecov/project`, and
+`codecov/patch` checks. Dependabot PRs are set to squash auto-merge after those
+checks pass and review conversations are resolved.
 
 ## Intended use
 

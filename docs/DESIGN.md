@@ -182,9 +182,9 @@ their platform smoke tests before publication. Manual release testing still cove
 the active-stream case and nontechnical GUI flow, which fixture tests cannot prove.
 `make test` must emit `coverage.xml` with pytest-cov and `junit.xml` with pytest;
 CI uploads both to Codecov using GitHub OIDC and stores the reports as an Actions
-artifact. Codecov's 80% project and patch targets remain informational while the
-repo contains only scaffolding; make them required after collector tests establish
-a meaningful baseline and add the resulting checks to master protection.
+artifact. Codecov enforces 80% project and patch targets; master requires both
+Codecov checks alongside `Lint & Test`. Synthetic release-script tests establish
+the initial baseline, and collector tests must maintain those targets.
 
 ## Delivery stages
 
@@ -192,6 +192,8 @@ a meaningful baseline and add the resulting checks to master protection.
    Dependabot for pip and GitHub Actions, CODEOWNERS, PR CI, branch protection,
    automatic Copilot review, and required conversation resolution. Configure
    vulnerability alerts and verify `git-activity-monitor` covers the new repo.
+   Enable Dependabot squash auto-merge with a dedicated token that triggers master
+   CI, and require `codecov/project` and `codecov/patch` in branch protection.
 2. **Pure collector:** test-first path discovery for Windows, native Linux, and OBS
    Flatpak; allowlist, bounded file inventory, copy and manifest logic. Test on
    synthetic trees, including missing/relocated Dropbox, symlinks/reparse points,
@@ -233,7 +235,8 @@ a meaningful baseline and add the resulting checks to master protection.
 - Each testable behavior has a test written before its implementation; PR CI and all required
   platform smoke tests pass before a beta release is published.
 - PRs require green lint/test checks and resolved review threads; Copilot reviews
-  new PRs and new pushes; master rejects direct pushes and force pushes.
+  new PRs and new pushes; master rejects direct pushes and force pushes. Codecov
+  project and patch checks must pass; Dependabot PRs auto-merge after all gates pass.
 
 ## Decisions to validate during implementation
 

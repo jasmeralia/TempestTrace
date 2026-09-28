@@ -1,6 +1,7 @@
 ; Compile from the repository root after PyInstaller creates dist/TempestTrace.exe:
 ; makensis /DAPP_VERSION=v0.1.0 build/installer.nsi
 !include "MUI2.nsh"
+!include "LogicLib.nsh"
 
 !ifndef APP_VERSION
   !error "Pass /DAPP_VERSION=<release tag> to makensis"
@@ -63,12 +64,38 @@ SectionEnd
 
 Function KillRunningTempestTrace
   DetailPrint "Closing any running TempestTrace processes before installing..."
-  ExecWait '"$SYSDIR\taskkill.exe" /IM "TempestTrace.exe" /F /T' $0
-  Sleep 1000
+  StrCpy $R0 0
+  kill_loop_install:
+    ExecWait '"$SYSDIR\taskkill.exe" /IM "TempestTrace.exe" /F /T' $0
+    Sleep 500
+    nsExec::ExecToStack 'cmd /C tasklist /FI "IMAGENAME eq TempestTrace.exe" /NH | findstr /I "TempestTrace.exe"'
+    Pop $1
+    ${If} $1 == 0
+      IntOp $R0 $R0 + 1
+      ${If} $R0 >= 5
+        MessageBox MB_ICONSTOP "TempestTrace is still running (taskkill exit code $0). Please close it manually and run the installer again."
+        Abort
+      ${EndIf}
+      Sleep 1000
+      Goto kill_loop_install
+    ${EndIf}
 FunctionEnd
 
 Function un.KillRunningTempestTrace
   DetailPrint "Closing any running TempestTrace processes before uninstalling..."
-  ExecWait '"$SYSDIR\taskkill.exe" /IM "TempestTrace.exe" /F /T' $0
-  Sleep 1000
+  StrCpy $R0 0
+  kill_loop_uninstall:
+    ExecWait '"$SYSDIR\taskkill.exe" /IM "TempestTrace.exe" /F /T' $0
+    Sleep 500
+    nsExec::ExecToStack 'cmd /C tasklist /FI "IMAGENAME eq TempestTrace.exe" /NH | findstr /I "TempestTrace.exe"'
+    Pop $1
+    ${If} $1 == 0
+      IntOp $R0 $R0 + 1
+      ${If} $R0 >= 5
+        MessageBox MB_ICONSTOP "TempestTrace is still running (taskkill exit code $0). Please close it manually and run the uninstaller again."
+        Abort
+      ${EndIf}
+      Sleep 1000
+      Goto kill_loop_uninstall
+    ${EndIf}
 FunctionEnd

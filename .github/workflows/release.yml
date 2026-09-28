@@ -19,6 +19,9 @@ jobs:
   lint-and-test:
     name: Lint & Test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -34,6 +37,32 @@ jobs:
         run: make lint
       - name: Test
         run: make test
+      - name: Preserve test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-reports
+          path: |
+            coverage.xml
+            junit.xml
+          if-no-files-found: warn
+      - name: Upload coverage to Codecov
+        if: ${{ !cancelled() && hashFiles('coverage.xml') != '' }}
+        uses: codecov/codecov-action@v7
+        with:
+          # Fork PRs use Codecov's tokenless public-repository upload path.
+          use_oidc: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          files: coverage.xml
+          flags: unittests
+          fail_ci_if_error: true
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() && hashFiles('junit.xml') != '' }}
+        uses: codecov/codecov-action@v7
+        with:
+          use_oidc: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          files: junit.xml
+          report_type: test_results
+          fail_ci_if_error: true
 
   windows-release:
     name: Build Windows prerelease
@@ -50,10 +79,11 @@ jobs:
         id: ready
         shell: pwsh
         run: |
-          if (Test-Path build/TempestTrace.spec) {
+          # The marker is added only after Windows and Linux release jobs exist.
+          if ((Test-Path build/TempestTrace.spec) -and (Test-Path build/release-ready)) {
             "value=true" >> $env:GITHUB_OUTPUT
           } else {
-            Write-Host "Design-only repository: no executable or release is published."
+            Write-Host "Release pipeline incomplete: no executable or release is published."
             "value=false" >> $env:GITHUB_OUTPUT
           }
       - uses: actions/setup-python@v7

@@ -161,7 +161,7 @@ jobs:
         if: steps.ready.outputs.value == 'true'
         shell: pwsh
         run: |
-          $assets = @(Get-Item -LiteralPath 'dist/TempestTrace.exe', "dist/TempestTrace-Setup-${{ steps.version.outputs.tag }}.exe" -ErrorAction Stop)
+          $assets = @(Get-Item -LiteralPath "dist/TempestTrace-Setup-${{ steps.version.outputs.tag }}.exe" -ErrorAction Stop)
           foreach ($asset in $assets) {
             $hash = (Get-FileHash $asset.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
             "$hash  $($asset.Name)" | Set-Content "$($asset.FullName).sha256"
@@ -200,7 +200,5 @@ jobs:
           prerelease: true
           generate_release_notes: true
           files: |
-            dist/TempestTrace.exe
-            dist/TempestTrace.exe.sha256
             dist/TempestTrace-Setup-${{ steps.version.outputs.tag }}.exe
             dist/TempestTrace-Setup-${{ steps.version.outputs.tag }}.exe.sha256

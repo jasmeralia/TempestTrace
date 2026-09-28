@@ -9,7 +9,7 @@ have not been implemented yet; this repository currently contains the plan and
 project setup. The plan includes native Linux packages, automatic update checks, a
 user-approved update flow, beta-channel selection, and test-driven implementation.
 CI runs lint and tests on PRs and master. The gated Windows release scaffold is set
-up to build a portable `.exe` and an NSIS setup installer, then smoke-test the
+up to build an executable inside an NSIS setup installer, then smoke-test the
 installer and installed app. It will not publish until the application and Linux
 build and smoke-test jobs are added, and the `build/release-ready` marker is
 deliberately committed.
@@ -33,8 +33,8 @@ The workflow uses this token so Dependabot merges trigger the master release CI.
 
 ## Intended use
 
-Rin can double-click the standalone Windows executable or install the NSIS setup
-package, then review the proposed output location and start a read-only collection.
+Rin can install the NSIS setup package and launch TempestTrace, then review the
+proposed output location and start a read-only collection.
 Linux users will use native packages with the same collection and redaction behavior.
 A successful run will leave a normal, timestamped folder under
 `Dropbox/Jasmeralia and Rin/obs logs/` with sanitized OBS

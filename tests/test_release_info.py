@@ -1,6 +1,6 @@
 """Tests for release tag selection."""
 
-from scripts.release_info import next_tag
+from scripts.release_info import next_tag, select_tag
 
 
 def test_first_tag_starts_prerelease_series() -> None:
@@ -13,3 +13,11 @@ def test_next_tag_uses_highest_semantic_version() -> None:
 
 def test_non_release_tags_are_ignored() -> None:
     assert next_tag(["v0.1.1-rc1", "v0.1.2", "draft", "v3.1"]) == "v0.1.3"
+
+
+def test_rerun_reuses_tag_on_current_commit() -> None:
+    assert select_tag(["v0.1.2"], ["v0.1.2"]) == ("v0.1.2", False)
+
+
+def test_new_commit_creates_next_tag() -> None:
+    assert select_tag([], ["v0.1.2"]) == ("v0.1.3", True)

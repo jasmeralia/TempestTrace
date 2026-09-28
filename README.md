@@ -6,7 +6,9 @@ diagnostic backup for troubleshooting Rin's screen flicker issue.
 The [design and implementation plan](docs/DESIGN.md) defines the collection scope,
 redaction rules, user flow, tests, and release criteria. The collector and executable
 have not been implemented yet; this repository currently contains the plan and
-project setup.
+project setup. CI runs lint and tests on PRs and master; after a future implementation
+adds `build/TempestTrace.spec` and a `--smoke-test` entry point, master merges will
+build and publish a one-file Windows prerelease.
 
 ## Intended use
 

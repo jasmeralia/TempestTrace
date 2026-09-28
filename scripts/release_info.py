@@ -23,27 +23,33 @@ def next_tag(tags: list[str]) -> str:
     return f"v{major}.{minor}.{patch + 1}"
 
 
+def select_tag(head_tags: list[str], all_tags: list[str]) -> tuple[str, bool]:
+    """Reuse a tag on rerun, or select a new tag for an untagged commit."""
+    release_tags = [tag for tag in head_tags if TAG_PATTERN.fullmatch(tag)]
+    if release_tags:
+        return max(release_tags, key=lambda tag: tuple(map(int, tag[1:].split(".")))), False
+    return next_tag(all_tags), True
+
+
 def main() -> None:
-    """Emit a release tag for the current untagged master commit."""
+    """Emit a release tag for the current master commit."""
     head_tags = subprocess.run(
         ["git", "tag", "--points-at", "HEAD"],
         check=True,
         capture_output=True,
         text=True,
     ).stdout.splitlines()
-    if any(TAG_PATTERN.fullmatch(tag) for tag in head_tags):
-        raise SystemExit("HEAD already has a release tag; refusing a duplicate release")
-
     tags = subprocess.run(
         ["git", "tag", "--list", "v*"],
         check=True,
         capture_output=True,
         text=True,
     ).stdout.splitlines()
-    tag = next_tag(tags)
+    tag, create_tag = select_tag(head_tags, tags)
     if output := os.environ.get("GITHUB_OUTPUT"):
         with Path(output).open("a", encoding="utf-8") as handle:
             handle.write(f"tag={tag}\n")
+            handle.write(f"create_tag={str(create_tag).lower()}\n")
     print(tag)
 
 

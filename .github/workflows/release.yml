@@ -10,6 +10,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   lint-and-test:
     name: Lint & Test
@@ -85,7 +89,7 @@ jobs:
           $hash = (Get-FileHash dist/TempestTrace.exe -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  TempestTrace.exe" | Set-Content dist/TempestTrace.exe.sha256
       - name: Create release tag
-        if: steps.ready.outputs.value == 'true'
+        if: steps.ready.outputs.value == 'true' && steps.version.outputs.create_tag == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}

@@ -1,0 +1,57 @@
+; Compile from the repository root after PyInstaller creates dist/TempestTrace.exe:
+; makensis /DAPP_VERSION=v0.1.0 build/installer.nsi
+!include "MUI2.nsh"
+
+!ifndef APP_VERSION
+  !error "Pass /DAPP_VERSION=<release tag> to makensis"
+!endif
+
+Unicode True
+Name "TempestTrace ${APP_VERSION}"
+OutFile "..\dist\TempestTrace-Setup-${APP_VERSION}.exe"
+InstallDir "$LOCALAPPDATA\Programs\TempestTrace"
+RequestExecutionLevel user
+SetCompressor /SOLID lzma
+
+!define MUI_ABORTWARNING
+!insertmacro MUI_PAGE_WELCOME
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_PAGE_FINISH
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+!insertmacro MUI_LANGUAGE "English"
+
+Section "TempestTrace" SecMain
+  SectionIn RO
+  SetOutPath "$INSTDIR"
+  File "..\dist\TempestTrace.exe"
+  File "..\LICENSE"
+  WriteUninstaller "$INSTDIR\Uninstall.exe"
+
+  CreateDirectory "$SMPROGRAMS\TempestTrace"
+  CreateShortCut "$SMPROGRAMS\TempestTrace\TempestTrace.lnk" "$INSTDIR\TempestTrace.exe"
+  CreateShortCut "$SMPROGRAMS\TempestTrace\Uninstall.lnk" "$INSTDIR\Uninstall.exe"
+
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TempestTrace" \
+    "DisplayName" "TempestTrace"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TempestTrace" \
+    "DisplayVersion" "${APP_VERSION}"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TempestTrace" \
+    "Publisher" "Morgan Blackthorne"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TempestTrace" \
+    "InstallLocation" "$INSTDIR"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TempestTrace" \
+    "UninstallString" '$\"$INSTDIR\Uninstall.exe$\"'
+SectionEnd
+
+Section "Uninstall"
+  Delete "$INSTDIR\TempestTrace.exe"
+  Delete "$INSTDIR\LICENSE"
+  Delete "$INSTDIR\Uninstall.exe"
+  RMDir "$INSTDIR"
+  Delete "$SMPROGRAMS\TempestTrace\TempestTrace.lnk"
+  Delete "$SMPROGRAMS\TempestTrace\Uninstall.lnk"
+  RMDir "$SMPROGRAMS\TempestTrace"
+  DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TempestTrace"
+SectionEnd

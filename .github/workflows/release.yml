@@ -80,7 +80,7 @@ jobs:
         shell: pwsh
         run: |
           # The marker is added only after Windows and Linux release jobs exist.
-          if ((Test-Path build/TempestTrace.spec) -and (Test-Path build/release-ready)) {
+          if ((Test-Path build/TempestTrace.spec) -and (Test-Path build/installer.nsi) -and (Test-Path build/release-ready)) {
             "value=true" >> $env:GITHUB_OUTPUT
           } else {
             Write-Host "Release pipeline incomplete: no executable or release is published."
@@ -113,12 +113,59 @@ jobs:
         id: version
         shell: pwsh
         run: python scripts/release_info.py
+      - name: Ensure NSIS
+        if: steps.ready.outputs.value == 'true'
+        shell: pwsh
+        run: |
+          $nsisX86 = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          $nsisX64 = "${env:ProgramFiles}\NSIS\makensis.exe"
+          if (-not ((Test-Path $nsisX86) -or (Test-Path $nsisX64))) {
+            choco install nsis -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "NSIS installation failed" }
+          }
+      - name: Build NSIS installer
+        if: steps.ready.outputs.value == 'true'
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          $nsis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          if (-not (Test-Path $nsis)) { $nsis = "${env:ProgramFiles}\NSIS\makensis.exe" }
+          if (-not (Test-Path $nsis)) { throw "makensis.exe not found" }
+          & $nsis "/DAPP_VERSION=$env:RELEASE_TAG" build/installer.nsi
+          if ($LASTEXITCODE -ne 0) { throw "NSIS installer build failed" }
+          if (-not (Test-Path "dist/TempestTrace-Setup-$env:RELEASE_TAG.exe")) {
+            throw "Missing NSIS installer"
+          }
+      - name: Smoke-test NSIS install and uninstall
+        if: steps.ready.outputs.value == 'true'
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          $installDir = Join-Path $env:RUNNER_TEMP 'TempestTrace-nsis-smoke'
+          $installer = (Resolve-Path "dist/TempestTrace-Setup-$env:RELEASE_TAG.exe").Path
+          $install = Start-Process -FilePath $installer -ArgumentList '/S', "/D=$installDir" -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "NSIS silent install failed" }
+          $app = Join-Path $installDir 'TempestTrace.exe'
+          if (-not (Test-Path $app)) { throw "Installed executable is missing" }
+          if (-not (Test-Path (Join-Path $installDir 'LICENSE'))) { throw "Installed license is missing" }
+          & $app --smoke-test
+          if ($LASTEXITCODE -ne 0) { throw "Installed executable smoke test failed" }
+          $uninstaller = Join-Path $installDir 'Uninstall.exe'
+          $uninstall = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "NSIS silent uninstall failed" }
+          if (Test-Path $app) { throw "Uninstall left the executable installed" }
+          if (Test-Path (Join-Path $installDir 'LICENSE')) { throw "Uninstall left the license installed" }
       - name: Create SHA-256 checksum
         if: steps.ready.outputs.value == 'true'
         shell: pwsh
         run: |
-          $hash = (Get-FileHash dist/TempestTrace.exe -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  TempestTrace.exe" | Set-Content dist/TempestTrace.exe.sha256
+          $assets = @(Get-Item -LiteralPath 'dist/TempestTrace.exe', "dist/TempestTrace-Setup-${{ steps.version.outputs.tag }}.exe" -ErrorAction Stop)
+          foreach ($asset in $assets) {
+            $hash = (Get-FileHash $asset.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($asset.Name)" | Set-Content "$($asset.FullName).sha256"
+          }
       - name: Create release tag
         if: steps.ready.outputs.value == 'true' && steps.version.outputs.create_tag == 'true'
         shell: pwsh
@@ -126,8 +173,27 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.version.outputs.tag }}
         run: gh api "repos/$env:GITHUB_REPOSITORY/git/refs" --method POST --field "ref=refs/tags/$env:RELEASE_TAG" --field "sha=$env:GITHUB_SHA"
-      - name: Publish prerelease
+      - name: Preserve manually promoted releases
         if: steps.ready.outputs.value == 'true'
+        id: release-state
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          $promoted = $false
+          try {
+            $release = Invoke-RestMethod `
+              -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" `
+              -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github+json' }
+            $promoted = (-not $release.draft) -and (-not $release.prerelease)
+          } catch {
+            if ([int]$_.Exception.Response.StatusCode -ne 404) { throw }
+          }
+          "promoted=$($promoted.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          if ($promoted) { Write-Host "Release was manually promoted; leaving it unchanged." }
+      - name: Publish prerelease
+        if: steps.ready.outputs.value == 'true' && steps.release-state.outputs.promoted != 'true'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.version.outputs.tag }}
@@ -136,3 +202,5 @@ jobs:
           files: |
             dist/TempestTrace.exe
             dist/TempestTrace.exe.sha256
+            dist/TempestTrace-Setup-${{ steps.version.outputs.tag }}.exe
+            dist/TempestTrace-Setup-${{ steps.version.outputs.tag }}.exe.sha256

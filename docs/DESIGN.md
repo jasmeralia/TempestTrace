@@ -7,9 +7,10 @@ Status: design; implementation has not started. Source task: Odoo project.task 5
 
 Give Rin a Windows NSIS installer for an app that creates an OBS diagnostic backup
 Morgan can inspect. Provide the same collection and redaction behavior on native
-Linux desktops. The result is a normal timestamped folder
-under `Dropbox/Jasmeralia and Rin/obs logs/`, with no ZIP and no command-line step.
-Collect OBS profiles, scene collections, and relevant logs. Keep diagnostic settings
+Linux desktops. The result is a single timestamped ZIP file
+under `Dropbox/Jasmeralia and Rin/obs logs/`, produced by the app with no
+command-line step or manual archiving. Collect OBS profiles, scene collections, and
+relevant logs. Keep diagnostic settings
 and Streamlabs source settings intact in the output. Remove credentials such as stream
 keys from the output. Never modify OBS's own files or interrupt an active stream.
 
@@ -40,14 +41,16 @@ outside the first release.
    If either path cannot be resolved or the destination is not writable, show a
    clear error and a folder picker; never silently choose a different destination.
    The destination preview remains visible before Run.
-3. Run creates `TempestTrace-YYYY-MM-DD_HH-MM-SS` (with a numeric collision suffix)
-   and shows progress by phase: scanning, copying, redacting, verifying, finishing.
-   The worker thread keeps the interface responsive. Cancel is supported between
-   files; an incomplete run is visibly marked and never reported as successful.
-4. The result screen shows the full folder path, counts of copied and skipped files,
-   redaction counts by category, warnings, and buttons to open the folder or copy its
-   path. A plain-text `README.txt` and machine-readable `manifest.json` repeat those
-   details inside the folder, without recording secret values.
+3. Run creates `TempestTrace-YYYY-MM-DD_HH-MM-SS.zip` (with a numeric collision
+   suffix) and shows progress by phase: scanning, copying, redacting, verifying,
+   packaging, finishing. The worker thread keeps the interface responsive. Cancel is
+   supported between files; an incomplete run is visibly marked and never reported as
+   successful.
+4. The result screen shows the full ZIP file path, counts of copied and skipped
+   files, redaction counts by category, warnings, and buttons to open the containing
+   folder, open the ZIP, or copy its path. A plain-text `README.txt` and
+   machine-readable `manifest.json` repeat those details inside the ZIP, without
+   recording secret values.
 
 ## Collection contract
 
@@ -90,11 +93,12 @@ known credential patterns and redact matching values while keeping the surroundi
 diagnostic line. Maintain a versioned field/path rule list and fixtures taken from
 synthetic OBS data; never commit Rin's real configuration or log samples.
 
-Streamlabs source settings must remain byte-for-byte equivalent at the parsed JSON
-subtree level. A credential detected inside that subtree is a conflict between the
-preservation and redaction requirements: block a successful backup, explain the
-specific source/file and ask Morgan to decide a narrow rule before release. Never
-quietly strip Streamlabs settings or silently include a detected credential.
+Streamlabs source settings must remain equivalent to the original at the parsed JSON
+subtree level, with one exception: values matching a known credential pattern (stream
+keys, tokens, passwords, etc.) are redacted in place, the same as any other detected
+secret. Preserve every other value, key, and structure in the subtree exactly. Never
+silently include a detected credential in the output, and never strip or alter
+Streamlabs settings beyond the specific redacted values.
 
 Before success, re-read every staged file and scan for known credential signatures,
 including original test fixture secrets. Files that cannot be parsed or sanitized are
@@ -104,14 +108,17 @@ free of secret values. Report counts and file paths, never removed values.
 
 ## Output safety and layout
 
-Stage in a uniquely named incomplete folder within the target parent, then rename
-to the final timestamped name only after verification. Include a completion marker
-in the manifest. A failed or cancelled run leaves an explicitly named incomplete
-folder that the UI offers to remove; it must never masquerade as a complete backup.
-Do not overwrite an existing run. Record source relative path, output relative path,
-size, checksum, redaction categories/counts, read consistency, and warning state for
-each file. Avoid storing the Windows user name or raw absolute OBS path in the
-manifest unless required to explain a failure.
+Stage the collected and redacted files in a uniquely named incomplete folder within
+the target parent, and verify them there. Include a completion marker in the
+manifest before compressing the verified staging tree into the final timestamped
+ZIP file, then remove the staging folder. Write the ZIP under an incomplete name
+first and rename it to its final name only once it is fully written; a failed or
+cancelled run leaves an explicitly named incomplete ZIP (or staging folder, if
+compression never started) that the UI offers to remove, and it must never
+masquerade as a complete backup. Do not overwrite an existing run. Record source
+relative path, output relative path, size, checksum, redaction categories/counts,
+read consistency, and warning state for each file. Avoid storing the Windows user
+name or raw absolute OBS path in the manifest unless required to explain a failure.
 
 ## Updates and release channels
 
@@ -168,8 +175,16 @@ manifest unless required to explain a failure.
   and Linux path adapters; the GUI only coordinates the plan and displays results.
 - Suggested modules: `paths` (OBS/Dropbox discovery), `inventory` (allowlist and size
   checks), `snapshot` (read-only copies and consistency), `redaction` (JSON, INI, log
-  rules), `verify` (output scan and manifest), `ui` (one-window flow), and `jobs`
-  (Qt worker and cancellation).
+  rules), `verify` (output scan and manifest), `package` (compress the verified
+  staging tree into the final ZIP), `ui` (one-window flow), and `jobs` (Qt worker
+  and cancellation).
+- Use the shared Winds of Storm brand icon (`resources/icons/tempesttrace.ico` and
+  `.png`, the same asset used by StormFuse and GaleFling) as the app icon. The NSIS
+  installer references it via `MUI_ICON`/`MUI_UNICON`; the GUI's About dialog must
+  use the same asset once the GUI stage begins. Before installing or uninstalling,
+  the NSIS script terminates any running `TempestTrace.exe` first (same pattern as
+  StormFuse/GaleFling), so an in-place upgrade never leaves a stale process holding
+  the old executable open.
 - Use PyInstaller `--onefile --windowed` to build the executable bundled in a
   per-user NSIS installer with Start Menu and uninstall entries. Publish the
   installer as the Windows release asset; keep the bare executable as an internal
@@ -234,12 +249,15 @@ the initial baseline, and collector tests must maintain those targets.
    synthetic trees, including missing/relocated Dropbox, symlinks/reparse points,
    locked/changing files, and filename collisions.
 3. **Redaction:** structural JSON/INI rules and log scanner. Test exact preservation
-   of non-secret settings and Streamlabs subtrees, plus rejection of unhandled
-   secrets, parse failures, and secrets in all user-visible reports.
+   of non-secret settings, including Streamlabs subtrees, plus redaction of known
+   credential patterns within those subtrees, rejection of unhandled secrets, parse
+   failures, and secrets in all user-visible reports.
 4. **GUI and packaging:** a single clear window, accessible progress/cancellation,
    completion actions, a Windows one-file build bundled into an NSIS installer,
-   and native Linux packages. Test while OBS is running and streaming; confirm no
-   source writes, restarts, or stream interruption on both platforms.
+   and native Linux packages. Include an About dialog using the shared
+   `resources/icons/tempesttrace` asset already wired into the NSIS installer.
+   Test while OBS is running and streaming; confirm no source writes, restarts, or
+   stream interruption on both platforms.
 5. **Updates and beta channel:** write failing tests for release selection, channel
    preference, checksum validation, interrupted downloads, update rollback, and
    platform-specific application before implementing the updater and UI.
@@ -259,14 +277,15 @@ the initial baseline, and collector tests must maintain those targets.
 ## Acceptance checks
 
 - Rin can install the NSIS package, launch the app, choose/confirm
-  the Dropbox location, and finish without extracting a ZIP or opening a terminal.
+  the Dropbox location, and finish without opening a terminal or manually creating
+  or extracting an archive; the app produces the ZIP itself.
 - The Windows installer supports a clean per-user install, launches the installed app,
   uninstalls only its own files, and never changes OBS, Dropbox, or backup outputs.
-- A completed output has profiles, scene collections, relevant logs, `README.txt`,
-  and `manifest.json` in an ordinary folder.
+- A completed output is a single ZIP file containing profiles, scene collections,
+  relevant logs, `README.txt`, and `manifest.json`.
 - Synthetic stream keys, bearer tokens, and passwords are absent from every output
-  file and from UI/application messages; normal OBS settings and Streamlabs source
-  subtrees are unchanged after parsing.
+  file and from UI/application messages, including within Streamlabs source subtrees;
+  every other OBS and Streamlabs setting is unchanged after parsing.
 - The original OBS tree is byte-for-byte unchanged; the app never terminates OBS.
 - Native Linux and Windows produce equivalent sanitized output; Linux packages work
   on both architectures and with native or Flatpak OBS configuration locations.
@@ -288,5 +307,4 @@ the initial baseline, and collector tests must maintain those targets.
 - Choose the recent-log count/age limit after seeing how long the flicker issue takes
   to reproduce; retain a user-selectable option for a specific log if needed.
 - Run a synthetic fixture from Rin's OBS version before finalizing the field/path
-  redaction list. The first real backup remains blocked if preservation conflicts
-  with a credential found in Streamlabs settings.
+  redaction list, including the Streamlabs-specific fields that need redaction.

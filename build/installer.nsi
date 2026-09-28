@@ -13,6 +13,9 @@ InstallDir "$LOCALAPPDATA\Programs\TempestTrace"
 RequestExecutionLevel user
 SetCompressor /SOLID lzma
 
+!define MUI_ICON "..\resources\icons\tempesttrace.ico"
+!define MUI_UNICON "..\resources\icons\tempesttrace.ico"
+
 !define MUI_ABORTWARNING
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
@@ -24,6 +27,7 @@ SetCompressor /SOLID lzma
 
 Section "TempestTrace" SecMain
   SectionIn RO
+  Call KillRunningTempestTrace
   SetOutPath "$INSTDIR"
   File "..\dist\TempestTrace.exe"
   File "..\LICENSE"
@@ -46,6 +50,7 @@ Section "TempestTrace" SecMain
 SectionEnd
 
 Section "Uninstall"
+  Call un.KillRunningTempestTrace
   Delete "$INSTDIR\TempestTrace.exe"
   Delete "$INSTDIR\LICENSE"
   Delete "$INSTDIR\Uninstall.exe"
@@ -55,3 +60,15 @@ Section "Uninstall"
   RMDir "$SMPROGRAMS\TempestTrace"
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TempestTrace"
 SectionEnd
+
+Function KillRunningTempestTrace
+  DetailPrint "Closing any running TempestTrace processes before installing..."
+  ExecWait '"$SYSDIR\taskkill.exe" /IM "TempestTrace.exe" /F /T' $0
+  Sleep 1000
+FunctionEnd
+
+Function un.KillRunningTempestTrace
+  DetailPrint "Closing any running TempestTrace processes before uninstalling..."
+  ExecWait '"$SYSDIR\taskkill.exe" /IM "TempestTrace.exe" /F /T' $0
+  Sleep 1000
+FunctionEnd

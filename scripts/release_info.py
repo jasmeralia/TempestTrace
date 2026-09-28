@@ -10,25 +10,22 @@ from pathlib import Path
 TAG_PATTERN = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 
 
-def next_tag(tags: list[str]) -> str:
-    """Return the next patch tag; start the prerelease series at v0.1.0."""
-    versions = [
-        tuple(int(part) for part in match.groups())
-        for tag in tags
-        if (match := TAG_PATTERN.fullmatch(tag)) is not None
-    ]
-    if not versions:
-        return "v0.1.0"
-    major, minor, patch = max(versions)
-    return f"v{major}.{minor}.{patch + 1}"
+def tag_for_commit(commit_count: int) -> str:
+    """Give each master commit a stable, unique prerelease patch number."""
+    if commit_count < 1:
+        raise ValueError("commit count must be positive")
+    return f"v0.1.{commit_count - 1}"
 
 
-def select_tag(head_tags: list[str], all_tags: list[str]) -> tuple[str, bool]:
+def select_tag(head_tags: list[str], all_tags: list[str], commit_count: int) -> tuple[str, bool]:
     """Reuse a tag on rerun, or select a new tag for an untagged commit."""
     release_tags = [tag for tag in head_tags if TAG_PATTERN.fullmatch(tag)]
     if release_tags:
         return max(release_tags, key=lambda tag: tuple(map(int, tag[1:].split(".")))), False
-    return next_tag(all_tags), True
+    tag = tag_for_commit(commit_count)
+    if tag in all_tags:
+        raise ValueError(f"{tag} already names a different commit")
+    return tag, True
 
 
 def main() -> None:
@@ -45,7 +42,15 @@ def main() -> None:
         capture_output=True,
         text=True,
     ).stdout.splitlines()
-    tag, create_tag = select_tag(head_tags, tags)
+    commit_count = int(
+        subprocess.run(
+            ["git", "rev-list", "--first-parent", "--count", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    tag, create_tag = select_tag(head_tags, tags, commit_count)
     if output := os.environ.get("GITHUB_OUTPUT"):
         with Path(output).open("a", encoding="utf-8") as handle:
             handle.write(f"tag={tag}\n")

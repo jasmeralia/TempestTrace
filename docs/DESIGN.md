@@ -128,7 +128,8 @@ manifest unless required to explain a failure.
 4. **GUI and packaging:** a single clear window, accessible progress/cancellation,
    completion actions, and a Windows one-file build. Test while OBS is running and
    streaming; confirm no source writes, restarts, or stream interruption.
-5. **Release:** after CI passes on a master merge, create the next version tag in CI,
+5. **Release:** after CI passes on a master merge, derive a stable version tag from
+   that commit's first-parent position on master, create the tag in CI,
    build the Windows `.exe`, verify its launch and required asset, and publish a
    GitHub prerelease with generated notes and SHA-256 checksum. Never publish a
    release from the design-only foundation or without a Windows smoke test.

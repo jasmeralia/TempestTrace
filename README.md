@@ -8,7 +8,10 @@ redaction rules, user flow, tests, and release criteria. The collector and execu
 have not been implemented yet; this repository currently contains the plan and
 project setup. CI runs lint and tests on PRs and master; after a future implementation
 adds `build/TempestTrace.spec` and a `--smoke-test` entry point, master merges will
-build and publish a one-file Windows prerelease.
+build and publish a one-file Windows prerelease. Prerelease tags use the master
+commit position (`v0.1.<position minus one>`), so every merge has a stable tag even
+when builds overlap or are retried; version numbers can have gaps before the first
+executable is ready.
 
 ## Intended use
 

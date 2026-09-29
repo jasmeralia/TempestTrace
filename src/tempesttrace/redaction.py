@@ -78,7 +78,8 @@ def _unquote(value: str) -> str:
     return value
 
 
-def _is_hotkey_log_match(text: str, match: re.Match[str]) -> bool:
+def is_hotkey_log_match(text: str, match: re.Match[str]) -> bool:
+    """Identify key assignments that are hotkeys rather than credentials."""
     field_name = re.split(r"\s*[=:]", match.group(1), maxsplit=1)[0].casefold()
     if field_name != "key":
         return False
@@ -95,7 +96,7 @@ def _embedded_secrets(text: str) -> set[str]:
         values.update(
             _unquote(match.group(2))
             for match in pattern.finditer(text)
-            if not _is_hotkey_log_match(text, match)
+            if not is_hotkey_log_match(text, match)
         )
     return {value for value in values if value and value != REDACTED}
 
@@ -145,7 +146,7 @@ def _redact_embedded(text: str, counts: dict[str, int]) -> str:
     def replace(match: re.Match[str]) -> str:
         if _unquote(match.group(2)) == REDACTED:
             return match.group(0)
-        if _is_hotkey_log_match(text, match):
+        if is_hotkey_log_match(text, match):
             return match.group(0)
         counts["credential_pattern"] = counts.get("credential_pattern", 0) + 1
         return f"{match.group(1)}{REDACTED}"

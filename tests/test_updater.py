@@ -156,6 +156,15 @@ def test_linux_asset_matching_requires_os_arch_and_package() -> None:
     assert offer is not None and offer.asset.name == name
 
 
+def test_linux_x86_64_appimage_asset_is_selected() -> None:
+    name = "TempestTrace-v1.2.3-linux-x86_64.AppImage"
+    releases = [release("v1.2.3", assets=[asset(name)])]
+
+    offer = check_for_update("1.2.2", releases, "linux", "amd64", "appimage", False)
+
+    assert offer is not None and offer.asset.name == name
+
+
 def test_parse_sha256sums_handles_gnu_and_bsd_lines() -> None:
     digest = "a" * 64
     sums = parse_sha256sums(f"{digest}  one.deb\nSHA256 (two.rpm) = {'b' * 64}\n")

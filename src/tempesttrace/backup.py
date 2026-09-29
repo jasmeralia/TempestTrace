@@ -20,6 +20,7 @@ from pathlib import Path
 from tempesttrace.redaction import (
     RULE_VERSION,
     has_unredacted_fields,
+    is_hotkey_log_match,
     redact_file_with_secrets,
 )
 
@@ -28,10 +29,14 @@ MAX_TOTAL_SIZE = 512 * 1024 * 1024
 MAX_LOG_FILES = 5
 ALLOWED_PROFILE_SUFFIXES = {".ini", ".json", ".txt"}
 _SECRET_SCAN = re.compile(
-    rb"(?i)(?:\bkey|api[_ -]?key|stream[_ -]?key|token|auth[_ -]?token|"
-    rb"bearer[_ -]?token|password|passwd|access[_ -]?token|client[_ -]?secret|secret)"
-    rb"\s*[=:]\s*"
-    rb"(?!<REDACTED>)(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;\]\"']+)"
+    r"(?i)((?:\bkey|api[_ -]?key|stream[_ -]?key|token|auth[_ -]?token|"
+    r"bearer[_ -]?token|password|passwd|access[_ -]?token|client[_ -]?secret|secret)"
+    r"\s*[=:]\s*)"
+    r"(?!<REDACTED>)(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;\]\"']+)"
+)
+_INI_SECRET_SCAN = re.compile(
+    r"(?im)^\s*((?:\w*key|\w*token|\w*password|\w*passwd|\w*secret)\s*[=:]\s*)"
+    r"(?!<REDACTED>)\S+"
 )
 
 
@@ -211,24 +216,20 @@ def _read_consistent(source: Path, target: Path, max_bytes: int) -> tuple[bool, 
 
 
 def _secret_scan(path: Path) -> bool:
-    if _SECRET_SCAN.search(path.read_bytes()):
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return True
+    if any(not is_hotkey_log_match(text, match) for match in _SECRET_SCAN.finditer(text)):
         return True
     if path.suffix.lower() == ".json" or path.name.lower().endswith(".json.bak"):
         try:
-            return has_unredacted_fields(json.loads(path.read_text(encoding="utf-8")), (path.name,))
+            return has_unredacted_fields(json.loads(text), (path.name,))
         except OSError, UnicodeError, json.JSONDecodeError:
             return True
     if path.suffix.lower() == ".ini" or path.name.lower().endswith(".ini.bak"):
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError, UnicodeError:
-            return True
-        return bool(
-            re.search(
-                r"(?im)^\s*(?:\w*key|\w*token|\w*password|\w*passwd|\w*secret)"
-                r"\s*[=:]\s*(?!<REDACTED>)\S+",
-                text,
-            )
+        return any(
+            not is_hotkey_log_match(text, match) for match in _INI_SECRET_SCAN.finditer(text)
         )
     return False
 

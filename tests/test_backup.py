@@ -141,6 +141,19 @@ def test_private_verifier_detects_plain_and_quoted_log_credentials(
     assert backup._secret_scan(path)
 
 
+def test_backup_verifier_preserves_hotkey_log_lines(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    hotkey_line = "hotkey binding key=F9\n"
+    (source / "logs/2026-01-01.txt").write_text(hotkey_line, encoding="utf-8")
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    result = create_backup(source, destination)
+
+    with zipfile.ZipFile(result.archive) as archive:
+        assert archive.read("logs/2026-01-01.txt").decode("utf-8") == hotkey_line
+
+
 @pytest.mark.parametrize(
     "property_name",
     ["key", '"key"'],

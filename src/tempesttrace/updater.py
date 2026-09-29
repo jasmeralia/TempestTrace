@@ -190,7 +190,9 @@ def _asset_name_matches(
     if not name.casefold().endswith(suffixes[package]):
         return False
     stem = name.casefold()[: -len(suffixes[package])]
-    tokens = re.split(r"[^a-z0-9]+", stem)
+    # Keep underscores inside architecture aliases such as ``x86_64`` while
+    # still requiring the alias to occupy a whole filename token.
+    tokens = re.split(r"[^a-z0-9_]+", stem)
     has_project = "tempesttrace" in tokens
     arch_tokens = {"amd64": {"amd64", "x86_64", "x64"}, "arm64": {"arm64", "aarch64"}}[arch]
     version = str(SemVer.parse(tag)).casefold()
@@ -233,7 +235,7 @@ def _release_checksums(release: Mapping[str, Any]) -> dict[str, str]:
     return result
 
 
-def check_for_update(  # noqa: PLR0912, PLR0913, PLR0917
+def check_for_update(  # noqa: PLR0912, PLR0913
     current_version: str | None,
     releases: Sequence[Mapping[str, Any]],
     platform: str,

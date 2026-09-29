@@ -63,6 +63,46 @@ def test_quoted_credentials_are_redacted_and_detected(tmp_path: Path) -> None:
     assert has_unredacted_fields({"password": '"JSON_QUOTED_SECRET"'})
 
 
+def test_credentials_inside_json_encoded_strings_are_redacted(tmp_path: Path) -> None:
+    path = tmp_path / "scene.json"
+    path.write_text(
+        json.dumps(
+            {
+                "payload": '{"key": "ENCODED_KEY_SECRET", "token": "ENCODED_TOKEN_SECRET"}',
+                "hotkeys": {"libobs.mute": {"key": "F9"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    redact_file(path)
+
+    value = json.loads(path.read_text(encoding="utf-8"))
+    assert json.loads(value["payload"]) == {"key": "<REDACTED>", "token": "<REDACTED>"}
+    assert value["hotkeys"]["libobs.mute"]["key"] == "F9"
+
+
+def test_quoted_json_credentials_in_ini_and_logs_are_redacted(tmp_path: Path) -> None:
+    ini = tmp_path / "basic.ini"
+    ini.write_text(
+        '[Output]\nOBSBasic.StartStreaming={"key":"OBS_KEY_F9","token":"INI_JSON_SECRET"}\n',
+        encoding="utf-8",
+    )
+    log = tmp_path / "current.txt"
+    log.write_text(
+        '{"settings":{"key":"LOG_JSON_SECRET","token":"LOG_TOKEN_SECRET"}}\n',
+        encoding="utf-8",
+    )
+
+    redact_file(ini)
+    redact_file(log)
+
+    assert '"key":"OBS_KEY_F9"' in ini.read_text(encoding="utf-8")
+    assert "INI_JSON_SECRET" not in ini.read_text(encoding="utf-8")
+    assert "LOG_JSON_SECRET" not in log.read_text(encoding="utf-8")
+    assert "LOG_TOKEN_SECRET" not in log.read_text(encoding="utf-8")
+
+
 def test_ordinary_words_ending_in_credential_suffix_are_not_sensitive() -> None:
     assert not _is_sensitive_key("monkey")
     assert not _is_sensitive_key("tokenizer")

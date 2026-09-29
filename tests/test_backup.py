@@ -147,6 +147,60 @@ def test_backup_redacts_bare_keys_and_keeps_ini_words_and_hotkeys(tmp_path: Path
     )
 
 
+def test_backup_redacts_credentials_nested_in_json_text_containers(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    (source / "basic/profiles/default/basic.ini").write_text(
+        '[Output]\nOBSBasic.StartStreaming={"key":"OBS_KEY_F9","token":"INI_JSON_SECRET"}\n',
+        encoding="utf-8",
+    )
+    (source / "logs/2026-01-01.txt").write_text(
+        '{"settings":{"key":"LOG_JSON_SECRET","token":"LOG_TOKEN_SECRET"}}\n'
+        "key=LOG_SECOND_SECRET\n",
+        encoding="utf-8",
+    )
+    (source / "basic/scenes/main.json").write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "name": "Camera",
+                        "settings": {
+                            "payload": '{"key": "SCENE_JSON_SECRET", "token": "SCENE_TOKEN_SECRET"}'
+                        },
+                    }
+                ],
+                "hotkeys": {"libobs.mute": {"key": "F9"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    result = create_backup(source, destination)
+
+    assert not result.warnings
+    with zipfile.ZipFile(result.archive) as archive:
+        contents = {name: archive.read(name).decode("utf-8") for name in archive.namelist()}
+    combined = "\n".join(contents.values())
+    for secret in (
+        "INI_JSON_SECRET",
+        "LOG_JSON_SECRET",
+        "LOG_TOKEN_SECRET",
+        "LOG_SECOND_SECRET",
+        "SCENE_JSON_SECRET",
+        "SCENE_TOKEN_SECRET",
+    ):
+        assert secret not in combined
+    assert '"key":"OBS_KEY_F9"' in contents["basic/profiles/default/basic.ini"]
+    scene = json.loads(contents["basic/scenes/main.json"])
+    assert json.loads(scene["sources"][0]["settings"]["payload"]) == {
+        "key": "<REDACTED>",
+        "token": "<REDACTED>",
+    }
+    assert scene["hotkeys"]["libobs.mute"]["key"] == "F9"
+
+
 def test_backup_promotes_without_hard_links(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -248,6 +302,23 @@ def test_private_verifier_detects_plain_and_quoted_log_credentials(
 ) -> None:
     path = tmp_path / "log.txt"
     path.write_text(line, encoding="utf-8")
+
+    assert backup._secret_scan(path)
+
+
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [
+        ("basic.ini", 'OBSBasic.StartStreaming={"key":"OBS_KEY_F9","token":"INI_SECRET"}'),
+        ("current.txt", '{"settings":{"key":"LOG_SECRET","token":"LOG_TOKEN_SECRET"}}'),
+        ("scene.json", json.dumps({"payload": '{"key":"SCENE_SECRET"}'})),
+    ],
+)
+def test_private_verifier_detects_credentials_inside_embedded_json(
+    tmp_path: Path, filename: str, content: str
+) -> None:
+    path = tmp_path / filename
+    path.write_text(content, encoding="utf-8")
 
     assert backup._secret_scan(path)
 

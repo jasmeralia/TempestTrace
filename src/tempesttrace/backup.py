@@ -22,6 +22,7 @@ from pathlib import Path
 
 from tempesttrace.redaction import (
     RULE_VERSION,
+    has_unredacted_embedded_json,
     has_unredacted_fields,
     has_unredacted_ini_fields,
     is_noncredential_log_match,
@@ -280,16 +281,19 @@ def _secret_scan(path: Path) -> bool:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return True
-    if any(not is_noncredential_log_match(text, match) for match in _SECRET_SCAN.finditer(text)):
-        return True
+    contains_secret = any(
+        not is_noncredential_log_match(text, match) for match in _SECRET_SCAN.finditer(text)
+    ) or has_unredacted_embedded_json(text)
     if path.suffix.lower() == ".json" or path.name.lower().endswith(".json.bak"):
         try:
-            return has_unredacted_fields(json.loads(text), (path.name,))
+            contains_secret = contains_secret or has_unredacted_fields(
+                json.loads(text), (path.name,)
+            )
         except OSError, UnicodeError, json.JSONDecodeError:
             return True
-    if path.suffix.lower() == ".ini" or path.name.lower().endswith(".ini.bak"):
-        return has_unredacted_ini_fields(text, path.name)
-    return False
+    elif path.suffix.lower() == ".ini" or path.name.lower().endswith(".ini.bak"):
+        contains_secret = contains_secret or has_unredacted_ini_fields(text, path.name)
+    return contains_secret
 
 
 def _contains_private_secret(path: Path, secrets: set[str]) -> bool:

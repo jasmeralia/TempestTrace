@@ -101,6 +101,12 @@ known credential patterns and redact matching values while keeping the surroundi
 diagnostic line. Maintain a versioned field/path rule list and fixtures taken from
 synthetic OBS data; never commit Rin's real configuration or log samples.
 
+Also inspect valid JSON objects and arrays embedded in INI values, log lines, and
+string-valued JSON fields. Redact credential fields within those fragments and have
+the final verifier reject any remaining embedded credential fields. Preserve OBS
+hotkey `key` values in known hotkey structures, including `OBSBasic.*` JSON-valued
+INI assignments.
+
 Streamlabs source settings must remain equivalent to the original at the parsed JSON
 subtree level, with one exception: values matching a known credential pattern (stream
 keys, tokens, passwords, etc.) are redacted in place, the same as any other detected

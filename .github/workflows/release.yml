@@ -53,10 +53,10 @@ jobs:
           cache-dependency-path: |
             requirements-dev.txt
             pyproject.toml
-      - name: Install Qt runtime libraries
+      - name: Install Qt system libraries
         run: |
           sudo apt-get update
-          sudo apt-get install --yes libegl1
+          sudo apt-get install --yes libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0
       - name: Install dependencies
         run: make deps
       - name: Lint

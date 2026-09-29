@@ -435,6 +435,41 @@ def test_windows_update_handoff_resets_pyinstaller_environment(tmp_path: Path, m
     assert app is not None
 
 
+def test_windows_update_handoff_is_rejected_while_backup_is_running(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("tempesttrace.ui.discover_obs", lambda: [])
+    monkeypatch.setattr("tempesttrace.ui.discover_dropbox", lambda: None)
+    launched: list[object] = []
+    warnings: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(
+        "tempesttrace.ui.subprocess.Popen", lambda *args, **kwargs: launched.append(args)
+    )
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args))
+    package = tmp_path / "setup.exe"
+    package.write_bytes(b"installer")
+    window = MainWindow(enable_updates=False)
+
+    class RunningThread:
+        def isRunning(self) -> bool:
+            return True
+
+    window.worker_thread = cast(QThread, RunningThread())
+    window._handoff_windows_installer(package)
+
+    assert not launched
+    assert warnings
+    window.worker_thread = None
+    window.close()
+    assert app is not None
+
+
 def test_appimage_update_handoff_resets_pyinstaller_environment(
     tmp_path: Path, monkeypatch
 ) -> None:

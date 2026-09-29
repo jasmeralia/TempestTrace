@@ -684,6 +684,14 @@ class MainWindow(QMainWindow):
         self._show_linux_package_action(package_path, package)
 
     def _handoff_windows_installer(self, package_path: Path) -> None:
+        if self.worker_thread is not None and self.worker_thread.isRunning():
+            QMessageBox.warning(
+                self,
+                "Backup in progress",
+                "Wait for the current backup to finish before running the installer. "
+                "The installer was not started.",
+            )
+            return
         answer = QMessageBox.question(
             self,
             "Run verified installer?",

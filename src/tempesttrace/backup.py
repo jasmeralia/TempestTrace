@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import configparser
+import ctypes
+import errno
 import hashlib
 import json
 import os
 import re
 import shutil
 import stat
+import sys
 import tempfile
 import time
 import zipfile
@@ -149,6 +152,31 @@ def _private_temp_directory(target_dir: Path, prefix: str) -> Path:
             return created
         shutil.rmtree(created, ignore_errors=True)
     raise ValueError("Could not create private staging outside the backup destination.")
+
+
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    """Atomically rename a file without replacing any existing destination."""
+    if not sys.platform.startswith("linux"):
+        os.rename(source, destination)
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOTSUP, "atomic no-replace rename is unavailable", destination)
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(-100, os.fsencode(source), -100, os.fsencode(destination), 1)
+    if result != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(error, os.strerror(error), destination)
+        raise OSError(error, os.strerror(error), destination)
 
 
 def _inventory(root: Path, skipped: list[dict[str, str]]) -> list[Path]:  # noqa: PLR0912
@@ -477,7 +505,7 @@ def create_backup(  # noqa: PLR0912, PLR0915
                 )
                 continue
             try:
-                os.rename(incomplete_zip, final)
+                _rename_noreplace(incomplete_zip, final)
             except FileExistsError:
                 reservation.unlink(missing_ok=True)
                 suffix, final, _reserved_incomplete, reservation = _reserve_archive_name(

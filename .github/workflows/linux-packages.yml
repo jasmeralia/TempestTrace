@@ -80,6 +80,10 @@ jobs:
           flatpak install --user --noninteractive --assumeyes "$package"
           permissions=$(flatpak info --user --show-permissions io.github.jasmeralia.TempestTrace)
           grep -Fq 'shared=network' <<<"$permissions"
+          grep -Fq 'home:ro' <<<"$permissions"
+          grep -Fq '~/Dropbox:rw' <<<"$permissions"
+          grep -Fq 'xdg-config/obs-studio:ro' <<<"$permissions"
+          grep -Fq '~/.dropbox:ro' <<<"$permissions"
           grep -Fq '~/.var/app/com.obsproject.Studio/config/obs-studio:ro' <<<"$permissions"
           native_obs="$HOME/.config/obs-studio"
           flatpak_obs="$HOME/.var/app/com.obsproject.Studio/config/obs-studio"

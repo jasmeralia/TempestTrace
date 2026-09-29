@@ -9,3 +9,4 @@ def test_flatpak_only_gets_read_only_obs_configuration_access() -> None:
     assert "--filesystem=xdg-config/obs-studio:ro" in script
     assert "--filesystem='~/.var/app/com.obsproject.Studio/config/obs-studio:ro'" in script
     assert "--filesystem='~/.dropbox:ro'" in script
+    assert "--filesystem='~/Dropbox:rw'" in script

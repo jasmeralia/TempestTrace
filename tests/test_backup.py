@@ -108,8 +108,16 @@ def test_backup_redacts_bare_keys_and_keeps_ini_words_and_hotkeys(tmp_path: Path
         ),
         encoding="utf-8",
     )
+    (source / "basic/scenes/Streaming Hotkeys.json").write_text(
+        json.dumps({"settings": {"key": "FILENAME_HOTKEY_SECRET"}}), encoding="utf-8"
+    )
     notes = source / "basic/profiles/default/notes.ini"
-    notes.write_text("[Video]\nmonkey=keep-me\nhotkey=F9\n", encoding="utf-8")
+    notes.write_text(
+        "[Video]\nmonkey=keep-me\nhotkey=F9\n"
+        "[Hotkeys]\nkey=HOTKEY_SECTION_SECRET\n"
+        'OBSBasic.StartStreaming={"key":"OBS_KEY_F9"}\n',
+        encoding="utf-8",
+    )
     destination = tmp_path / "out"
     destination.mkdir()
 
@@ -126,11 +134,17 @@ def test_backup_redacts_bare_keys_and_keeps_ini_words_and_hotkeys(tmp_path: Path
 
     assert "BAK_STREAM_SECRET" not in all_content.decode()
     assert "SCENE_STREAM_SECRET" not in all_content.decode()
+    assert "FILENAME_HOTKEY_SECRET" not in all_content.decode()
+    assert "HOTKEY_SECTION_SECRET" not in all_content.decode()
     assert json.loads(service_text)["settings"]["key"] == "<REDACTED>"
     scene = json.loads(scene_text)
     assert scene["sources"][0]["settings"]["key"] == "<REDACTED>"
     assert scene["hotkeys"][0]["key"] == "F9"
-    assert ini_text == "[Video]\nmonkey=keep-me\nhotkey=F9\n"
+    assert ini_text == (
+        "[Video]\nmonkey=keep-me\nhotkey=F9\n"
+        "[Hotkeys]\nkey=<REDACTED>\n"
+        'OBSBasic.StartStreaming={"key":"OBS_KEY_F9"}\n'
+    )
 
 
 def test_backup_promotes_without_hard_links(
@@ -162,6 +176,31 @@ def test_private_staging_falls_back_outside_destination_when_tempdir_is_inside(
     create_backup(source, destination)
 
     assert not list(destination.glob(".*.private-*"))
+
+
+def test_racing_final_file_is_not_replaced_during_promotion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    same_time = datetime(2026, 9, 28, 12, 0, 0)
+    conflicting_final = destination / "TempestTrace-2026-09-28_12-00-00.zip"
+    original_rename = backup._rename_noreplace
+
+    def create_late_collision(source_path: Path, destination_path: Path) -> None:
+        if destination_path == conflicting_final and not conflicting_final.exists():
+            conflicting_final.write_bytes(b"preexisting archive")
+        original_rename(source_path, destination_path)
+
+    monkeypatch.setattr(backup, "_rename_noreplace", create_late_collision)
+
+    result = create_backup(source, destination, now=same_time)
+
+    assert conflicting_final.read_bytes() == b"preexisting archive"
+    assert result.archive.name == "TempestTrace-2026-09-28_12-00-00-1.zip"
+    with zipfile.ZipFile(result.archive) as archive:
+        assert archive.testzip() is None
 
 
 def test_cancel_leaves_marked_incomplete_stage(tmp_path: Path) -> None:

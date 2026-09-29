@@ -165,7 +165,7 @@ def test_key_context_and_case_variants_preserve_hotkey_bindings(tmp_path: Path) 
 
 
 def test_bare_key_is_redacted_in_backup_and_scene_files_but_not_hotkeys(tmp_path: Path) -> None:
-    for filename in ("service.json.bak", "main.json"):
+    for filename in ("service.json.bak", "main.json", "Streaming Hotkeys.json"):
         path = tmp_path / filename
         path.write_text(
             json.dumps(
@@ -187,12 +187,12 @@ def test_bare_key_is_redacted_in_backup_and_scene_files_but_not_hotkeys(tmp_path
 
 def test_log_redaction_preserves_chroma_color_key_value(tmp_path: Path) -> None:
     log = tmp_path / "current.txt"
-    original = "filter chroma color key: #00ff00\nkey=STREAM_SECRET\n"
+    original = "filter chroma color key: #00ff00 key=STREAM_SECRET\n"
     log.write_text(original, encoding="utf-8")
 
     redact_file(log)
 
-    assert log.read_text(encoding="utf-8") == ("filter chroma color key: #00ff00\nkey=<REDACTED>\n")
+    assert log.read_text(encoding="utf-8") == "filter chroma color key: #00ff00 key=<REDACTED>\n"
 
 
 def test_short_credentials_do_not_corrupt_substring_matches(tmp_path: Path) -> None:

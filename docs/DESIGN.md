@@ -222,9 +222,10 @@ explain a failure.
   distribution and glibc floor in release notes. The Linux
   packages must grant or request access to OBS's config tree and the chosen Dropbox
   folder; test Flatpak portals and Snap filesystem access rather than assuming sandbox
-  access. Flatpak must keep the user's home read-only and grant OBS config and Dropbox
-  metadata paths read-only; write access to the chosen backup folder must come from a
-  user-approved file chooser portal grant. No FFmpeg dependency is needed.
+  access. Flatpak must keep the user's home read-only, grant OBS config and Dropbox
+  metadata paths read-only, and allow writes to the default `~/Dropbox` destination.
+  Relocated or custom destinations need a tested, user-approved portal grant before
+  claiming support. No FFmpeg dependency is needed.
 - Run a Windows smoke test of the built `.exe`, including launch from Explorer and
   a synthetic OBS/Dropbox fixture. Silently install the NSIS asset in CI, smoke-test
   the installed executable, uninstall, and verify removal of installed files.

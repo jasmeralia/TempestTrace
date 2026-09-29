@@ -52,8 +52,16 @@ def _is_sensitive_key(key: str, context: tuple[str, ...] = ()) -> bool:
         "authorization",
     }
     if normalized == "key":
-        normalized_context = {re.sub(r"[^a-z0-9]", "", part.casefold()) for part in context}
-        return not any("hotkey" in part or "binding" in part for part in normalized_context)
+        structural_context = {re.sub(r"[^a-z0-9]", "", part.casefold()) for part in context[1:]}
+        hotkey_fields = {
+            "hotkey",
+            "hotkeys",
+            "binding",
+            "bindings",
+            "keybinding",
+            "keybindings",
+        }
+        return not bool(structural_context & hotkey_fields)
     if normalized in credential_names:
         return True
     suffixes = ("key", "token", "password", "passwd", "secret")
@@ -77,11 +85,10 @@ def is_noncredential_log_match(text: str, match: re.Match[str]) -> bool:
     if field_name != "key":
         return False
     start = text.rfind("\n", 0, match.start()) + 1
-    end = text.find("\n", match.end())
-    context = text[start:] if end < 0 else text[start:end]
+    prefix = text[start : match.start()]
     return bool(
-        re.search(r"(?i)hotkey|key.?binding|shortcut", context)
-        or re.search(r"(?i)\b(?:chroma|colou?r)\s+key\s*[=:]", context)
+        re.search(r"(?i)\b(?:hotkey(?:\s+binding)?|key.?binding|shortcut)\s*$", prefix)
+        or re.search(r"(?i)\b(?:chroma|colou?r)\s*$", prefix)
     )
 
 
@@ -204,16 +211,11 @@ def has_unredacted_fields(value: Any, context: tuple[str, ...] = ()) -> bool:
 
 def has_unredacted_ini_fields(text: str, filename: str) -> bool:
     """Check INI assignments using the same key rules as the redactor."""
-    section = ""
     for line in text.splitlines():
-        section_match = re.match(r"^\s*\[([^]]+)\]", line)
-        if section_match:
-            section = section_match.group(1)
-            continue
         match = re.match(r"^\s*([^=:#\s]+)\s*[=:]\s*(.*?)\s*$", line)
         if (
             match
-            and _is_sensitive_key(match.group(1), (filename, section))
+            and _is_sensitive_key(match.group(1), (filename,))
             and match.group(2) not in ("", REDACTED)
         ):
             return True
@@ -222,14 +224,9 @@ def has_unredacted_ini_fields(text: str, filename: str) -> bool:
 
 def _ini_secret_values(text: str, filename: str) -> set[str]:
     secrets: set[str] = set()
-    section = ""
     for line in text.splitlines():
-        section_match = re.match(r"^\s*\[([^]]+)\]", line)
-        if section_match:
-            section = section_match.group(1)
-            continue
         match = re.match(r"^\s*([^=:#\s]+)\s*[=:]\s*(.*?)\s*$", line)
-        if match and _is_sensitive_key(match.group(1), (filename, section)):
+        if match and _is_sensitive_key(match.group(1), (filename,)):
             secret = _unquote(match.group(2))
             if secret and secret != REDACTED:
                 secrets.add(secret)
@@ -238,19 +235,9 @@ def _ini_secret_values(text: str, filename: str) -> set[str]:
 
 def _redact_ini(text: str, filename: str, counts: dict[str, int], secrets: set[str]) -> str:
     lines: list[str] = []
-    section = ""
     for original_line in text.splitlines(keepends=True):
-        section_match = re.match(r"^\s*\[([^]]+)\]", original_line)
-        if section_match:
-            section = section_match.group(1)
-            lines.append(original_line)
-            continue
         match = re.match(r"^(\s*)([^=:#\s]+)(\s*[=:]\s*)(.*?)(\r?\n)?$", original_line)
-        if (
-            match
-            and _is_sensitive_key(match.group(2), (filename, section))
-            and match.group(4).strip()
-        ):
+        if match and _is_sensitive_key(match.group(2), (filename,)) and match.group(4).strip():
             cleaned = (
                 f"{match.group(1)}{match.group(2)}{match.group(3)}{REDACTED}{match.group(5) or ''}"
             )

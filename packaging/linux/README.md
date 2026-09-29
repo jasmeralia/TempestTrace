@@ -38,11 +38,11 @@ use their core24/Freedesktop 26.08 runtimes rather than the host glibc.
 DEB, RPM, and AppImage run outside a filesystem sandbox. The Flatpak requests
 network access for GitHub update checks and read-only access to the user's home
 for config discovery. It also grants read-only access to the host native OBS config,
-OBS Flatpak config, and Dropbox metadata. The selected backup folder is writable
-through the file chooser's portal grant. CI tests collection from both native and
-OBS Flatpak fixture paths. Relocated Dropbox folders outside the home directory
-also require a file chooser portal grant; portal behavior remains unverified with
-this PyQt6 UI. The strict
+OBS Flatpak config, and Dropbox metadata. It grants read/write access to `~/Dropbox`
+so the default `~/Dropbox/Jasmeralia and Rin/obs logs` destination works. A Dropbox
+folder relocated outside `~/Dropbox`, or another custom destination, needs an
+additional sandbox grant and is not yet validated for Flatpak. CI tests collection
+from both native and OBS Flatpak fixture paths. The strict
 Snap declares `home` plus an `obs-config`
 personal-files plug for standard hidden OBS and Dropbox metadata paths. The user
 or administrator must connect that plug after installation. Relocated data

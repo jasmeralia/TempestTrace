@@ -235,7 +235,7 @@ def _release_checksums(release: Mapping[str, Any]) -> dict[str, str]:
     return result
 
 
-def check_for_update(  # noqa: PLR0912, PLR0913
+def check_for_update(  # noqa: PLR0912, PLR0913, PLR0917
     current_version: str | None,
     releases: Sequence[Mapping[str, Any]],
     platform: str,

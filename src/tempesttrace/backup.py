@@ -91,6 +91,29 @@ def _recent_logs(root: Path, candidates: list[Path], skipped: list[dict[str, str
     return [item for _, item in recent]
 
 
+def _reserve_archive_name(
+    target_dir: Path, base: str, start_suffix: int = 0
+) -> tuple[int, Path, Path, Path]:
+    """Exclusively reserve a candidate name; final promotion still uses no-clobber link."""
+    suffix = start_suffix
+    while True:
+        stem = base if suffix == 0 else f"{base}-{suffix}"
+        final = target_dir / f"{stem}.zip"
+        incomplete_zip = target_dir / f"{stem}.incomplete.zip"
+        reservation = target_dir / f".{stem}.reserve"
+        try:
+            descriptor = os.open(reservation, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            suffix += 1
+            continue
+        os.close(descriptor)
+        if final.exists() or incomplete_zip.exists():
+            reservation.unlink(missing_ok=True)
+            suffix += 1
+            continue
+        return suffix, final, incomplete_zip, reservation
+
+
 def _inventory(root: Path, skipped: list[dict[str, str]]) -> list[Path]:  # noqa: PLR0912
     candidates: list[Path] = []
     profiles = root / "basic/profiles"
@@ -218,7 +241,9 @@ def _contains_private_secret(path: Path, secrets: set[str]) -> bool:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return True
-    return any(secret and secret in text for secret in secrets)
+    return any(
+        secret and re.search(rf"(?<!\w){re.escape(secret)}(?!\w)", text) for secret in secrets
+    )
 
 
 def create_backup(  # noqa: PLR0912, PLR0915
@@ -250,20 +275,13 @@ def create_backup(  # noqa: PLR0912, PLR0915
 
     when = now or datetime.now().astimezone()
     base = f"TempestTrace-{when.strftime('%Y-%m-%d_%H-%M-%S')}"
-    suffix = 0
-    while True:
-        stem = base if suffix == 0 else f"{base}-{suffix}"
-        final = target_dir / f"{stem}.zip"
-        incomplete_zip = final.with_name(final.stem + ".incomplete.zip")
-        if not final.exists() and not incomplete_zip.exists():
-            break
-        suffix += 1
-    staging = Path(tempfile.mkdtemp(prefix=f".{base}.incomplete-", dir=target_dir))
+    suffix, final, incomplete_zip, reservation = _reserve_archive_name(target_dir, base)
     skipped: list[dict[str, str]] = []
     warnings: list[str] = []
     records: list[dict[str, object]] = []
     redaction_counts: dict[str, int] = {}
     try:
+        staging = Path(tempfile.mkdtemp(prefix=f".{base}.incomplete-", dir=target_dir))
         if progress:
             progress("scanning", 0, 0)
         files = _inventory(root, skipped)
@@ -407,7 +425,20 @@ def create_backup(  # noqa: PLR0912, PLR0915
             progress("promoting", len(records), len(records))
         if cancelled is not None and cancelled():
             raise BackupCancelled("Collection cancelled.")
-        os.replace(incomplete_zip, final)
+        while True:
+            try:
+                os.link(incomplete_zip, final)
+            except FileExistsError:
+                reservation.unlink(missing_ok=True)
+                suffix, final, _reserved_incomplete, reservation = _reserve_archive_name(
+                    target_dir, base, suffix + 1
+                )
+            else:
+                break
+        try:
+            incomplete_zip.unlink()
+        except OSError:
+            warnings.append("The backup is complete, but its temporary ZIP could not be removed.")
         try:
             shutil.rmtree(staging)
         except OSError:
@@ -422,3 +453,5 @@ def create_backup(  # noqa: PLR0912, PLR0915
         # Preserve the incomplete staging tree/archive so the UI can offer cleanup.
         # Preserve both the incomplete staging tree and any partial archive.
         raise
+    finally:
+        reservation.unlink(missing_ok=True)

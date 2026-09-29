@@ -2,7 +2,10 @@ import hashlib
 import json
 import shutil
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
+from threading import Barrier, Lock
 
 import pytest
 
@@ -120,6 +123,21 @@ def test_private_verifier_detects_plain_and_quoted_log_credentials(
     path.write_text(line, encoding="utf-8")
 
     assert backup._secret_scan(path)
+
+
+def test_short_credentials_do_not_reject_unrelated_substrings_in_backup(
+    tmp_path: Path,
+) -> None:
+    source = fixture(tmp_path / "obs")
+    (source / "logs/2026-01-02.txt").write_text("token=x description=texture\n", encoding="utf-8")
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    result = create_backup(source, destination)
+
+    with zipfile.ZipFile(result.archive) as archive:
+        log = archive.read("logs/2026-01-02.txt").decode("utf-8")
+    assert log == "token=<REDACTED> description=texture\n"
 
 
 def test_bad_json_is_omitted_and_symlinks_are_not_followed(tmp_path: Path) -> None:
@@ -315,3 +333,65 @@ def test_nested_credential_duplicate_under_nonsensitive_key_does_not_leak(
     with zipfile.ZipFile(result.archive) as archive:
         contents = b"".join(archive.read(name) for name in archive.namelist())
     assert duplicated_secret.encode() not in contents
+
+
+def test_same_timestamp_concurrent_backups_reserve_distinct_complete_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    same_time = datetime(2026, 9, 28, 12, 0, 0)
+    original_reserve = backup._reserve_archive_name
+    both_ready = Barrier(2)
+    call_lock = Lock()
+    initial_calls = 0
+
+    def synchronized_reserve(target_dir: Path, base: str, start_suffix: int = 0):
+        nonlocal initial_calls
+        with call_lock:
+            initial_calls += 1
+            wait_for_peer = initial_calls <= 2
+        if wait_for_peer:
+            both_ready.wait(timeout=5)
+        return original_reserve(target_dir, base, start_suffix)
+
+    monkeypatch.setattr(backup, "_reserve_archive_name", synchronized_reserve)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(lambda _index: create_backup(source, destination, now=same_time), range(2))
+        )
+
+    assert len({result.archive for result in results}) == 2
+    assert {result.archive.name for result in results} == {
+        "TempestTrace-2026-09-28_12-00-00.zip",
+        "TempestTrace-2026-09-28_12-00-00-1.zip",
+    }
+    for result in results:
+        with zipfile.ZipFile(result.archive) as archive:
+            assert archive.testzip() is None
+            assert "manifest.json" in archive.namelist()
+    assert not list(destination.glob(".*.reserve"))
+
+
+def test_late_final_name_collision_is_preserved_and_backup_uses_suffix(
+    tmp_path: Path,
+) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    same_time = datetime(2026, 9, 28, 12, 0, 0)
+    conflicting_final = destination / "TempestTrace-2026-09-28_12-00-00.zip"
+
+    def create_late_collision(phase: str, current: int, total: int) -> None:
+        if phase == "promoting":
+            conflicting_final.write_bytes(b"preexisting archive")
+
+    result = create_backup(source, destination, now=same_time, progress=create_late_collision)
+
+    assert conflicting_final.read_bytes() == b"preexisting archive"
+    assert result.archive.name == "TempestTrace-2026-09-28_12-00-00-1.zip"
+    with zipfile.ZipFile(result.archive) as archive:
+        assert archive.testzip() is None
+        assert "manifest.json" in archive.namelist()
+    assert not list(destination.glob(".*.reserve"))

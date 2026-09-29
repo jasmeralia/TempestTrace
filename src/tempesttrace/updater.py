@@ -607,6 +607,7 @@ fi
 rm -f -- "$helper"
 rm -f -- "$rollback"
 trap - EXIT HUP INT TERM
+nohup env PYINSTALLER_RESET_ENVIRONMENT=1 "$current" >/dev/null 2>&1 </dev/null &
 """
     helper.parent.mkdir(parents=True, exist_ok=True)
     with helper.open("x", encoding="utf-8", newline="\n") as output:

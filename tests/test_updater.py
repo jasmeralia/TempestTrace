@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import shlex
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 from typing import Any
@@ -496,6 +498,11 @@ def test_appimage_update_helper_waits_replaces_and_keeps_rollback(tmp_path: Path
     assert "mv" in script and "chmod +x" in script
     assert '"$current" --smoke-test' in script
     assert "sleep 10" not in script
+    assert 'nohup env PYINSTALLER_RESET_ENVIRONMENT=1 "$current"' in script
+    assert script.index('rm -f -- "$rollback"') < script.index("trap - EXIT HUP INT TERM")
+    assert script.index("trap - EXIT HUP INT TERM") < script.index(
+        "nohup env PYINSTALLER_RESET_ENVIRONMENT=1"
+    )
     assert "current AppImage" in script and "new AppImage" in script
 
 
@@ -508,7 +515,17 @@ def test_appimage_helper_uses_smoke_test_and_rolls_back_only_on_failure(
     stage = tmp_path / "stage"
     stage.mkdir()
     downloaded = stage / "TempestTrace.new.AppImage"
-    new_payload = f'#!/bin/sh\n[ "$1" = --smoke-test ] || exit 8\nexit {smoke_exit}\n'
+    events = tmp_path / "app-events.log"
+    events_q = shlex.quote(str(events))
+    new_payload = (
+        "#!/bin/sh\n"
+        f"events={events_q}\n"
+        'if [ "${1-}" = --smoke-test ]; then\n'
+        '    echo smoke >> "$events"\n'
+        f"    exit {smoke_exit}\n"
+        "fi\n"
+        'echo "launch:${PYINSTALLER_RESET_ENVIRONMENT:-missing}" >> "$events"\n'
+    )
     downloaded.write_text(new_payload, encoding="utf-8")
     downloaded.chmod(0o700)
     helper = stage / "apply-update.sh"
@@ -519,3 +536,13 @@ def test_appimage_helper_uses_smoke_test_and_rolls_back_only_on_failure(
     assert result.returncode == expected_exit
     assert current.read_bytes() == (new_payload.encode() if smoke_exit == 0 else b"old")
     assert not list(tmp_path.glob("*.tempesttrace-rollback.*"))
+    deadline = time.monotonic() + 2
+    while smoke_exit == 0 and time.monotonic() < deadline:
+        if events.exists() and "launch:1" in events.read_text(encoding="utf-8"):
+            break
+        time.sleep(0.01)
+    event_text = events.read_text(encoding="utf-8") if events.exists() else ""
+    if smoke_exit == 0:
+        assert event_text.splitlines() == ["smoke", "launch:1"]
+    else:
+        assert event_text.splitlines() == ["smoke"]

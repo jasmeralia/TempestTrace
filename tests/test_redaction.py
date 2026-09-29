@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from tempesttrace.redaction import _is_sensitive_key, has_unredacted_fields, redact_file
 
 
@@ -101,6 +103,60 @@ def test_quoted_json_credentials_in_ini_and_logs_are_redacted(tmp_path: Path) ->
     assert "INI_JSON_SECRET" not in ini.read_text(encoding="utf-8")
     assert "LOG_JSON_SECRET" not in log.read_text(encoding="utf-8")
     assert "LOG_TOKEN_SECRET" not in log.read_text(encoding="utf-8")
+
+
+def test_obsbasic_hotkey_context_does_not_exempt_nested_settings_key(tmp_path: Path) -> None:
+    ini = tmp_path / "basic.ini"
+    ini.write_text(
+        '[Output]\nOBSBasic.StartStreaming={"key":"OBS_KEY_F9",'
+        '"settings":{"key":"NESTED_STREAM_SECRET"},"token":"TOKEN_SECRET"}\n',
+        encoding="utf-8",
+    )
+    log = tmp_path / "current.txt"
+    log.write_text(
+        'OBSBasic.StartStreaming={"key":"OBS_KEY_F9",'
+        '"settings":{"key":"LOG_NESTED_STREAM_SECRET"}}\n',
+        encoding="utf-8",
+    )
+
+    redact_file(ini)
+    redact_file(log)
+
+    ini_clean = ini.read_text(encoding="utf-8")
+    log_clean = log.read_text(encoding="utf-8")
+    assert '"key":"OBS_KEY_F9"' in ini_clean and '"key":"<REDACTED>"' in ini_clean
+    assert "NESTED_STREAM_SECRET" not in ini_clean and "TOKEN_SECRET" not in ini_clean
+    assert "LOG_NESTED_STREAM_SECRET" not in log_clean
+
+
+def test_credential_free_embedded_json_keeps_its_original_formatting(tmp_path: Path) -> None:
+    path = tmp_path / "scene.json"
+    layout = '{"width": 1920, "height": 1080}'
+    path.write_text(json.dumps({"layout": layout}), encoding="utf-8")
+
+    categories, count = redact_file(path)
+
+    assert categories == {} and count == 0
+    assert json.loads(path.read_text(encoding="utf-8"))["layout"] == layout
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        r"escaped {\"token\":\"ESCAPED_SECRET\"}",
+        "repr {'token': 'SINGLE_SECRET'}",
+        'trail {"token":"TRAILING_SECRET",}',
+    ],
+)
+def test_non_strict_quoted_credential_text_is_redacted(tmp_path: Path, line: str) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(line + "\n", encoding="utf-8")
+
+    redact_file(path)
+
+    cleaned = path.read_text(encoding="utf-8")
+    for secret in ("ESCAPED_SECRET", "SINGLE_SECRET", "TRAILING_SECRET"):
+        assert secret not in cleaned
 
 
 def test_ordinary_words_ending_in_credential_suffix_are_not_sensitive() -> None:

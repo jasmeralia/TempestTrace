@@ -323,6 +323,48 @@ def test_private_verifier_detects_credentials_inside_embedded_json(
     assert backup._secret_scan(path)
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        r"escaped {\"token\":\"ESCAPED_SECRET\"}",
+        "repr {'token': 'SINGLE_SECRET'}",
+        'trail {"token":"TRAILING_SECRET",}',
+    ],
+)
+def test_private_verifier_detects_non_strict_quoted_credentials(tmp_path: Path, line: str) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(line, encoding="utf-8")
+
+    assert backup._secret_scan(path)
+
+
+def test_backup_redacts_nested_key_in_obsbasic_binding_without_losing_hotkey(
+    tmp_path: Path,
+) -> None:
+    source = fixture(tmp_path / "obs")
+    (source / "basic/profiles/default/basic.ini").write_text(
+        '[Output]\nOBSBasic.StartStreaming={"key":"OBS_KEY_F9",'
+        '"token":"INI_TOKEN_SECRET","settings":{"key":"INI_NESTED_SECRET"}}\n',
+        encoding="utf-8",
+    )
+    (source / "logs/2026-01-01.txt").write_text(
+        'OBSBasic.StartStreaming={"key":"OBS_KEY_F9","settings":{"key":"LOG_NESTED_SECRET"}}\n',
+        encoding="utf-8",
+    )
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    result = create_backup(source, destination)
+
+    assert not result.warnings
+    with zipfile.ZipFile(result.archive) as archive:
+        ini = archive.read("basic/profiles/default/basic.ini").decode("utf-8")
+        log = archive.read("logs/2026-01-01.txt").decode("utf-8")
+    assert '"key":"OBS_KEY_F9"' in ini and '"key":"<REDACTED>"' in ini
+    assert "INI_TOKEN_SECRET" not in ini and "INI_NESTED_SECRET" not in ini
+    assert "LOG_NESTED_SECRET" not in log
+
+
 def test_backup_verifier_preserves_hotkey_log_lines(tmp_path: Path) -> None:
     source = fixture(tmp_path / "obs")
     hotkey_line = "hotkey binding key=F9\n"

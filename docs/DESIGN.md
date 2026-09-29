@@ -102,10 +102,11 @@ diagnostic line. Maintain a versioned field/path rule list and fixtures taken fr
 synthetic OBS data; never commit Rin's real configuration or log samples.
 
 Also inspect valid JSON objects and arrays embedded in INI values, log lines, and
-string-valued JSON fields. Redact credential fields within those fragments and have
-the final verifier reject any remaining embedded credential fields. Preserve OBS
-hotkey `key` values in known hotkey structures, including `OBSBasic.*` JSON-valued
-INI assignments.
+string-valued JSON fields. Redact credential fields within those fragments and scan
+quoted credential assignments in malformed JSON-like text. The final verifier must
+reject either form if credentials remain. Preserve OBS hotkey `key` values only at
+the binding field in `OBSBasic.*` JSON-valued INI assignments; nested settings named
+`key` remain sensitive. Leave credential-free embedded JSON text byte-for-byte intact.
 
 Streamlabs source settings must remain equivalent to the original at the parsed JSON
 subtree level, with one exception: values matching a known credential pattern (stream

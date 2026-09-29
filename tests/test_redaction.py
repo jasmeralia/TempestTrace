@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from tempesttrace.redaction import redact_file
+from tempesttrace.redaction import _is_sensitive_key, has_unredacted_fields, redact_file
 
 
 def test_structured_redaction_preserves_other_values(tmp_path: Path) -> None:
@@ -45,3 +45,26 @@ def test_ini_backup_is_redacted(tmp_path: Path) -> None:
     backup.write_text("[Stream]\nstreamKey=BACKUP_SECRET\n", encoding="utf-8")
     redact_file(backup)
     assert "BACKUP_SECRET" not in backup.read_text(encoding="utf-8")
+
+
+def test_quoted_credentials_are_redacted_and_detected(tmp_path: Path) -> None:
+    log = tmp_path / "quoted.txt"
+    log.write_text("key=\"QUOTED_SECRET\" password='OTHER_SECRET'\n", encoding="utf-8")
+    categories, count = redact_file(log)
+    assert "QUOTED_SECRET" not in log.read_text(encoding="utf-8")
+    assert "OTHER_SECRET" not in log.read_text(encoding="utf-8")
+    assert categories == {"credential_pattern": 2} and count == 2
+
+    ini = tmp_path / "quoted.ini"
+    ini.write_text('password="INI_QUOTED_SECRET"\n', encoding="utf-8")
+    redact_file(ini)
+    assert "INI_QUOTED_SECRET" not in ini.read_text(encoding="utf-8")
+
+    assert has_unredacted_fields({"password": '"JSON_QUOTED_SECRET"'})
+
+
+def test_ordinary_words_ending_in_credential_suffix_are_not_sensitive() -> None:
+    assert not _is_sensitive_key("monkey")
+    assert not _is_sensitive_key("tokenizer")
+    assert _is_sensitive_key("apiKey")
+    assert _is_sensitive_key("stream_key")

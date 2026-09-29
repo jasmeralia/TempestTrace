@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from tempesttrace import backup
 from tempesttrace.backup import BackupCancelled, create_backup
 
 
@@ -130,3 +131,148 @@ def test_empty_obs_tree_is_not_reported_as_success(tmp_path: Path) -> None:
     destination.mkdir()
     with pytest.raises(ValueError, match="No supported OBS files"):
         create_backup(source, destination)
+
+
+def test_quoted_log_credential_fails_backup_verification_if_not_redacted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = fixture(tmp_path / "obs")
+    (source / "logs/2026-01-01.txt").write_text('key="LEAK_IF_UNVERIFIED"', encoding="utf-8")
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    original_redact_file = backup.redact_file_with_secrets
+
+    def leave_quoted_secret(path: Path):
+        if path.suffix == ".txt":
+            return {}, 0, set()
+        return original_redact_file(path)
+
+    monkeypatch.setattr(backup, "redact_file_with_secrets", leave_quoted_secret)
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        contents = b"".join(archive.read(name) for name in archive.namelist())
+        assert b"LEAK_IF_UNVERIFIED" not in contents
+        manifest = json.loads(archive.read("manifest.json"))
+        assert any(item["reason"] == "verification_secret_found" for item in manifest["skipped"])
+
+
+def test_cancel_during_zip_packaging_keeps_final_archive_unpromoted(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    packaging_started = False
+
+    def progress(phase: str, current: int, total: int) -> None:
+        nonlocal packaging_started
+        if phase == "packaging" and current >= 1:
+            packaging_started = True
+
+    with pytest.raises(BackupCancelled, match="cancelled"):
+        create_backup(source, destination, progress=progress, cancelled=lambda: packaging_started)
+    final_archives = [
+        path for path in destination.glob("TempestTrace-*.zip") if ".incomplete" not in path.name
+    ]
+    assert not final_archives
+    assert list(destination.glob("TempestTrace-*.incomplete.zip"))
+
+
+def test_cancel_after_zip_verification_prevents_final_promotion(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    promoting = False
+
+    def progress(phase: str, current: int, total: int) -> None:
+        nonlocal promoting
+        if phase == "promoting":
+            promoting = True
+
+    with pytest.raises(BackupCancelled, match="cancelled"):
+        create_backup(source, destination, progress=progress, cancelled=lambda: promoting)
+    final_archives = [
+        path for path in destination.glob("TempestTrace-*.zip") if ".incomplete" not in path.name
+    ]
+    assert not final_archives
+    assert list(destination.glob("TempestTrace-*.incomplete.zip"))
+
+
+@pytest.mark.parametrize("race_at", ["stat", "read"])
+def test_log_disappearing_during_inventory_or_read_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, race_at: str
+) -> None:
+    source = fixture(tmp_path / "obs")
+    disappearing_log = source / "logs/2026-01-01.txt"
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    if race_at == "stat":
+        original_stat = Path.stat
+        stat_calls = 0
+
+        def race_stat(path: Path, *args: object, **kwargs: object):
+            nonlocal stat_calls
+            if path == disappearing_log:
+                stat_calls += 1
+                if stat_calls > 1:
+                    raise FileNotFoundError(path)
+            return original_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", race_stat)
+    else:
+        original_read = backup._read_consistent
+
+        def race_read(path: Path, target: Path, max_bytes: int):
+            if path == disappearing_log:
+                raise FileNotFoundError(path)
+            return original_read(path, target, max_bytes)
+
+        monkeypatch.setattr(backup, "_read_consistent", race_read)
+
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+    assert any(
+        item["path"] == "logs/2026-01-01.txt" and item["reason"] == "unreadable"
+        for item in manifest["skipped"]
+    )
+
+
+def test_credential_duplicated_under_nonsensitive_json_key_is_removed_without_manifest_leak(
+    tmp_path: Path,
+) -> None:
+    source = fixture(tmp_path / "obs")
+    duplicated_secret = "DUPLICATED_STREAM_SECRET"
+    service = source / "basic/profiles/default/service.json"
+    service.write_text(
+        json.dumps({"key": duplicated_secret, "plugin_metadata": duplicated_secret}),
+        encoding="utf-8",
+    )
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        contents = b"".join(archive.read(name) for name in archive.namelist())
+        assert duplicated_secret.encode() not in contents
+        manifest_bytes = archive.read("manifest.json")
+        assert duplicated_secret.encode() not in manifest_bytes
+
+
+def test_nested_credential_duplicate_under_nonsensitive_key_does_not_leak(
+    tmp_path: Path,
+) -> None:
+    source = fixture(tmp_path / "obs")
+    duplicated_secret = "NESTED_DUPLICATED_SECRET"
+    service = source / "basic/profiles/default/service.json"
+    service.write_text(
+        json.dumps({"token": {"value": duplicated_secret}, "plugin_metadata": duplicated_secret}),
+        encoding="utf-8",
+    )
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        contents = b"".join(archive.read(name) for name in archive.namelist())
+    assert duplicated_secret.encode() not in contents

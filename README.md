@@ -1,7 +1,7 @@
 # TempestTrace
 
-TempestTrace is a Windows and Linux desktop utility in active development for collecting a safe OBS
-Studio diagnostic backup for troubleshooting Rin's screen flicker issue.
+TempestTrace is a prototype for a Windows and Linux desktop app that will collect a
+safe OBS Studio diagnostic backup for troubleshooting Rin's screen flicker issue.
 
 The [design and implementation plan](docs/DESIGN.md) defines the collection scope,
 redaction rules, user flow, tests, and release criteria. The synthetic-fixture

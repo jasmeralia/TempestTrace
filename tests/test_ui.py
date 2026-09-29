@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtGui import QDesktopServices
@@ -65,6 +67,54 @@ def test_incomplete_output_can_be_removed_after_cancel_or_failure(
     window._remove_incomplete()
     assert not partial.exists()
     assert window.cleanup_button.isHidden()
+    window.close()
+    assert app is not None
+
+
+def test_incomplete_zip_is_included_in_cleanup(tmp_path: Path, monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    obs = tmp_path / "obs"
+    obs.mkdir()
+    output = tmp_path / "out"
+    output.mkdir()
+    monkeypatch.setattr("tempesttrace.ui.discover_obs", lambda: [obs])
+    monkeypatch.setattr("tempesttrace.ui.discover_dropbox", lambda: None)
+    window = MainWindow()
+    window.destination = output
+    partial = output / "TempestTrace-2026-09-28_12-00-00.incomplete.zip"
+    partial.write_bytes(b"partial")
+    window._incomplete_outputs = [partial]
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+    window._remove_incomplete()
+
+    assert not partial.exists()
+    assert window.cleanup_button.isHidden()
+    window.close()
+    assert app is not None
+
+
+def test_worker_stopped_handles_disappearing_destination(tmp_path: Path, monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    obs = tmp_path / "obs"
+    obs.mkdir()
+    output = tmp_path / "out"
+    output.mkdir()
+    monkeypatch.setattr("tempesttrace.ui.discover_obs", lambda: [obs])
+    monkeypatch.setattr("tempesttrace.ui.discover_dropbox", lambda: None)
+    window = MainWindow()
+    window.destination = output
+    output.rmdir()
+
+    window._worker_stopped()
+
+    assert window._incomplete_outputs == []
+    assert window.cleanup_button.isHidden()
+    assert window.run_button.isEnabled()
     window.close()
     assert app is not None
 
@@ -226,8 +276,14 @@ def test_update_error_states_keep_collection_available(monkeypatch) -> None:
     monkeypatch.setattr("tempesttrace.ui.discover_obs", lambda: [])
     monkeypatch.setattr("tempesttrace.ui.discover_dropbox", lambda: None)
     prompts: list[str] = []
+    warning_text: list[str] = []
     monkeypatch.setattr(QMessageBox, "information", lambda _w, title, *_args: prompts.append(title))
-    monkeypatch.setattr(QMessageBox, "warning", lambda _w, title, *_args: prompts.append(title))
+
+    def record_warning(_window, title: str, message: str) -> None:
+        prompts.append(title)
+        warning_text.append(message)
+
+    monkeypatch.setattr(QMessageBox, "warning", record_warning)
     window = MainWindow()
     window._manual_update_check = True
     window._on_update_failed()
@@ -235,9 +291,11 @@ def test_update_error_states_keep_collection_available(monkeypatch) -> None:
     window._on_update_downloaded(object())
     assert prompts == [
         "Update check unavailable",
-        "Update verification failed",
+        "Update download failed",
         "Update",
     ]
+    assert "could not be downloaded or verified" in warning_text[0]
+    assert "size or SHA-256 check" not in warning_text[0]
     window.close()
     assert app is not None
 
@@ -272,14 +330,21 @@ def test_sandboxed_package_update_downloads_to_host_visible_folder(
     assert path.is_relative_to(tmp_path / "Downloads")
 
 
+@pytest.mark.parametrize(
+    ("package_type", "suffix", "expected_command"),
+    [
+        ("flatpak", "flatpak", "flatpak install --user --bundle --or-update"),
+        ("snap", "snap", "sudo snap install --dangerous"),
+    ],
+)
 def test_linux_update_handoff_shows_copyable_local_install_command(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, package_type: str, suffix: str, expected_command: str
 ) -> None:
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr("tempesttrace.ui.discover_obs", lambda: [])
     monkeypatch.setattr("tempesttrace.ui.discover_dropbox", lambda: None)
     window = MainWindow()
-    package = tmp_path / "TempestTrace update.flatpak"
+    package = tmp_path / f"TempestTrace update.{suffix}"
     package.write_bytes(b"verified")
     real_message_box = QMessageBox
 
@@ -314,6 +379,6 @@ def test_linux_update_handoff_shows_copyable_local_install_command(
             return self.picked
 
     monkeypatch.setattr("tempesttrace.ui.QMessageBox", FakeMessageBox)
-    window._handoff_verified_update(package, "flatpak")
-    assert app.clipboard().text() == (f"flatpak install --user --bundle --or-update '{package}'")
+    window._handoff_verified_update(package, package_type)
+    assert app.clipboard().text() == (f"{expected_command} '{package}'")
     window.close()

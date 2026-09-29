@@ -35,7 +35,7 @@ jobs:
       - name: Install package build tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes dpkg-dev rpm flatpak squashfs-tools snapd libfuse2t64
+          sudo apt-get install --yes dpkg-dev rpm flatpak squashfs-tools snapd libfuse2t64 xvfb xauth xdotool
           python -m pip install --upgrade pip
           python -m pip install . pyinstaller==6.22.3
       - name: Install pinned AppImageKit tool
@@ -89,13 +89,97 @@ jobs:
             dnf remove -y tempesttrace
             test ! -e /usr/bin/tempesttrace
           '
-      - name: Smoke-test local Snap install, launch, and uninstall
+      - name: Strict Snap install and explicit personal-files connection
         run: |
           package=$(find dist/linux -maxdepth 1 -name '*.snap' -print -quit)
           test -n "$package"
-          sudo snap install --dangerous --devmode "$package"
+          sudo snap install --dangerous "$package"
+          sudo snap connect tempesttrace:obs-config
+          sudo snap connections tempesttrace | grep -E 'personal-files[[:space:]]+tempesttrace:obs-config[[:space:]]+:personal-files'
           QT_QPA_PLATFORM=offscreen snap run tempesttrace --smoke-test
-          sudo snap remove tempesttrace
+      - name: Strict Snap synthetic OBS collection
+        env:
+          OBS_FIXTURE_SECRET: SNAP-CI-STREAM-KEY-NEVER-OUTPUT
+        run: |
+          fixture="$HOME/.config/obs-studio"
+          dropbox="$HOME/Dropbox"
+          output="$dropbox/Jasmeralia and Rin/obs logs"
+          mkdir -p "$fixture/basic/profiles/Fixture" "$fixture/basic/scenes" "$fixture/logs" \
+            "$HOME/.dropbox" "$output"
+          cat > "$fixture/basic/profiles/Fixture/service.json" <<EOF
+          {"type":"rtmp_common","settings":{"key":"$OBS_FIXTURE_SECRET"}}
+          EOF
+          cat > "$fixture/basic/scenes/Fixture.json" <<'EOF'
+          {"name":"Fixture","sources":[]}
+          EOF
+          printf '[General]\nFixture=true\n' > "$fixture/global.ini"
+          printf 'Synthetic OBS log: key=%s\n' "$OBS_FIXTURE_SECRET" > "$fixture/logs/fixture.txt"
+          cat > "$HOME/.dropbox/info.json" <<EOF
+          {"personal":{"path":"$dropbox"}}
+          EOF
+          find "$fixture" -type f -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/obs-before.sha256"
+          mkdir -p "$HOME/snap/tempesttrace/current/.config/WindsOfStorm"
+          printf '[updates]\nautomatic=false\n' > \
+            "$HOME/snap/tempesttrace/current/.config/WindsOfStorm/TempestTrace.conf"
+          SNAP_TEST_OUTPUT="$output" xvfb-run -a bash -euc '
+            QT_QPA_PLATFORM=xcb snap run tempesttrace >"$RUNNER_TEMP/tempesttrace-snap.log" 2>&1 &
+            snap_pid=$!
+            trap "kill \$snap_pid 2>/dev/null || true" EXIT
+            window_id=
+            for _ in $(seq 1 30); do
+              window_id=$(xdotool search --onlyvisible --name "^TempestTrace$" 2>/dev/null | head -n 1 || true)
+              [[ -n "$window_id" ]] && break
+              sleep 1
+            done
+            if [[ -z "$window_id" ]]; then cat "$RUNNER_TEMP/tempesttrace-snap.log"; exit 1; fi
+            xdotool windowfocus --sync "$window_id"
+            # OBS combo, OBS chooser, Dropbox chooser, then the default Create Backup button.
+            xdotool key --clearmodifiers Tab Tab Tab Return
+            for _ in $(seq 1 90); do
+              if find "$SNAP_TEST_OUTPUT" -maxdepth 1 -type f -name "TempestTrace-*.zip" \
+                ! -name "*.incomplete.zip" -print -quit | grep -q .; then exit 0; fi
+              sleep 1
+            done
+            cat "$RUNNER_TEMP/tempesttrace-snap.log"
+            exit 1
+          '
+          python - "$output" "$OBS_FIXTURE_SECRET" <<'PY'
+          import json
+          import sys
+          import zipfile
+          from pathlib import Path
+
+          output = Path(sys.argv[1])
+          secret = sys.argv[2].encode()
+          archives = list(output.glob("TempestTrace-*.zip"))
+          assert len(archives) == 1, f"expected one complete archive, found {archives}"
+          with zipfile.ZipFile(archives[0]) as archive:
+              names = set(archive.namelist())
+              expected = {
+                  "basic/profiles/Fixture/service.json",
+                  "basic/scenes/Fixture.json",
+                  "global.ini",
+                  "logs/fixture.txt",
+                  "README.txt",
+                  "manifest.json",
+              }
+              assert expected <= names, f"missing collected files: {expected - names}"
+              payloads = [archive.read(name) for name in names]
+              assert all(secret not in payload for payload in payloads), "fixture secret leaked"
+              profile = json.loads(archive.read("basic/profiles/Fixture/service.json"))
+              assert profile["settings"]["key"] == "<REDACTED>"
+              manifest = json.loads(archive.read("manifest.json"))
+              assert manifest["complete"] is True
+          PY
+          find "$fixture" -type f -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/obs-after.sha256"
+          diff -u "$RUNNER_TEMP/obs-before.sha256" "$RUNNER_TEMP/obs-after.sha256"
+      - name: Uninstall strict Snap and verify removal
+        if: always()
+        run: |
+          if sudo snap list tempesttrace >/dev/null 2>&1; then
+            sudo snap remove --purge tempesttrace
+          fi
+          ! sudo snap list tempesttrace >/dev/null 2>&1
       - name: Verify package metadata and AppImage launch
         run: |
           rpm -qp --info dist/linux/*.rpm

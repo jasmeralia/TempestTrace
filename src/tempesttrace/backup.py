@@ -17,7 +17,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from tempesttrace.redaction import RULE_VERSION, has_unredacted_fields, redact_file
+from tempesttrace.redaction import (
+    RULE_VERSION,
+    has_unredacted_fields,
+    redact_file_with_secrets,
+)
 
 MAX_FILE_SIZE = 32 * 1024 * 1024
 MAX_TOTAL_SIZE = 512 * 1024 * 1024
@@ -26,7 +30,7 @@ ALLOWED_PROFILE_SUFFIXES = {".ini", ".json", ".txt"}
 _SECRET_SCAN = re.compile(
     rb"(?i)(?:\bkey|stream[_ -]?key|bearer[_ -]?token|password|passwd|"
     rb"access[_ -]?token|client[_ -]?secret)\s*[=:]\s*"
-    rb"(?!<REDACTED>)[^\s,;\]\"']+"
+    rb"(?!<REDACTED>)(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;\]\"']+)"
 )
 
 
@@ -73,6 +77,17 @@ def _path_has_link(root: Path, path: Path) -> bool:
         if _is_link_or_reparse(current):
             return True
     return False
+
+
+def _recent_logs(root: Path, candidates: list[Path], skipped: list[dict[str, str]]) -> list[Path]:
+    recent: list[tuple[int, Path]] = []
+    for item in candidates:
+        try:
+            recent.append((item.stat().st_mtime_ns, item))
+        except OSError:
+            skipped.append({"path": item.relative_to(root).as_posix(), "reason": "unreadable"})
+    recent.sort(key=lambda entry: entry[0], reverse=True)
+    return [item for _, item in recent]
 
 
 def _inventory(root: Path, skipped: list[dict[str, str]]) -> list[Path]:  # noqa: PLR0912
@@ -142,7 +157,7 @@ def _inventory(root: Path, skipped: list[dict[str, str]]) -> list[Path]:  # noqa
                 skipped.append(
                     {"path": item.relative_to(root).as_posix(), "reason": "unsupported_file_type"}
                 )
-    log_candidates.sort(key=lambda item: item.stat().st_mtime_ns, reverse=True)
+    log_candidates = _recent_logs(root, log_candidates, skipped)
     candidates.extend(log_candidates[:MAX_LOG_FILES])
     for item in log_candidates[MAX_LOG_FILES:]:
         skipped.append(
@@ -192,6 +207,17 @@ def _secret_scan(path: Path) -> bool:
             )
         )
     return False
+
+
+def _contains_private_secret(path: Path, secrets: set[str]) -> bool:
+    """Check that redacted credential literals did not survive in the staged file."""
+    if not secrets:
+        return False
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return True
+    return any(secret and secret in text for secret in secrets)
 
 
 def create_backup(  # noqa: PLR0912, PLR0915
@@ -269,13 +295,16 @@ def create_backup(  # noqa: PLR0912, PLR0915
                 total += actual_size
                 if progress:
                     progress("redacting", index - 1, len(files))
-                categories, _redaction_count = redact_file(staged)
+                categories, _redaction_count, secrets = redact_file_with_secrets(staged)
             except FileLimitExceeded:
                 skipped.append({"path": rel_text, "reason": "size_limit_exceeded_during_read"})
                 continue
             except OSError, UnicodeError, ValueError, configparser.Error:
                 staged.unlink(missing_ok=True)
-                skipped.append({"path": rel_text, "reason": "unreadable_or_unsanitizable"})
+                reason = (
+                    "unreadable" if relative.parts[0] == "logs" else "unreadable_or_unsanitizable"
+                )
+                skipped.append({"path": rel_text, "reason": reason})
                 warnings.append(f"Could not safely include {rel_text}.")
                 continue
             if not consistent:
@@ -291,7 +320,7 @@ def create_backup(  # noqa: PLR0912, PLR0915
                 redaction_counts[category] = redaction_counts.get(category, 0) + amount
             if progress:
                 progress("verifying", index, len(files))
-            if _secret_scan(staged):
+            if _contains_private_secret(staged, secrets) or _secret_scan(staged):
                 staged.unlink(missing_ok=True)
                 skipped.append({"path": rel_text, "reason": "verification_secret_found"})
                 warnings.append(
@@ -348,17 +377,35 @@ def create_backup(  # noqa: PLR0912, PLR0915
                 raise ValueError("A credential pattern was detected in the backup report.")
         if progress:
             progress("verifying", len(files), len(files))
-            progress("packaging", len(records), len(records))
         with zipfile.ZipFile(
             incomplete_zip, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=6
         ) as archive:
-            for item in sorted(staging.rglob("*")):
+            archive_files = [
+                item
+                for item in sorted(staging.rglob("*"))
+                if item.is_file() and not _is_link_or_reparse(item)
+            ]
+            if progress:
+                progress("packaging", 0, len(archive_files))
+            for index, item in enumerate(archive_files, 1):
+                if cancelled is not None and cancelled():
+                    raise BackupCancelled("Collection cancelled.")
+                if progress:
+                    progress("packaging", index - 1, len(archive_files))
                 if item.is_file() and not _is_link_or_reparse(item):
                     archive.write(item, item.relative_to(staging).as_posix())
+            if cancelled is not None and cancelled():
+                raise BackupCancelled("Collection cancelled.")
+            if progress:
+                progress("packaging", len(archive_files), len(archive_files))
         with zipfile.ZipFile(incomplete_zip) as archive:
             bad_member = archive.testzip()
             if bad_member:
                 raise ValueError("The completed ZIP did not pass integrity verification.")
+        if progress:
+            progress("promoting", len(records), len(records))
+        if cancelled is not None and cancelled():
+            raise BackupCancelled("Collection cancelled.")
         os.replace(incomplete_zip, final)
         shutil.rmtree(staging)
         if progress:

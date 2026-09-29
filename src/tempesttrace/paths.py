@@ -23,6 +23,9 @@ def discover_obs(platform: str | None = None, env: Mapping[str, str] | None = No
             candidates.append(Path(values["APPDATA"]) / "obs-studio")
     else:
         home = _home(values)
+        real_home = (
+            Path(values["SNAP_REAL_HOME"]).expanduser() if values.get("SNAP_REAL_HOME") else None
+        )
         sandboxed = bool(
             values.get("FLATPAK_ID")
             or values.get("SNAP")
@@ -31,13 +34,16 @@ def discover_obs(platform: str | None = None, env: Mapping[str, str] | None = No
         )
         if values.get("HOST_XDG_CONFIG_HOME"):
             host_config = Path(values["HOST_XDG_CONFIG_HOME"])
+        elif real_home is not None:
+            host_config = real_home / ".config"
         elif values.get("XDG_CONFIG_HOME") and not sandboxed:
             host_config = Path(values["XDG_CONFIG_HOME"])
         else:
             host_config = home / ".config"
-        candidates.extend(
-            (host_config / "obs-studio", home / ".var/app/com.obsproject.Studio/config/obs-studio")
-        )
+        candidates.extend((host_config / "obs-studio",))
+        if real_home is not None:
+            candidates.append(real_home / ".var/app/com.obsproject.Studio/config/obs-studio")
+        candidates.append(home / ".var/app/com.obsproject.Studio/config/obs-studio")
     return list(dict.fromkeys(path for path in candidates if path.is_dir()))
 
 
@@ -54,7 +60,11 @@ def discover_dropbox(
             if values.get(key)
         ]
     else:
-        candidates = [_home(values) / ".dropbox/info.json"]
+        homes = (
+            [Path(values["SNAP_REAL_HOME"]).expanduser()] if values.get("SNAP_REAL_HOME") else []
+        )
+        homes.append(_home(values))
+        candidates = [home / ".dropbox/info.json" for home in homes]
     for info in candidates:
         try:
             data = json.loads(info.read_text(encoding="utf-8"))

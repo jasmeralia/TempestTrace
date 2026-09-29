@@ -122,6 +122,14 @@ def test_drafts_and_wrong_platform_architecture_or_package_are_ignored() -> None
     assert offer is None
 
 
+def test_fallback_asset_match_rejects_unrelated_project() -> None:
+    item = release(
+        "v1.8.0",
+        assets=[asset("OtherProject-v1.8.0-linux-amd64.deb")],
+    )
+    assert check_for_update("1.7.0", [item], "linux", "amd64", "deb", False) is None
+
+
 def test_release_without_valid_asset_checksum_is_rejected() -> None:
     item = release("v1.0.0", assets=[asset("TempestTrace-Setup-v1.0.0.exe")])
     item["checksums"] = {"TempestTrace-Setup-v1.0.0.exe": "not-a-hash"}
@@ -244,6 +252,51 @@ def test_fetch_release_feed_reads_checksums_and_sha256_sidecars() -> None:
     assert parsed[0]["checksums"] == {filename: "a" * 64, "other.deb": "b" * 64}
 
 
+def test_fetch_release_feed_follows_pagination_for_later_stable_releases() -> None:
+    filename = "TempestTrace-Setup-v1.3.0.exe"
+    page_two_release = {
+        "tag_name": "v1.3.0",
+        "prerelease": False,
+        "assets": [
+            asset(filename),
+            {
+                "name": "SHA256SUMS",
+                "browser_download_url": "https://assets.example.test/SHA256SUMS",
+            },
+        ],
+    }
+    page_urls: list[str] = []
+
+    class PageResponse(io.BytesIO):
+        def __init__(self, body: bytes, link: str | None = None) -> None:
+            super().__init__(body)
+            self.headers = {"Link": link} if link else {}
+
+    responses = {
+        "https://api.example.test/releases": PageResponse(
+            b"[]", '<https://api.example.test/releases?page=2>; rel="next"'
+        ),
+        "https://api.example.test/releases?page=2": PageResponse(
+            json.dumps([page_two_release]).encode()
+        ),
+        "https://assets.example.test/SHA256SUMS": PageResponse(
+            f"{'c' * 64}  {filename}\n".encode()
+        ),
+    }
+
+    def opener(url: str) -> PageResponse:
+        page_urls.append(url)
+        return responses[url]
+
+    releases = fetch_release_feed("https://api.example.test/releases", opener)
+    offer = check_for_update("1.2.0", releases, "windows", "amd64", "nsis", False)
+    assert page_urls[:2] == [
+        "https://api.example.test/releases",
+        "https://api.example.test/releases?page=2",
+    ]
+    assert offer is not None and offer.version == "1.3.0"
+
+
 @pytest.mark.parametrize(
     ("url", "body", "message"),
     [
@@ -306,5 +359,8 @@ def test_appimage_update_helper_waits_replaces_and_keeps_rollback(tmp_path: Path
     script = result.read_text(encoding="utf-8")
     assert "kill -0 '4321'" in script
     assert "tempesttrace-rollback" in script
+    assert "rollback=$(mktemp" in script
+    assert 'rm -f -- "$rollback"' in script
+    assert 'rmdir "$rollback"' not in script
     assert "mv" in script and "chmod +x" in script
     assert "current AppImage" in script and "new AppImage" in script

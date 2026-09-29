@@ -80,7 +80,9 @@ Section "TempestTrace" SecMain
   IfErrors install_failed
 
   ; Validate the replacement executable before removing rollback copies.
+  ClearErrors
   ExecWait '"$INSTDIR\TempestTrace.exe" --smoke-test' $0
+  IfErrors install_failed
   ${If} $0 != 0
     Goto install_failed
   ${EndIf}

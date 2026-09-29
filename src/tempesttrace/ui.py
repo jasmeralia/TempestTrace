@@ -421,13 +421,16 @@ class MainWindow(QMainWindow):
     @pyqtSlot()
     def _worker_stopped(self) -> None:
         if self.destination is not None:
-            self._incomplete_outputs = [
-                item
-                for item in self.destination.iterdir()
-                if item not in self._output_before
-                and item.name.startswith((".TempestTrace-", "TempestTrace-"))
-                and ("incomplete" in item.name)
-            ]
+            try:
+                self._incomplete_outputs = [
+                    item
+                    for item in self.destination.iterdir()
+                    if item not in self._output_before
+                    and item.name.startswith((".TempestTrace-", "TempestTrace-"))
+                    and ("incomplete" in item.name)
+                ]
+            except OSError:
+                self._incomplete_outputs = []
             self.cleanup_button.setVisible(bool(self._incomplete_outputs))
         self.run_button.setEnabled(True)
         self.cancel_button.setEnabled(True)
@@ -452,11 +455,16 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
         for path in self._incomplete_outputs:
-            if path.parent == self.destination and path.name.startswith(".TempestTrace-"):
-                if path.is_dir() and not path.is_symlink():
-                    shutil.rmtree(path)
-                else:
-                    path.unlink(missing_ok=True)
+            if path.parent == self.destination and path.name.startswith(
+                (".TempestTrace-", "TempestTrace-")
+            ):
+                try:
+                    if path.is_dir() and not path.is_symlink():
+                        shutil.rmtree(path)
+                    else:
+                        path.unlink(missing_ok=True)
+                except FileNotFoundError:
+                    pass
         self._incomplete_outputs = []
         self.cleanup_button.setVisible(False)
         self.status_bar.showMessage("Incomplete output removed", 5000)
@@ -607,9 +615,9 @@ class MainWindow(QMainWindow):
         self.status_bar.clearMessage()
         QMessageBox.warning(
             self,
-            "Update verification failed",
-            "The downloaded package failed its size or SHA-256 check. "
-            "The current version is unchanged.",
+            "Update download failed",
+            "The update could not be downloaded or verified. Check your network and available "
+            "disk space, then try again. The current version is unchanged.",
         )
 
     @pyqtSlot(object)
@@ -728,7 +736,9 @@ class MainWindow(QMainWindow):
         elif package == "snap":
             command = f"sudo snap install --dangerous {shlex.quote(str(package_path))}"
             detail = (
-                "Install the local Snap explicitly. --dangerous trusts this downloaded file; "
+                "Install this local Snap explicitly; if TempestTrace is already installed, "
+                "Snap treats the same-name local install as a refresh. --dangerous trusts this "
+                "downloaded file; "
                 "Snap Store refreshes do not discover GitHub assets. Strict confinement may "
                 "require `sudo snap connect tempesttrace:obs-config` once for OBS config access."
             )

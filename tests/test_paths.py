@@ -65,3 +65,21 @@ def test_linux_dropbox_metadata_resolves_relocated_folder(tmp_path: Path) -> Non
     info.parent.mkdir()
     info.write_text('{"personal": {"path": "' + str(relocated) + '"}}', encoding="utf-8")
     assert discover_dropbox("Linux", {"HOME": str(tmp_path)}) == relocated
+
+
+def test_snap_real_home_discovers_host_obs_and_dropbox(tmp_path: Path) -> None:
+    snap_home = tmp_path / "snap-home"
+    host_config = snap_home / ".config/obs-studio"
+    host_config.mkdir(parents=True)
+    dropbox = tmp_path / "Dropbox"
+    dropbox.mkdir()
+    metadata = snap_home / ".dropbox/info.json"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_text(
+        '{"personal": {"path": "' + str(dropbox).replace("\\", "\\\\") + '"}}',
+        encoding="utf-8",
+    )
+    env = {"HOME": str(tmp_path / "snap/current"), "SNAP_REAL_HOME": str(snap_home)}
+
+    assert discover_obs("Linux", env) == [host_config]
+    assert discover_dropbox("Linux", env) == dropbox

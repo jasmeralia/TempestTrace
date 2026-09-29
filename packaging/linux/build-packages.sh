@@ -157,7 +157,7 @@ apps:
   tempesttrace:
     command: usr/bin/tempesttrace
     desktop: usr/share/applications/io.github.jasmeralia.TempestTrace.desktop
-    plugs: [desktop, desktop-legacy, wayland, x11, opengl, home, obs-config]
+    plugs: [desktop, desktop-legacy, wayland, x11, opengl, home, network, obs-config]
 plugs:
   obs-config:
     interface: personal-files
@@ -169,6 +169,18 @@ parts:
   app:
     plugin: dump
     source: app
+    stage-packages:
+      - libx11-6
+      - libxcb1
+      - libxkbcommon-x11-0
+      - libxcb-cursor0
+      - libxcb-icccm4
+      - libxcb-image0
+      - libxcb-keysyms1
+      - libxcb-randr0
+      - libxcb-render-util0
+      - libxcb-xinerama0
+      - libxcb-xkb1
 EOF
     (cd "$dir" && snapcraft pack --destructive-mode --output \
         "$output_dir/TempestTrace-v${version_bare}-linux-${arch}.snap")

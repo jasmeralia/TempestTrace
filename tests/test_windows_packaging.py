@@ -47,9 +47,11 @@ def test_installer_marks_outputs_for_cleanup_before_writing_them() -> None:
 def test_installer_smoke_tests_new_executable_before_committing_upgrade() -> None:
     installer = INSTALLER.read_text(encoding="utf-8")
     smoke_test = installer.index("ExecWait '\"$INSTDIR\\TempestTrace.exe\" --smoke-test' $0")
+    clear_errors = installer.index("ClearErrors", installer.index("; Validate the replacement"))
+    exec_error_check = installer.index("IfErrors install_failed", smoke_test)
     rollback_cleanup = installer.index('!insertmacro RemoveRollbackFile "TempestTrace.exe"')
 
-    assert smoke_test < rollback_cleanup
+    assert clear_errors < smoke_test < exec_error_check < rollback_cleanup
     assert "${If} $0 != 0" in installer[smoke_test:rollback_cleanup]
 
 

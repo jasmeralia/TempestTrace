@@ -191,12 +191,13 @@ def _asset_name_matches(
         return False
     stem = name.casefold()[: -len(suffixes[package])]
     tokens = re.split(r"[^a-z0-9]+", stem)
+    has_project = "tempesttrace" in tokens
     arch_tokens = {"amd64": {"amd64", "x86_64", "x64"}, "arm64": {"arm64", "aarch64"}}[arch]
     version = str(SemVer.parse(tag)).casefold()
     has_version = re.search(rf"(?<![0-9.])v?{re.escape(version)}(?![0-9.])", stem) is not None
     has_arch = bool(arch_tokens.intersection(tokens))
     has_platform = "linux" in tokens or package in {"deb", "rpm", "snap"}
-    return has_version and has_arch and has_platform
+    return has_project and has_version and has_arch and has_platform
 
 
 def parse_sha256sums(contents: str) -> dict[str, str]:
@@ -302,20 +303,40 @@ def check_for_update(  # noqa: PLR0912, PLR0913, PLR0917
     return max(candidates, key=lambda item: item[0])[1] if candidates else None
 
 
-def _read_url(opener: Callable[[str], Any], url: str) -> bytes:
+def _read_url_with_headers(opener: Callable[[str], Any], url: str) -> tuple[bytes, str | None]:
     response = opener(url)
     close = getattr(response, "close", None)
     try:
         data = cast(bytes, response.read(MAX_DOWNLOAD_SIZE + 1))
+        headers = getattr(response, "headers", {})
+        link_header = headers.get("Link") if hasattr(headers, "get") else None
     finally:
         if callable(close):
             close()
     if len(data) > MAX_DOWNLOAD_SIZE:
         raise ValueError("release metadata exceeds size limit")
+    return data, cast(str | None, link_header)
+
+
+def _read_url(opener: Callable[[str], Any], url: str) -> bytes:
+    data, _ = _read_url_with_headers(opener, url)
     return data
 
 
-def fetch_release_feed(
+def _next_page_url(link_header: str | None) -> str | None:
+    if link_header is None:
+        return None
+    for entry in link_header.split(","):
+        match = re.fullmatch(r'\s*<([^>]+)>\s*;\s*rel="next"\s*', entry)
+        if match:
+            next_url = match.group(1)
+            if not next_url.startswith("https://"):
+                raise ValueError("release feed pagination must use HTTPS")
+            return next_url
+    return None
+
+
+def fetch_release_feed(  # noqa: PLR0912
     url: str = "https://api.github.com/repos/jasmeralia/TempestTrace/releases",
     opener: Callable[[str], Any] | None = None,
 ) -> list[dict[str, Any]]:
@@ -323,49 +344,57 @@ def fetch_release_feed(
     open_url = opener or (lambda target: urllib.request.urlopen(target, timeout=20))
     if not url.startswith("https://"):
         raise ValueError("release feed must use HTTPS")
-    raw = json.loads(_read_url(open_url, url))
-    if not isinstance(raw, list):
-        raise ValueError("release feed response must be a list")
     parsed: list[dict[str, Any]] = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        release = dict(item)
-        checksums: dict[str, str] = {}
-        assets = item.get("assets", [])
-        if isinstance(assets, list):
-            manifest_assets = [
-                asset
-                for asset in assets
-                if isinstance(asset, dict)
-                and isinstance(asset.get("name"), str)
-                and asset["name"].casefold() in {"sha256sums", "sha256sums.txt"}
-            ]
-            for manifest in manifest_assets[:1]:
-                manifest_url = manifest.get("browser_download_url")
-                if isinstance(manifest_url, str) and manifest_url.startswith("https://"):
-                    manifest_text = _read_url(open_url, manifest_url).decode("utf-8")
-                    checksums.update(parse_sha256sums(manifest_text))
-            for sidecar in assets:
-                if not isinstance(sidecar, dict):
-                    continue
-                sidecar_name = sidecar.get("name")
-                sidecar_url = sidecar.get("browser_download_url")
-                if (
-                    isinstance(sidecar_name, str)
-                    and sidecar_name.endswith(".sha256")
-                    and isinstance(sidecar_url, str)
-                    and sidecar_url.startswith("https://")
-                ):
-                    target_name = sidecar_name[:-7]
-                    text = _read_url(open_url, sidecar_url).decode("ascii").strip()
-                    match = re.fullmatch(r"([0-9a-fA-F]{64})(?:\s+\*?(.+))?", text)
-                    if match and (
-                        match.group(2) is None or Path(match.group(2)).name == target_name
+    page_url: str | None = url
+    visited_pages: set[str] = set()
+    while page_url is not None:
+        if page_url in visited_pages:
+            raise ValueError("release feed pagination loop detected")
+        visited_pages.add(page_url)
+        page_data, link_header = _read_url_with_headers(open_url, page_url)
+        raw = json.loads(page_data)
+        if not isinstance(raw, list):
+            raise ValueError("release feed response must be a list")
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            release = dict(item)
+            checksums: dict[str, str] = {}
+            assets = item.get("assets", [])
+            if isinstance(assets, list):
+                manifest_assets = [
+                    asset
+                    for asset in assets
+                    if isinstance(asset, dict)
+                    and isinstance(asset.get("name"), str)
+                    and asset["name"].casefold() in {"sha256sums", "sha256sums.txt"}
+                ]
+                for manifest in manifest_assets[:1]:
+                    manifest_url = manifest.get("browser_download_url")
+                    if isinstance(manifest_url, str) and manifest_url.startswith("https://"):
+                        manifest_text = _read_url(open_url, manifest_url).decode("utf-8")
+                        checksums.update(parse_sha256sums(manifest_text))
+                for sidecar in assets:
+                    if not isinstance(sidecar, dict):
+                        continue
+                    sidecar_name = sidecar.get("name")
+                    sidecar_url = sidecar.get("browser_download_url")
+                    if (
+                        isinstance(sidecar_name, str)
+                        and sidecar_name.endswith(".sha256")
+                        and isinstance(sidecar_url, str)
+                        and sidecar_url.startswith("https://")
                     ):
-                        checksums[target_name] = match.group(1).lower()
-        release["checksums"] = checksums
-        parsed.append(release)
+                        target_name = sidecar_name[:-7]
+                        text = _read_url(open_url, sidecar_url).decode("ascii").strip()
+                        match = re.fullmatch(r"([0-9a-fA-F]{64})(?:\s+\*?(.+))?", text)
+                        if match and (
+                            match.group(2) is None or Path(match.group(2)).name == target_name
+                        ):
+                            checksums[target_name] = match.group(1).lower()
+            release["checksums"] = checksums
+            parsed.append(release)
+        page_url = _next_page_url(link_header)
     return parsed
 
 
@@ -463,7 +492,7 @@ downloaded={downloaded_q}
 helper={helper_q}
 while kill -0 {pid_q} 2>/dev/null; do sleep 1; done
 rollback=$(mktemp "${{current}}.tempesttrace-rollback.XXXXXX")
-rmdir "$rollback"
+rm -f -- "$rollback"
 mv -- "$current" "$rollback"
 restore() {{
     if [ -e "$rollback" ]; then

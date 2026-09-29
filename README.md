@@ -55,11 +55,25 @@ log files; it redacts recognized credential fields and patterns in staged copies
 writes a timestamped ZIP, README, and manifest. Review skipped files and warnings in
 the manifest after collection.
 
+## Screenshots
+
+These screenshots are captured from the real Qt interface using synthetic OBS files
+and a temporary Dropbox folder. They contain no real profiles, logs, or credentials.
+
+### Review locations
+
+![TempestTrace source and backup destination selection](docs/images/main-window.png)
+
+### Sanitized backup complete
+
+![TempestTrace showing a completed sanitized backup](docs/images/backup-complete.png)
+
 ## Development
 
 Install dependencies with `make deps`, launch with `python -m tempesttrace`, and run
 the synthetic suite with `make test`. Collection and redaction live outside Qt so path
 discovery and backup behavior can be exercised with temporary fixture directories.
+Regenerate the README screenshots with `make screenshots` after UI changes.
 
 ## Source references
 

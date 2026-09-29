@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (
 
 from tempesttrace.backup import BackupCancelled, BackupResult, create_backup
 from tempesttrace.paths import discover_dropbox, discover_obs
+from tempesttrace.theme import apply_theme
 from tempesttrace.updater import (
     UpdateOffer,
     check_for_update,
@@ -88,6 +89,7 @@ class UpdateDownloadWorker(QObject):
 
     @pyqtSlot()
     def run(self) -> None:
+        folder: Path | None = None
         try:
             package = detect_package_type()
             if package == "appimage":
@@ -108,6 +110,8 @@ class UpdateDownloadWorker(QObject):
             if package == "appimage":
                 path.chmod(path.stat().st_mode | 0o111)
         except Exception:
+            if folder is not None:
+                shutil.rmtree(folder, ignore_errors=True)
             self.failed.emit()
         else:
             self.finished.emit(path)
@@ -154,6 +158,9 @@ class BackupWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self, *, enable_updates: bool = True) -> None:  # noqa: PLR0915
         super().__init__()
+        application = QApplication.instance()
+        if application is not None:
+            apply_theme(cast(QApplication, application), self)
         self.updates_enabled = enable_updates
         self.setWindowTitle("TempestTrace")
         self.setMinimumWidth(610)
@@ -276,7 +283,6 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status_bar)
         self.setCentralWidget(root)
         self._load_paths()
-        self._style()
         if enable_updates and self.auto_update_action.isChecked():
             QTimer.singleShot(1500, self._automatic_update_check)
 
@@ -848,21 +854,6 @@ class MainWindow(QMainWindow):
                 clipboard.setText(command)
         elif box.clickedButton() == folder_button:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(package_path.parent)))
-
-    def _style(self) -> None:
-        self.setStyleSheet(
-            "QMainWindow { background: #181a1f; color: #e7e9ee; }"
-            "QWidget { color: #e7e9ee; font-size: 10pt; }"
-            "#heading { font-size: 20pt; font-weight: 600; padding: 8px 0; }"
-            "QGroupBox { border: 1px solid #424650; border-radius: 6px; "
-            "margin-top: 10px; padding: 12px; }"
-            "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }"
-            "QPushButton { background: #30343d; border: 1px solid #505661; "
-            "border-radius: 4px; padding: 8px 12px; }"
-            "QPushButton:hover { background: #3a404b; } QPushButton:disabled { color: #848995; }"
-            "QComboBox, QProgressBar { background: #22252b; border: 1px solid #505661; "
-            "border-radius: 4px; padding: 5px; }"
-        )
 
 
 def main() -> int:

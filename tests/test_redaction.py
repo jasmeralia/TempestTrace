@@ -68,6 +68,31 @@ def test_ordinary_words_ending_in_credential_suffix_are_not_sensitive() -> None:
     assert not _is_sensitive_key("tokenizer")
     assert _is_sensitive_key("apiKey")
     assert _is_sensitive_key("stream_key")
+    assert _is_sensitive_key("CUSTOMTOKEN")
+    assert _is_sensitive_key("REFRESH_TOKEN")
+    assert _is_sensitive_key("OAUTH_TOKEN")
+
+
+def test_redacts_uppercase_unknown_credential_suffix(tmp_path: Path) -> None:
+    service = tmp_path / "service.json"
+    service.write_text(
+        json.dumps(
+            {
+                "CUSTOMTOKEN": "CUSTOM_SECRET",
+                "REFRESH_TOKEN": "REFRESH_SECRET",
+                "OAUTH_TOKEN": "OAUTH_SECRET",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    redact_file(service)
+
+    assert json.loads(service.read_text(encoding="utf-8")) == {
+        "CUSTOMTOKEN": "<REDACTED>",
+        "REFRESH_TOKEN": "<REDACTED>",
+        "OAUTH_TOKEN": "<REDACTED>",
+    }
 
 
 def test_url_query_credentials_and_log_token_variants_are_redacted(tmp_path: Path) -> None:

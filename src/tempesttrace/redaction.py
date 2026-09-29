@@ -62,12 +62,11 @@ def _is_sensitive_key(key: str, context: tuple[str, ...] = ()) -> bool:
         )
     if normalized in credential_names:
         return True
+    suffixes = ("key", "token", "password", "passwd", "secret")
+    folded_key = key.casefold()
     return bool(
-        re.search(
-            r"(?:^|[^a-zA-Z0-9])(?:key|token|password|passwd|secret)$"
-            r"|(?<=[a-z0-9])(?:Key|Token|Password|Passwd|Secret)$",
-            key,
-        )
+        re.search(r"(?:^|[^a-z0-9])(?:key|token|password|passwd|secret)$", folded_key)
+        or any(folded_key.endswith(suffix) and key[-len(suffix) :] != suffix for suffix in suffixes)
     )
 
 

@@ -191,10 +191,12 @@ explain a failure.
 
 ## Architecture and toolchain
 
-- Python 3 with PyQt6, following StormFuse's small dark desktop UI and worker-thread
-  pattern. Keep pure collection/redaction code separate from Qt, so it runs in
-  Linux CI and can be tested with fixture trees. Use `pathlib` and separate Windows
-  and Linux path adapters; the GUI only coordinates the plan and displays results.
+- Python 3 with PyQt6, following GaleFling's dark palette and component styling plus
+  StormFuse's small desktop UI and worker-thread pattern. Use the shared GaleFling
+  color and typography tokens throughout the interface. Keep pure collection and
+  redaction code separate from Qt so it runs in Linux CI and can be tested with fixture
+  trees. Use `pathlib` and separate Windows and Linux path adapters; the GUI only
+  coordinates the plan and displays results.
 - Suggested modules: `paths` (OBS/Dropbox discovery), `inventory` (allowlist and size
   checks), `snapshot` (read-only copies and consistency), `redaction` (JSON, INI, log
   rules), `verify` (output scan and manifest), `package` (compress the verified

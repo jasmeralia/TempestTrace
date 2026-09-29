@@ -508,6 +508,33 @@ def test_sandboxed_package_update_downloads_to_host_visible_folder(
     assert path.is_relative_to(tmp_path / "Downloads")
 
 
+def test_update_download_removes_temporary_folder_after_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr("tempesttrace.ui.Path.home", lambda: tmp_path)
+    monkeypatch.setattr("tempesttrace.ui.detect_package_type", lambda: "flatpak")
+
+    def fail_download(*_args):
+        raise OSError("download failed")
+
+    monkeypatch.setattr("tempesttrace.ui.verify_download", fail_download)
+    offer = UpdateOffer(
+        "1.2.3",
+        False,
+        "",
+        "",
+        ReleaseAsset("TempestTrace.flatpak", "https://example.test/pkg", 8, "a" * 64),
+    )
+    worker = UpdateDownloadWorker(offer)
+    failures: list[bool] = []
+    worker.failed.connect(lambda: failures.append(True))
+
+    worker.run()
+
+    assert failures == [True]
+    assert list((tmp_path / "Downloads").iterdir()) == []
+
+
 def test_windows_update_handoff_resets_pyinstaller_environment(tmp_path: Path, monkeypatch) -> None:
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr("tempesttrace.ui.discover_obs", lambda: [])

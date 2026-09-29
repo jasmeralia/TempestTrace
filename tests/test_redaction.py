@@ -153,3 +153,28 @@ def test_short_credentials_do_not_corrupt_substring_matches(tmp_path: Path) -> N
     redact_file(structured)
     value = json.loads(structured.read_text(encoding="utf-8"))
     assert value == {"token": "<REDACTED>", "mirror": "<REDACTED>", "description": "texture"}
+
+
+def test_duplicate_credentials_under_nonsensitive_keys_are_counted(tmp_path: Path) -> None:
+    structured = tmp_path / "service.json"
+    structured.write_text(
+        json.dumps(
+            {
+                "token": "DUPLICATE_SECRET",
+                "mirror": "DUPLICATE_SECRET",
+                "history": ["DUPLICATE_SECRET"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    categories, count = redact_file(structured)
+
+    value = json.loads(structured.read_text(encoding="utf-8"))
+    assert value == {
+        "token": "<REDACTED>",
+        "mirror": "<REDACTED>",
+        "history": ["<REDACTED>"],
+    }
+    assert categories == {"credential_field": 3}
+    assert count == 3

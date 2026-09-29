@@ -45,6 +45,27 @@ def test_window_initializes_discovered_locations_and_completion_actions(
     assert app is not None
 
 
+def test_window_keeps_proposed_dropbox_destination_when_not_created_yet(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    obs = tmp_path / "obs"
+    dropbox = tmp_path / "Dropbox"
+    obs.mkdir()
+    dropbox.mkdir()
+    proposed = dropbox / "Jasmeralia and Rin/obs logs"
+    monkeypatch.setattr("tempesttrace.ui.discover_obs", lambda: [obs])
+    monkeypatch.setattr("tempesttrace.ui.discover_dropbox", lambda: dropbox)
+
+    window = MainWindow(enable_updates=False)
+
+    assert window.destination == proposed
+    assert not proposed.exists()
+    assert window.destination_label.text() == str(proposed)
+    window.close()
+    assert app is not None
+
+
 def test_close_waits_for_backup_and_update_workers(monkeypatch: pytest.MonkeyPatch) -> None:
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr("tempesttrace.ui.discover_obs", lambda: [])
@@ -308,6 +329,84 @@ def test_start_rejects_missing_source_and_destination(tmp_path: Path, monkeypatc
     assert app is not None
 
 
+def test_start_backup_waits_until_update_worker_stops(tmp_path: Path, monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    obs = tmp_path / "obs"
+    obs.mkdir()
+    monkeypatch.setattr("tempesttrace.ui.discover_obs", lambda: [obs])
+    monkeypatch.setattr("tempesttrace.ui.discover_dropbox", lambda: None)
+    warnings: list[str] = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda _w, title, *_args: warnings.append(title))
+    window = MainWindow(enable_updates=False)
+    window.destination = tmp_path / "backup"
+
+    class RunningThread:
+        def isRunning(self) -> bool:
+            return True
+
+    window.update_thread = cast(QThread, RunningThread())
+    window._start_backup()
+
+    assert warnings == ["Update in progress"]
+    assert not window.destination.exists()
+    window.update_thread = None
+    window.close()
+    assert app is not None
+
+
+def test_manual_update_check_waits_until_backup_stops(monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("tempesttrace.ui.discover_obs", lambda: [])
+    monkeypatch.setattr("tempesttrace.ui.discover_dropbox", lambda: None)
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox, "information", lambda _w, title, *_args: warnings.append(title)
+    )
+    window = MainWindow()
+
+    class RunningThread:
+        def isRunning(self) -> bool:
+            return True
+
+    window.worker_thread = cast(QThread, RunningThread())
+    window._check_for_updates(manual=True)
+
+    assert warnings == ["Backup in progress"]
+    assert window.update_thread is None
+    window.worker_thread = None
+    window.close()
+    assert app is not None
+
+
+def test_automatic_update_check_is_deferred_until_backup_stops(monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("tempesttrace.ui.discover_obs", lambda: [])
+    monkeypatch.setattr("tempesttrace.ui.discover_dropbox", lambda: None)
+    window = MainWindow(enable_updates=False)
+
+    class RunningThread:
+        running = True
+
+        def isRunning(self) -> bool:
+            return self.running
+
+    backup_thread = RunningThread()
+    window.worker_thread = cast(QThread, backup_thread)
+    checks: list[bool] = []
+    monkeypatch.setattr(window, "_check_for_updates", lambda *, manual: checks.append(manual))
+    window._automatic_update_check()
+
+    assert checks == []
+    assert window._automatic_update_pending
+    backup_thread.running = False
+    window._worker_stopped()
+
+    assert checks == [False]
+    assert not window._automatic_update_pending
+    window.close()
+    assert app is not None
+
+
 def test_update_preferences_and_manual_source_build_check(tmp_path: Path, monkeypatch) -> None:
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr("tempesttrace.ui.discover_obs", lambda: [])
@@ -497,6 +596,42 @@ def test_appimage_update_handoff_resets_pyinstaller_environment(
     window._handoff_appimage(package)
 
     assert calls[0][1]["env"]["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
+    window.close()
+    assert app is not None
+
+
+def test_appimage_update_handoff_is_rejected_while_backup_is_running(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("tempesttrace.ui.discover_obs", lambda: [])
+    monkeypatch.setattr("tempesttrace.ui.discover_dropbox", lambda: None)
+    monkeypatch.setenv("APPIMAGE", str(tmp_path / "current.AppImage"))
+    prompts: list[str] = []
+    launches: list[object] = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda _w, title, *_args: prompts.append(title))
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(
+        "tempesttrace.ui.subprocess.Popen", lambda *args, **kwargs: launches.append(args)
+    )
+    package = tmp_path / "update.AppImage"
+    package.write_bytes(b"verified update")
+    window = MainWindow(enable_updates=False)
+
+    class RunningThread:
+        def isRunning(self) -> bool:
+            return True
+
+    window.worker_thread = cast(QThread, RunningThread())
+    window._handoff_appimage(package)
+
+    assert prompts == ["Backup in progress"]
+    assert launches == []
+    window.worker_thread = None
     window.close()
     assert app is not None
 

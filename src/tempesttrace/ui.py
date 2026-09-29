@@ -169,6 +169,7 @@ class MainWindow(QMainWindow):
         self.update_thread: QThread | None = None
         self.update_worker: UpdateCheckWorker | UpdateDownloadWorker | None = None
         self._manual_update_check = False
+        self._automatic_update_pending = False
         self._pending_offer: UpdateOffer | None = None
         self._close_requested = False
         self._allow_close = False
@@ -296,8 +297,7 @@ class MainWindow(QMainWindow):
         if self.dropbox_root:
             proposed = self.dropbox_root / "Jasmeralia and Rin/obs logs"
             self.destination_label.setText(str(proposed))
-            if proposed.is_dir():
-                self.destination = proposed
+            self.destination = proposed
 
     def _choose_obs(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Choose OBS configuration folder")
@@ -317,6 +317,13 @@ class MainWindow(QMainWindow):
             self.destination_label.setText(str(self.destination))
 
     def _start_backup(self) -> None:
+        if self.update_thread is not None:
+            QMessageBox.warning(
+                self,
+                "Update in progress",
+                "Wait for the current update check or download to finish before creating a backup.",
+            )
+            return
         source = self.obs_combo.currentData()
         if not isinstance(source, Path) or not source.is_dir():
             QMessageBox.warning(
@@ -443,6 +450,10 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(False)
         self.worker_thread = None
         self.worker = None
+        if self._automatic_update_pending:
+            self._automatic_update_pending = False
+            if not self._close_requested and self.auto_update_action.isChecked():
+                self._check_for_updates(manual=False)
         self._finish_deferred_close()
 
     def closeEvent(self, event: QCloseEvent | None) -> None:
@@ -538,10 +549,23 @@ class MainWindow(QMainWindow):
 
     def _automatic_update_check(self) -> None:
         if self.auto_update_action.isChecked():
+            if self.worker_thread is not None and self.worker_thread.isRunning():
+                self._automatic_update_pending = True
+                return
             self._check_for_updates(manual=False)
 
     def _check_for_updates(self, *, manual: bool) -> None:
         if not self.updates_enabled:
+            return
+        if self.worker_thread is not None and self.worker_thread.isRunning():
+            if manual:
+                QMessageBox.information(
+                    self,
+                    "Backup in progress",
+                    "Wait for the current backup to finish before checking for updates.",
+                )
+            else:
+                self._automatic_update_pending = True
             return
         if self.update_thread is not None:
             if manual:
@@ -736,6 +760,14 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(package_path)))
 
     def _handoff_appimage(self, package_path: Path) -> None:
+        if self.worker_thread is not None and self.worker_thread.isRunning():
+            QMessageBox.warning(
+                self,
+                "Backup in progress",
+                "Wait for the current backup to finish before replacing the AppImage. "
+                "The update was not started.",
+            )
+            return
         current = os.environ.get("APPIMAGE")
         if not current:
             QMessageBox.warning(

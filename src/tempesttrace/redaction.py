@@ -177,6 +177,11 @@ def _redact_object(
         return [_redact_object(child, counts, secrets, context) for child in value]
     if isinstance(value, str):
         if value in secrets:
+            # Secret literals are collected across the whole document so that
+            # duplicate values under otherwise benign keys are scrubbed too.
+            # Count each replacement just like a sensitive-key replacement.
+            if value != REDACTED:
+                counts["credential_field"] = counts.get("credential_field", 0) + 1
             return REDACTED
         return _scrub_text(_redact_embedded(value, counts), secrets)
     return value

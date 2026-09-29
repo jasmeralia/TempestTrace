@@ -7,15 +7,17 @@ import re
 from pathlib import Path
 from typing import Any
 
-RULE_VERSION = 5
+RULE_VERSION = 6
 REDACTED = "<REDACTED>"
 _LOG_PATTERNS = (
     re.compile(
         r"(?i)((?<![?&])\b(?:key|stream[_ -]?key|api[_ -]?key|token|auth[_ -]?token|"
         r"bearer[_ -]?token|password|passwd|access[_ -]?token|client[_ -]?secret)"
-        r"(?:\\?[\"'])?\s*[=:]\s*)"
-        r'(\\?"(?:\\.|[^"\\])*\\?"|\\?\'(?:\\.|[^\'\\])*\\?\'|'
-        r"[^\s,;\]\"\'}]+)"
+        r"(?:\\*[\"']|&quot;)?(?:\s|/\*[^*\r\n]*\*/)*[=:]"
+        r"(?:\s|/\*[^*\r\n]*\*/)*)"
+        r'(\\*"(?:\\[^\r\n]|[^"\\\r\n])*\\*"|'
+        r"\\*'(?:\\[^\r\n]|[^'\\\r\n])*\\*'|"
+        r"&quot;[^\r\n]*?&quot;|[^\s,;\]\"\'}]+)"
     ),
     re.compile(r"(?i)(\bAuthorization:\s*(?:Bearer|Basic)\s+)([^\s,;]+)"),
 )
@@ -77,14 +79,18 @@ def _is_sensitive_key(key: str, context: tuple[str, ...] = ()) -> bool:
 
 def _unquote(value: str) -> str:
     value = value.strip()
-    quoted = re.match(r"^(\\?[\"'])(.*?)(\\?[\"'])$", value)
+    if value.casefold().startswith("&quot;") and value.casefold().endswith("&quot;"):
+        return value[6:-6]
+    quoted = re.match(r"^(\\*[\"'])(.*?)(\\*[\"'])$", value)
     if quoted and quoted.group(1).lstrip("\\") == quoted.group(3).lstrip("\\"):
         return quoted.group(2)
     return value
 
 
 def _quoted_redacted(value: str) -> str:
-    quoted = re.match(r"^(\\?[\"'])(.*?)(\\?[\"'])$", value)
+    if value.casefold().startswith("&quot;") and value.casefold().endswith("&quot;"):
+        return f"&quot;{REDACTED}&quot;"
+    quoted = re.match(r"^(\\*[\"'])(.*?)(\\*[\"'])$", value)
     if quoted and quoted.group(1).lstrip("\\") == quoted.group(3).lstrip("\\"):
         return f"{quoted.group(1)}{REDACTED}{quoted.group(3)}"
     return REDACTED
@@ -116,14 +122,15 @@ def _sub_outside_json(text: str, pattern: re.Pattern[str], replace: Any) -> str:
     return "".join(pieces)
 
 
-def is_noncredential_log_match(text: str, match: re.Match[str]) -> bool:
+def is_noncredential_log_match(_text: str, match: re.Match[str]) -> bool:
     """Identify ambiguous key assignments that are not credential values."""
     field_name = re.split(r"\s*[=:]", match.group(1), maxsplit=1)[0].casefold()
     field_name = re.sub(r"[\\\"']", "", field_name)
     if field_name != "key":
         return False
-    start = text.rfind("\n", 0, match.start()) + 1
-    prefix = text[start : match.start()]
+    match_text = match.string
+    start = match_text.rfind("\n", 0, match.start()) + 1
+    prefix = match_text[start : match.start()]
     return bool(
         re.search(r"(?i)\b(?:hotkey(?:\s+binding)?|key.?binding|shortcut)\s*$", prefix)
         or re.search(r"(?i)\b(?:chroma|colou?r)\s*$", prefix)
@@ -165,13 +172,14 @@ def _json_fragments(text: str) -> list[tuple[int, int, Any, tuple[str, ...]]]:
             continue
         end = start + length
         line_start = text.rfind("\n", 0, start) + 1
-        assignment_prefix = text[line_start:start]
+        previous_line_start = text.rfind("\n", 0, max(0, line_start - 1)) + 1
+        assignment_prefix = text[previous_line_start:start]
         # OBS stores individual action bindings as JSON-valued INI assignments.
         # Their bare `key` property is a hotkey, while other credential fields
         # in the same object still receive normal structural redaction.
         context = (
             ("<embedded>", "__obsbasic_hotkey_binding__")
-            if re.search(r"(?i)\bOBSBasic\.[\w.]+\s*=\s*$", assignment_prefix)
+            if re.search(r"(?i)\bOBSBasic\.[\w.]+\s*=\s*(?:\r?\n\s*)*$", assignment_prefix)
             else ("<embedded>",)
         )
         fragments.append((start, end, value, context))
@@ -320,11 +328,11 @@ def has_unredacted_embedded_json(text: str) -> bool:
 def has_unredacted_ini_fields(text: str, filename: str) -> bool:
     """Check INI assignments using the same key rules as the redactor."""
     for line in text.splitlines():
-        match = re.match(r"^\s*([^=:#\s]+)\s*[=:]\s*(.*?)\s*$", line)
+        match = re.match(r"^\s*([A-Za-z0-9_.-][^=:#\s]*)\s*[=:]\s*(.*?)\s*$", line)
         if (
             match
             and _is_sensitive_key(match.group(1), (filename,))
-            and match.group(2) not in ("", REDACTED)
+            and _unquote(match.group(2)) not in ("", REDACTED)
         ):
             return True
     return False
@@ -333,7 +341,7 @@ def has_unredacted_ini_fields(text: str, filename: str) -> bool:
 def _ini_secret_values(text: str, filename: str) -> set[str]:
     secrets: set[str] = set()
     for line in text.splitlines():
-        match = re.match(r"^\s*([^=:#\s]+)\s*[=:]\s*(.*?)\s*$", line)
+        match = re.match(r"^\s*([A-Za-z0-9_.-][^=:#\s]*)\s*[=:]\s*(.*?)\s*$", line)
         if match and _is_sensitive_key(match.group(1), (filename,)):
             secret = _unquote(match.group(2))
             if secret and secret != REDACTED:
@@ -344,7 +352,10 @@ def _ini_secret_values(text: str, filename: str) -> set[str]:
 def _redact_ini(text: str, filename: str, counts: dict[str, int], secrets: set[str]) -> str:
     lines: list[str] = []
     for original_line in text.splitlines(keepends=True):
-        match = re.match(r"^(\s*)([^=:#\s]+)(\s*[=:]\s*)(.*?)(\r?\n)?$", original_line)
+        match = re.match(
+            r"^(\s*)([A-Za-z0-9_.-][^=:#\s]*)(\s*[=:]\s*)(.*?)(\r?\n)?$",
+            original_line,
+        )
         if match and _is_sensitive_key(match.group(2), (filename,)) and match.group(4).strip():
             cleaned = (
                 f"{match.group(1)}{match.group(2)}{match.group(3)}{REDACTED}{match.group(5) or ''}"

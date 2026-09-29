@@ -309,6 +309,40 @@ def test_private_verifier_detects_plain_and_quoted_log_credentials(
 @pytest.mark.parametrize(
     ("filename", "content"),
     [
+        ("log.txt", 'key="<REDACTED>"'),
+        ("log.txt", 'token="<REDACTED>"'),
+        ("basic.ini", 'token="<REDACTED>"'),
+    ],
+)
+def test_private_verifier_accepts_quoted_redaction_marker(
+    tmp_path: Path, filename: str, content: str
+) -> None:
+    path = tmp_path / filename
+    path.write_text(content, encoding="utf-8")
+
+    assert not backup._secret_scan(path)
+
+
+def test_backup_includes_log_after_quoted_credentials_are_redacted(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    (source / "logs/2026-01-03.txt").write_text(
+        'key="QUOTED_KEY_SECRET" token="QUOTED_TOKEN_SECRET"\n', encoding="utf-8"
+    )
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    result = create_backup(source, destination)
+
+    assert not result.warnings
+    with zipfile.ZipFile(result.archive) as archive:
+        name = "logs/2026-01-03.txt"
+        assert name in archive.namelist()
+        assert archive.read(name).decode("utf-8") == 'key="<REDACTED>" token="<REDACTED>"\n'
+
+
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [
         ("basic.ini", 'OBSBasic.StartStreaming={"key":"OBS_KEY_F9","token":"INI_SECRET"}'),
         ("current.txt", '{"settings":{"key":"LOG_SECRET","token":"LOG_TOKEN_SECRET"}}'),
         ("scene.json", json.dumps({"payload": '{"key":"SCENE_SECRET"}'})),
@@ -327,8 +361,11 @@ def test_private_verifier_detects_credentials_inside_embedded_json(
     "line",
     [
         r"escaped {\"token\":\"ESCAPED_SECRET\"}",
+        r'double {\\"token\\":\\"DOUBLE_ESC_SECRET\\"}',
         "repr {'token': 'SINGLE_SECRET'}",
         'trail {"token":"TRAILING_SECRET",}',
+        '{"token" /*comment*/: "COMMENT_SECRET"}',
+        "{&quot;token&quot;:&quot;HTML_SECRET&quot;}",
     ],
 )
 def test_private_verifier_detects_non_strict_quoted_credentials(tmp_path: Path, line: str) -> None:
@@ -336,6 +373,13 @@ def test_private_verifier_detects_non_strict_quoted_credentials(tmp_path: Path, 
     path.write_text(line, encoding="utf-8")
 
     assert backup._secret_scan(path)
+
+
+def test_private_verifier_does_not_join_quoted_assignments_across_lines(tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text('loaded {\\"token\\"\nsee "docs"\n', encoding="utf-8")
+
+    assert not backup._secret_scan(path)
 
 
 def test_backup_redacts_nested_key_in_obsbasic_binding_without_losing_hotkey(
@@ -363,6 +407,44 @@ def test_backup_redacts_nested_key_in_obsbasic_binding_without_losing_hotkey(
     assert '"key":"OBS_KEY_F9"' in ini and '"key":"<REDACTED>"' in ini
     assert "INI_TOKEN_SECRET" not in ini and "INI_NESTED_SECRET" not in ini
     assert "LOG_NESTED_SECRET" not in log
+
+
+def test_backup_preserves_hotkeys_and_chroma_after_json_log_fragment(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    lines = (
+        '{"width": 1920, "height": 1080}\nfilter chroma color key: #00ff00\nhotkey binding key=F9\n'
+    )
+    (source / "logs/2026-01-01.txt").write_text(lines, encoding="utf-8")
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    result = create_backup(source, destination)
+
+    assert not result.warnings
+    with zipfile.ZipFile(result.archive) as archive:
+        assert archive.read("logs/2026-01-01.txt").decode("utf-8") == lines
+
+
+def test_backup_redacts_multiline_obsbasic_json_value_without_truncation(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    ini = (
+        "[Output]\nOBSBasic.StartStreaming=\n"
+        '{"key":"OBS_KEY_F9","settings":{"key":"MULTILINE_STREAM_SECRET",'
+        '"token":"MULTILINE_TOKEN_SECRET"}}\n'
+    )
+    (source / "basic/profiles/default/basic.ini").write_text(ini, encoding="utf-8")
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    result = create_backup(source, destination)
+
+    assert not result.warnings
+    with zipfile.ZipFile(result.archive) as archive:
+        cleaned = archive.read("basic/profiles/default/basic.ini").decode("utf-8")
+    assert '"key":"OBS_KEY_F9"' in cleaned
+    assert '"key":"<REDACTED>"' in cleaned
+    assert "MULTILINE_STREAM_SECRET" not in cleaned
+    assert "MULTILINE_TOKEN_SECRET" not in cleaned
 
 
 def test_backup_verifier_preserves_hotkey_log_lines(tmp_path: Path) -> None:

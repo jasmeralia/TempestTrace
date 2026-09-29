@@ -144,8 +144,11 @@ def test_credential_free_embedded_json_keeps_its_original_formatting(tmp_path: P
     "line",
     [
         r"escaped {\"token\":\"ESCAPED_SECRET\"}",
+        r'double {\\"token\\":\\"DOUBLE_ESC_SECRET\\"}',
         "repr {'token': 'SINGLE_SECRET'}",
         'trail {"token":"TRAILING_SECRET",}',
+        '{"token" /*comment*/: "COMMENT_SECRET"}',
+        "{&quot;token&quot;:&quot;HTML_SECRET&quot;}",
     ],
 )
 def test_non_strict_quoted_credential_text_is_redacted(tmp_path: Path, line: str) -> None:
@@ -155,8 +158,26 @@ def test_non_strict_quoted_credential_text_is_redacted(tmp_path: Path, line: str
     redact_file(path)
 
     cleaned = path.read_text(encoding="utf-8")
-    for secret in ("ESCAPED_SECRET", "SINGLE_SECRET", "TRAILING_SECRET"):
+    for secret in (
+        "ESCAPED_SECRET",
+        "DOUBLE_ESC_SECRET",
+        "SINGLE_SECRET",
+        "TRAILING_SECRET",
+        "COMMENT_SECRET",
+        "HTML_SECRET",
+    ):
         assert secret not in cleaned
+
+
+def test_non_strict_assignment_redaction_stays_on_its_line(tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text('loaded {\\"token\\":\\"ESCAPED_SECRET\\"}\nsee "docs"\n', encoding="utf-8")
+
+    redact_file(path)
+
+    assert path.read_text(encoding="utf-8") == (
+        'loaded {\\"token\\":\\"<REDACTED>\\"}\nsee "docs"\n'
+    )
 
 
 def test_ordinary_words_ending_in_credential_suffix_are_not_sensitive() -> None:

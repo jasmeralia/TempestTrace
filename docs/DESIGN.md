@@ -105,8 +105,9 @@ Also inspect valid JSON objects and arrays embedded in INI values, log lines, an
 string-valued JSON fields. Redact credential fields within those fragments and scan
 quoted credential assignments in malformed JSON-like text. The final verifier must
 reject either form if credentials remain. Preserve OBS hotkey `key` values only at
-the binding field in `OBSBasic.*` JSON-valued INI assignments; nested settings named
-`key` remain sensitive. Leave credential-free embedded JSON text byte-for-byte intact.
+the binding field in `OBSBasic.*` JSON-valued INI assignments, including multiline
+values; nested settings named `key` remain sensitive. Leave credential-free embedded
+JSON text byte-for-byte intact.
 
 Streamlabs source settings must remain equivalent to the original at the parsed JSON
 subtree level, with one exception: values matching a known credential pattern (stream

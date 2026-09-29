@@ -37,7 +37,8 @@ _SECRET_SCAN = re.compile(
     r"(?i)((?:\bkey|api[_ -]?key|stream[_ -]?key|token|auth[_ -]?token|"
     r"bearer[_ -]?token|password|passwd|access[_ -]?token|client[_ -]?secret|secret)"
     r"\s*[=:]\s*)"
-    r"(?!<REDACTED>)(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;\]\"']+)"
+    r"(?!(?:\\*[\"'])?<REDACTED>)"
+    r"(?:\\*\"[^\"\r\n]*\\*\"|\\*'[^'\r\n]*\\*'|[^\s,;\]\"']+)"
 )
 
 

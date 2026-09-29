@@ -55,6 +55,17 @@ def test_installer_smoke_tests_new_executable_before_committing_upgrade() -> Non
     assert "${If} $0 != 0" in installer[smoke_test:rollback_cleanup]
 
 
+def test_installer_remembers_custom_install_directory() -> None:
+    installer = INSTALLER.read_text(encoding="utf-8")
+
+    install_key = (
+        'InstallDirRegKey HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\'
+        'TempestTrace" "InstallLocation"'
+    )
+    assert install_key in installer
+    assert '"InstallLocation" "$INSTDIR"' in installer
+
+
 def test_uninstaller_removes_only_owned_files_and_keeps_nonempty_install_dir() -> None:
     installer = INSTALLER.read_text(encoding="utf-8")
     section_start = installer.index('Section "Uninstall"')

@@ -28,6 +28,12 @@ def test_master_rerun_reuses_tag_already_on_head() -> None:
     )
 
 
+def test_failed_master_build_retry_reuses_tag_already_on_head() -> None:
+    assert resolve_release(
+        "push", "refs/heads/master", False, ["v0.1.4"], ["v0.1.4"], retry_failed=True
+    ) == (True, False, "v0.1.4")
+
+
 def test_master_merge_allocates_next_tag() -> None:
     assert resolve_release("push", "refs/heads/master", False, [], ["v0.1.4"]) == (
         True,
@@ -83,6 +89,14 @@ def test_main_emits_release_decision(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert output.read_text(encoding="utf-8") == (
         "is_release=false\ncreate_tag=false\ntag_name=v0.1.0\n"
     )
+
+    monkeypatch.setenv("RETRY_FAILED_RELEASE", "true")
+    output.write_text("", encoding="utf-8")
+    main()
+    assert output.read_text(encoding="utf-8") == (
+        "is_release=true\ncreate_tag=false\ntag_name=v0.1.0\n"
+    )
+    monkeypatch.delenv("RETRY_FAILED_RELEASE")
 
     git("commit", "--allow-empty", "-m", "next merge")
     output.write_text("", encoding="utf-8")

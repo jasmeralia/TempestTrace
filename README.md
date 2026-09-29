@@ -43,6 +43,8 @@ The workflow uses this token so Dependabot merges trigger the master release CI.
 Rin can install the NSIS setup package and launch TempestTrace, then review the
 proposed output location and start a read-only collection.
 Linux users can use native packages with the same collection and redaction behavior.
+Amd64 and arm64 native Linux packages target glibc 2.35 or newer; Flatpak and Snap
+use their pinned runtimes.
 A successful run will leave a single, timestamped ZIP file under
 `Dropbox/Jasmeralia and Rin/obs logs/` containing sanitized OBS
 profiles, scene collections, recent logs, and a readable manifest. The utility will

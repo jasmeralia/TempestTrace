@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
+from typing import cast
 
 from PyQt6.QtCore import QObject, QSettings, Qt, QThread, QTimer, QUrl, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QAction, QDesktopServices, QIcon
@@ -151,8 +152,9 @@ class BackupWorker(QObject):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:  # noqa: PLR0915
+    def __init__(self, *, enable_updates: bool = True) -> None:  # noqa: PLR0915
         super().__init__()
+        self.updates_enabled = enable_updates
         self.setWindowTitle("TempestTrace")
         self.setMinimumWidth(610)
         self.setWindowIcon(self._brand_icon())
@@ -177,16 +179,19 @@ class MainWindow(QMainWindow):
             help_menu.addAction(about_action)
             help_menu.addSeparator()
             update_action = QAction("Check for Updates…", self)
+            update_action.setEnabled(enable_updates)
             update_action.triggered.connect(lambda: self._check_for_updates(manual=True))
             help_menu.addAction(update_action)
         self.auto_update_action = QAction("Check for updates automatically", self)
         self.auto_update_action.setCheckable(True)
+        self.auto_update_action.setEnabled(enable_updates)
         self.auto_update_action.setChecked(
             self.settings.value("updates/automatic", True, type=bool)
         )
         self.auto_update_action.toggled.connect(self._save_auto_update_preference)
         self.include_beta_action = QAction("Include beta updates", self)
         self.include_beta_action.setCheckable(True)
+        self.include_beta_action.setEnabled(enable_updates)
         self.include_beta_action.setChecked(
             self.settings.value("updates/include_beta", False, type=bool)
         )
@@ -269,7 +274,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
         self._load_paths()
         self._style()
-        if self.auto_update_action.isChecked():
+        if enable_updates and self.auto_update_action.isChecked():
             QTimer.singleShot(1500, self._automatic_update_check)
 
     @staticmethod
@@ -393,9 +398,7 @@ class MainWindow(QMainWindow):
             )
         )
         if result.warnings:
-            message += (
-                f"\nWarnings: {len(result.warnings)}. See README.txt and manifest.json in the ZIP."
-            )
+            message += "\nWarnings:\n" + "\n".join(f"• {warning}" for warning in result.warnings)
         self.detail.setText(message)
         self.open_dir_button.setVisible(True)
         self.open_zip_button.setVisible(True)
@@ -509,6 +512,8 @@ class MainWindow(QMainWindow):
             self._check_for_updates(manual=False)
 
     def _check_for_updates(self, *, manual: bool) -> None:
+        if not self.updates_enabled:
+            return
         if self.update_thread is not None:
             if manual:
                 self.status_bar.showMessage("An update check is already running", 3000)
@@ -657,7 +662,14 @@ class MainWindow(QMainWindow):
             subprocess, "CREATE_NEW_PROCESS_GROUP", 0
         )
         try:
-            subprocess.Popen([str(package_path)], close_fds=True, creationflags=flags)
+            environment = os.environ.copy()
+            environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+            subprocess.Popen(
+                [str(package_path)],
+                close_fds=True,
+                creationflags=flags,
+                env=environment,
+            )
         except OSError:
             QMessageBox.warning(
                 self,
@@ -713,6 +725,7 @@ class MainWindow(QMainWindow):
                 stderr=subprocess.DEVNULL,
                 close_fds=True,
                 start_new_session=True,
+                env={**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"},
             )
         except OSError, ValueError:
             QMessageBox.warning(
@@ -779,6 +792,15 @@ class MainWindow(QMainWindow):
 def main() -> int:
     """Start the TempestTrace desktop application."""
     if "--smoke-test" in sys.argv:
+        app = cast(QApplication, QApplication.instance() or QApplication([]))
+        app.setApplicationName("TempestTrace")
+        app.setApplicationVersion(VERSION)
+        app.setWindowIcon(MainWindow._brand_icon())
+        window = MainWindow(enable_updates=False)
+        window.show()
+        app.processEvents()
+        window.close()
+        app.processEvents()
         return 0
     app = QApplication(sys.argv)
     app.setApplicationName("TempestTrace")

@@ -336,6 +336,95 @@ def _next_page_url(link_header: str | None) -> str | None:
     return None
 
 
+def _release_package_assets(
+    release: Mapping[str, Any],
+) -> list[tuple[tuple[str, str, str], str]]:
+    tag = release.get("tag_name")
+    assets = release.get("assets", [])
+    if not isinstance(tag, str) or not isinstance(assets, list):
+        return []
+    try:
+        SemVer.parse(tag)
+    except ValueError:
+        return []
+
+    matches: list[tuple[tuple[str, str, str], str]] = []
+    targets = [
+        ("windows", "amd64", "nsis"),
+        *[
+            ("linux", arch, package)
+            for arch in ("amd64", "arm64")
+            for package in ("deb", "rpm", "appimage", "flatpak", "snap")
+        ],
+    ]
+    for raw_asset in assets:
+        if not isinstance(raw_asset, Mapping):
+            continue
+        name = raw_asset.get("name")
+        if not isinstance(name, str):
+            continue
+        for target in targets:
+            try:
+                if _asset_name_matches(name, tag, *target):
+                    matches.append((target, name))
+            except ValueError:
+                continue
+    return matches
+
+
+def _fetch_asset_checksums(
+    release: Mapping[str, Any],
+    relevant_names: set[str],
+    open_url: Callable[[str], Any],
+) -> dict[str, str]:
+    checksums: dict[str, str] = {}
+    assets = release.get("assets", [])
+    if not isinstance(assets, list):
+        return checksums
+    manifest_assets = [
+        asset
+        for asset in assets
+        if isinstance(asset, Mapping)
+        and isinstance(asset.get("name"), str)
+        and asset["name"].casefold() in {"sha256sums", "sha256sums.txt"}
+    ]
+    for manifest in manifest_assets[:1]:
+        manifest_url = manifest.get("browser_download_url")
+        if not isinstance(manifest_url, str) or not manifest_url.startswith("https://"):
+            continue
+        try:
+            manifest_text = _read_url(open_url, manifest_url).decode("utf-8")
+            checksums.update(parse_sha256sums(manifest_text))
+        except Exception:
+            # A broken checksum file for one release must not prevent checking
+            # the remaining candidate releases or update channels.
+            continue
+
+    for sidecar in assets:
+        if not isinstance(sidecar, Mapping):
+            continue
+        sidecar_name = sidecar.get("name")
+        sidecar_url = sidecar.get("browser_download_url")
+        if (
+            not isinstance(sidecar_name, str)
+            or not sidecar_name.endswith(".sha256")
+            or not isinstance(sidecar_url, str)
+            or not sidecar_url.startswith("https://")
+        ):
+            continue
+        target_name = sidecar_name[:-7]
+        if target_name not in relevant_names:
+            continue
+        try:
+            text = _read_url(open_url, sidecar_url).decode("ascii").strip()
+        except Exception:
+            continue
+        match = re.fullmatch(r"([0-9a-fA-F]{64})(?:\s+\*?(.+))?", text)
+        if match and (match.group(2) is None or Path(match.group(2)).name == target_name):
+            checksums[target_name] = match.group(1).lower()
+    return {name: digest for name, digest in checksums.items() if name in relevant_names}
+
+
 def fetch_release_feed(  # noqa: PLR0912
     url: str = "https://api.github.com/repos/jasmeralia/TempestTrace/releases",
     opener: Callable[[str], Any] | None = None,
@@ -359,42 +448,43 @@ def fetch_release_feed(  # noqa: PLR0912
             if not isinstance(item, dict):
                 continue
             release = dict(item)
-            checksums: dict[str, str] = {}
-            assets = item.get("assets", [])
-            if isinstance(assets, list):
-                manifest_assets = [
-                    asset
-                    for asset in assets
-                    if isinstance(asset, dict)
-                    and isinstance(asset.get("name"), str)
-                    and asset["name"].casefold() in {"sha256sums", "sha256sums.txt"}
-                ]
-                for manifest in manifest_assets[:1]:
-                    manifest_url = manifest.get("browser_download_url")
-                    if isinstance(manifest_url, str) and manifest_url.startswith("https://"):
-                        manifest_text = _read_url(open_url, manifest_url).decode("utf-8")
-                        checksums.update(parse_sha256sums(manifest_text))
-                for sidecar in assets:
-                    if not isinstance(sidecar, dict):
-                        continue
-                    sidecar_name = sidecar.get("name")
-                    sidecar_url = sidecar.get("browser_download_url")
-                    if (
-                        isinstance(sidecar_name, str)
-                        and sidecar_name.endswith(".sha256")
-                        and isinstance(sidecar_url, str)
-                        and sidecar_url.startswith("https://")
-                    ):
-                        target_name = sidecar_name[:-7]
-                        text = _read_url(open_url, sidecar_url).decode("ascii").strip()
-                        match = re.fullmatch(r"([0-9a-fA-F]{64})(?:\s+\*?(.+))?", text)
-                        if match and (
-                            match.group(2) is None or Path(match.group(2)).name == target_name
-                        ):
-                            checksums[target_name] = match.group(1).lower()
-            release["checksums"] = checksums
+            release["checksums"] = {}
             parsed.append(release)
         page_url = _next_page_url(link_header)
+
+    # Check only the newest usable release for each package/channel first. If
+    # its checksum data is missing or broken, try older compatible candidates.
+    candidates: dict[tuple[tuple[str, str, str], bool], list[tuple[dict[str, Any], str]]] = {}
+    target_names: dict[int, set[str]] = {}
+    for release in parsed:
+        if release.get("draft", False):
+            continue
+        tag = release.get("tag_name")
+        if not isinstance(tag, str):
+            continue
+        try:
+            version = SemVer.parse(tag)
+        except ValueError:
+            continue
+        is_beta = bool(release.get("prerelease", False)) or version.is_prerelease
+        for target, name in _release_package_assets(release):
+            candidates.setdefault((target, is_beta), []).append((release, name))
+            target_names.setdefault(id(release), set()).add(name)
+
+    fetched: set[int] = set()
+    for release_candidates in candidates.values():
+        release_candidates.sort(
+            key=lambda item: SemVer.parse(str(item[0]["tag_name"])), reverse=True
+        )
+        for release, name in release_candidates:
+            release_id = id(release)
+            if release_id not in fetched:
+                fetched.add(release_id)
+                release["checksums"] = _fetch_asset_checksums(
+                    release, target_names.get(release_id, set()), open_url
+                )
+            if name in release["checksums"]:
+                break
     return parsed
 
 
@@ -460,8 +550,8 @@ def write_appimage_update_helper(
     """Write a detached Linux helper that replaces an AppImage after exit.
 
     The new image is staged beside the running image so both renames stay on one
-    filesystem. The helper retains the old image until the replacement survives
-    a short launch check, restoring it if the replacement cannot start.
+    filesystem. The helper retains the old image until an explicit smoke check
+    succeeds, restoring it if the replacement cannot start correctly.
     """
     current = Path(current_path).absolute()
     downloaded = Path(downloaded_path).absolute()
@@ -510,10 +600,7 @@ if ! chmod +x -- "$current"; then
     restore
     exit 1
 fi
-"$current" >/dev/null 2>&1 &
-new_pid=$!
-sleep 10
-if ! kill -0 "$new_pid" 2>/dev/null; then
+if ! "$current" --smoke-test >/dev/null 2>&1; then
     restore
     exit 1
 fi

@@ -25,12 +25,14 @@ def next_patch(latest: str | None) -> str:
     return f"v{major}.{minor}.{patch + 1}"
 
 
-def resolve_release(
+def resolve_release(  # noqa: PLR0913
     event: str,
     ref: str,
     dispatch_release: bool,
     head_tags: list[str],
     all_tags: list[str],
+    *,
+    retry_failed: bool = False,
 ) -> tuple[bool, bool, str]:
     """Return whether to release, whether to create a tag, and the build version."""
     if event == "pull_request":
@@ -49,7 +51,7 @@ def resolve_release(
         head_release_tags = [tag for tag in head_tags if TAG_PATTERN.fullmatch(tag)]
         if head_release_tags:
             tag = max(head_release_tags, key=_version_key)
-            return False, False, tag
+            return retry_failed, False, tag
         valid_tags = [tag for tag in all_tags if TAG_PATTERN.fullmatch(tag)]
         latest = max(valid_tags, key=_version_key) if valid_tags else None
         tag = next_patch(latest)
@@ -70,6 +72,7 @@ def main() -> None:
     event = os.environ.get("EVENT_NAME", "")
     ref = os.environ.get("REF", "")
     dispatch_release = os.environ.get("DISPATCH_RELEASE", "").casefold() == "true"
+    retry_failed = os.environ.get("RETRY_FAILED_RELEASE", "").casefold() == "true"
     if event == "pull_request" or (event == "workflow_dispatch" and not dispatch_release):
         tag = f"0.0.0+{os.environ.get('GITHUB_SHA', 'local')[:12]}"
         is_release, create_tag = False, False
@@ -77,7 +80,7 @@ def main() -> None:
         head_tags = _git_tags("--points-at", "HEAD")
         all_tags = _git_tags("--list", "v*")
         is_release, create_tag, tag = resolve_release(
-            event, ref, dispatch_release, head_tags, all_tags
+            event, ref, dispatch_release, head_tags, all_tags, retry_failed=retry_failed
         )
     values = {
         "is_release": str(is_release).lower(),

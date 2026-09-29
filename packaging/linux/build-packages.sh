@@ -43,7 +43,7 @@ Section: utils
 Priority: optional
 Architecture: $arch
 Maintainer: TempestTrace contributors
-Depends: libc6 (>= 2.39), libx11-6, libxcb1, libxkbcommon-x11-0, libxcb-cursor0, libxcb-icccm4, libxcb-image0, libxcb-keysyms1, libxcb-render-util0, libxcb-xinerama0, libxcb-xkb1
+Depends: libc6 (>= 2.35), libx11-6, libxcb1, libxkbcommon-x11-0, libxcb-cursor0, libxcb-icccm4, libxcb-image0, libxcb-keysyms1, libxcb-render-util0, libxcb-xinerama0, libxcb-xkb1
 Description: Safe OBS diagnostic backup utility
  Creates a redacted diagnostic archive without modifying OBS configuration.
 EOF
@@ -63,7 +63,7 @@ Release:        1
 Summary:        Safe OBS diagnostic backup utility
 License:        GPL-3.0-or-later
 BuildArch:      $rpm_arch
-Requires:       glibc >= 2.39
+Requires:       glibc >= 2.35
 Requires:       libX11
 Requires:       libxcb
 Requires:       libxkbcommon-x11
@@ -117,20 +117,22 @@ build_flatpak() {
     command -v flatpak >/dev/null
     flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo
     flatpak install --user --noninteractive --assumeyes flathub \
-        "org.freedesktop.Platform/$flatpak_arch/24.08" \
-        "org.freedesktop.Sdk/$flatpak_arch/24.08"
+        "org.freedesktop.Platform/$flatpak_arch/26.08" \
+        "org.freedesktop.Sdk/$flatpak_arch/26.08"
     local dir=$work/flatpak-build
     local repo=$work/flatpak-repo
     flatpak build-init --arch="$flatpak_arch" "$dir" \
-        io.github.jasmeralia.TempestTrace org.freedesktop.Platform 24.08 \
-        org.freedesktop.Sdk 24.08
+        io.github.jasmeralia.TempestTrace org.freedesktop.Platform 26.08 \
+        org.freedesktop.Sdk 26.08
     install -D -m 0755 "$app/usr/bin/tempesttrace" "$dir/files/bin/tempesttrace"
     install -D -m 0644 "$app/usr/share/applications/io.github.jasmeralia.TempestTrace.desktop" \
         "$dir/files/share/applications/io.github.jasmeralia.TempestTrace.desktop"
     install -D -m 0644 "$app/usr/share/icons/hicolor/256x256/apps/io.github.jasmeralia.TempestTrace.png" \
         "$dir/files/share/icons/hicolor/256x256/apps/io.github.jasmeralia.TempestTrace.png"
+    # `home` excludes other Flatpak apps' private data, so grant OBS's exact tree read-only.
     flatpak build-finish --command=tempesttrace --socket=wayland --socket=fallback-x11 \
-        --share=ipc --device=dri --filesystem=home "$dir"
+        --share=ipc --share=network --device=dri --filesystem=home \
+        --filesystem='~/.var/app/com.obsproject.Studio/config/obs-studio:ro' "$dir"
     flatpak build-export --arch="$flatpak_arch" "$repo" "$dir" stable
     flatpak build-bundle --arch="$flatpak_arch" "$repo" \
         "$output_dir/TempestTrace-v${version_bare}-linux-${arch}.flatpak" \

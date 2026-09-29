@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -237,19 +238,22 @@ def test_fetch_release_feed_reads_checksums_and_sha256_sidecars() -> None:
             "assets": [
                 {"name": filename, "browser_download_url": "https://x/package"},
                 {"name": "SHA256SUMS", "browser_download_url": "https://x/SHA256SUMS"},
-                {"name": "other.deb.sha256", "browser_download_url": "https://x/other.sha256"},
+                {
+                    "name": f"{filename}.sha256",
+                    "browser_download_url": "https://x/package.sha256",
+                },
             ],
         }
     ]
     bodies = {
         "https://api.example.test/releases": json.dumps(feed).encode(),
         "https://x/SHA256SUMS": f"{'a' * 64}  {filename}\n".encode(),
-        "https://x/other.sha256": f"{'b' * 64}  other.deb\n".encode(),
+        "https://x/package.sha256": f"{'b' * 64}  {filename}\n".encode(),
     }
     parsed = fetch_release_feed(
         "https://api.example.test/releases", lambda url: io.BytesIO(bodies[url])
     )
-    assert parsed[0]["checksums"] == {filename: "a" * 64, "other.deb": "b" * 64}
+    assert parsed[0]["checksums"] == {filename: "b" * 64}
 
 
 def test_fetch_release_feed_follows_pagination_for_later_stable_releases() -> None:
@@ -295,6 +299,133 @@ def test_fetch_release_feed_follows_pagination_for_later_stable_releases() -> No
         "https://api.example.test/releases?page=2",
     ]
     assert offer is not None and offer.version == "1.3.0"
+
+
+def test_fetch_release_feed_ignores_old_unavailable_checksum_assets() -> None:
+    old_asset_name = "TempestTrace-Setup-v1.0.0.exe"
+    new_asset_name = "TempestTrace-Setup-v1.1.0.exe"
+    feed = [
+        {
+            "tag_name": "v1.1.0",
+            "prerelease": False,
+            "assets": [
+                asset(new_asset_name),
+                {
+                    "name": "SHA256SUMS",
+                    "browser_download_url": "https://assets.example.test/new-sums",
+                },
+            ],
+        },
+        {
+            "tag_name": "v1.0.0",
+            "prerelease": False,
+            "assets": [
+                asset(old_asset_name),
+                {
+                    "name": "SHA256SUMS",
+                    "browser_download_url": "https://assets.example.test/old-sums",
+                },
+            ],
+        },
+    ]
+    requested: list[str] = []
+
+    def opener(url: str) -> io.BytesIO:
+        requested.append(url)
+        if url == "https://api.example.test/releases":
+            return io.BytesIO(json.dumps(feed).encode())
+        if url == "https://assets.example.test/new-sums":
+            return io.BytesIO(f"{'d' * 64}  {new_asset_name}\n".encode())
+        raise OSError("historical checksum asset is unavailable")
+
+    releases = fetch_release_feed("https://api.example.test/releases", opener)
+    offer = check_for_update("0.9.0", releases, "windows", "amd64", "nsis", False)
+    assert offer is not None and offer.version == "1.1.0"
+    assert "https://assets.example.test/old-sums" not in requested
+
+
+def test_fetch_release_feed_falls_back_after_unavailable_newest_checksum() -> None:
+    newest = "TempestTrace-Setup-v1.2.0.exe"
+    fallback = "TempestTrace-Setup-v1.1.0.exe"
+    feed = [
+        {
+            "tag_name": "v1.2.0",
+            "prerelease": False,
+            "assets": [
+                asset(newest),
+                {
+                    "name": "SHA256SUMS",
+                    "browser_download_url": "https://assets.example.test/newest-sums",
+                },
+            ],
+        },
+        {
+            "tag_name": "v1.1.0",
+            "prerelease": False,
+            "assets": [
+                asset(fallback),
+                {
+                    "name": "SHA256SUMS",
+                    "browser_download_url": "https://assets.example.test/fallback-sums",
+                },
+            ],
+        },
+    ]
+
+    def opener(url: str) -> io.BytesIO:
+        if url == "https://api.example.test/releases":
+            return io.BytesIO(json.dumps(feed).encode())
+        if url.endswith("newest-sums"):
+            return io.BytesIO(b"not a SHA256SUMS manifest\n")
+        if url.endswith("fallback-sums"):
+            return io.BytesIO(f"{'f' * 64}  {fallback}\n".encode())
+        raise AssertionError(url)
+
+    releases = fetch_release_feed("https://api.example.test/releases", opener)
+    offer = check_for_update("1.0.0", releases, "windows", "amd64", "nsis", False)
+    assert offer is not None and offer.version == "1.1.0"
+
+
+def test_fetch_release_feed_skips_bad_candidate_checksum_and_preserves_channels() -> None:
+    release_data = [
+        {
+            "tag_name": "v1.3.0-beta.1",
+            "prerelease": True,
+            "assets": [
+                asset("TempestTrace-Setup-v1.3.0-beta.1.exe"),
+                {
+                    "name": "SHA256SUMS",
+                    "browser_download_url": "https://assets.example.test/beta-sums",
+                },
+            ],
+        },
+        {
+            "tag_name": "v1.2.0",
+            "prerelease": False,
+            "assets": [
+                asset("TempestTrace-Setup-v1.2.0.exe"),
+                {
+                    "name": "SHA256SUMS",
+                    "browser_download_url": "https://assets.example.test/stable-sums",
+                },
+            ],
+        },
+    ]
+
+    def opener(url: str) -> io.BytesIO:
+        if url == "https://api.example.test/releases":
+            return io.BytesIO(json.dumps(release_data).encode())
+        if url.endswith("beta-sums"):
+            raise OSError("bad beta checksum endpoint")
+        if url.endswith("stable-sums"):
+            return io.BytesIO(f"{'e' * 64}  TempestTrace-Setup-v1.2.0.exe\n".encode())
+        raise AssertionError(url)
+
+    releases = fetch_release_feed("https://api.example.test/releases", opener)
+    stable = check_for_update("1.1.0", releases, "windows", "amd64", "nsis", False)
+    beta = check_for_update("1.1.0", releases, "windows", "amd64", "nsis", True)
+    assert stable is not None and stable.version == "1.2.0"
+    assert beta is not None and beta.version == "1.2.0"
 
 
 @pytest.mark.parametrize(
@@ -363,4 +494,28 @@ def test_appimage_update_helper_waits_replaces_and_keeps_rollback(tmp_path: Path
     assert 'rm -f -- "$rollback"' in script
     assert 'rmdir "$rollback"' not in script
     assert "mv" in script and "chmod +x" in script
+    assert '"$current" --smoke-test' in script
+    assert "sleep 10" not in script
     assert "current AppImage" in script and "new AppImage" in script
+
+
+@pytest.mark.parametrize(("smoke_exit", "expected_exit"), [(0, 0), (9, 1)])
+def test_appimage_helper_uses_smoke_test_and_rolls_back_only_on_failure(
+    tmp_path: Path, smoke_exit: int, expected_exit: int
+) -> None:
+    current = tmp_path / "TempestTrace.AppImage"
+    current.write_bytes(b"old")
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    downloaded = stage / "TempestTrace.new.AppImage"
+    new_payload = f'#!/bin/sh\n[ "$1" = --smoke-test ] || exit 8\nexit {smoke_exit}\n'
+    downloaded.write_text(new_payload, encoding="utf-8")
+    downloaded.chmod(0o700)
+    helper = stage / "apply-update.sh"
+    write_appimage_update_helper(current, downloaded, helper, process_id=2**30)
+
+    result = subprocess.run(["/bin/sh", str(helper)], check=False, capture_output=True)
+
+    assert result.returncode == expected_exit
+    assert current.read_bytes() == (new_payload.encode() if smoke_exit == 0 else b"old")
+    assert not list(tmp_path.glob("*.tempesttrace-rollback.*"))

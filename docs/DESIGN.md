@@ -168,7 +168,7 @@ name or raw absolute OBS path in the manifest unless required to explain a failu
   [Snap's install-mode guide](https://snapcraft.io/docs/explanation/snap-development/install-modes/)
   documents the trust and confinement flags for local snaps.
 - After lint and tests pass on an untagged master commit, CI allocates and creates the
-  next patch tag in the `v0.1.x` beta series, beginning at `v0.1.0`. It builds the
+  next patch tag in the `v0.1.x` beta series, beginning at `v0.1.0`, then builds the
   Windows installer and every Linux format/architecture from that same tag. Serialize
   release builds. Retry an actual build failure with GitHub's **Re-run failed jobs**;
   it reuses the workflow's tag and successful platform artifacts. A rerun after success
@@ -177,7 +177,10 @@ name or raw absolute OBS path in the manifest unless required to explain a failu
 - After every successful master build, publish a beta prerelease once Windows and every
   Linux package/architecture job pass and the complete asset/checksum validation
   succeeds. PR updates run lint and synthetic tests; package builds run only after a
-  master merge. Existing release assets are immutable to CI: retry publication by
+  master merge. A tag may exist without a release if a package build fails; retry only
+  an actual Windows or Linux package build failure and reuse that tag. A rerun after
+  success does not rebuild packages or consume a version. Existing release assets are
+  immutable to CI: retry publication by
   verifying same-name assets and adding only missing files. Changing a release from
   prerelease to stable does not control this behavior. CI never changes release status
   or replaces existing assets. Morgan promotes the validated release manually without

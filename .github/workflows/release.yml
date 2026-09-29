@@ -12,7 +12,7 @@ permissions:
 
 # Keep version allocation and package builds ordered across master merges.
 concurrency:
-  group: tempesttrace-build-release
+  group: ${{ github.event_name == 'pull_request' && format('tempesttrace-pr-{0}', github.event.pull_request.number) || 'tempesttrace-build-release' }}
   queue: max
 
 jobs:
@@ -23,6 +23,9 @@ jobs:
       is_release: ${{ steps.release.outputs.is_release }}
       create_tag: ${{ steps.release.outputs.create_tag }}
       tag_name: ${{ steps.release.outputs.tag_name }}
+    permissions:
+      actions: read
+      contents: read
     steps:
       - uses: actions/checkout@v7
         with:
@@ -30,12 +33,28 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.14'
+      - name: Detect a failed release retry
+        id: retry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && github.run_attempt > 1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          previous_attempt=$((GITHUB_RUN_ATTEMPT - 1))
+          failed_builds=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${previous_attempt}/jobs" \
+            --paginate \
+            --jq '[.jobs[] | select(.conclusion == "failure" and (.name | startswith("Build ") or startswith("Linux packages ("))) | .name] | unique | .[]')
+          if [ -n "$failed_builds" ]; then
+            echo 'failed=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'failed=false' >> "$GITHUB_OUTPUT"
+          fi
       - name: Resolve version and release mode
         id: release
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
           GITHUB_SHA: ${{ github.sha }}
+          RETRY_FAILED_RELEASE: ${{ steps.retry.outputs.failed || 'false' }}
         run: python scripts/release_info.py
 
   lint-and-test:

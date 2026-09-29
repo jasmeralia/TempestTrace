@@ -11,6 +11,7 @@ Unicode True
 Name "TempestTrace ${APP_VERSION}"
 OutFile "..\dist\TempestTrace-Setup-${APP_VERSION}.exe"
 InstallDir "$LOCALAPPDATA\Programs\TempestTrace"
+InstallDirRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TempestTrace" "InstallLocation"
 RequestExecutionLevel user
 SetCompressor /SOLID lzma
 

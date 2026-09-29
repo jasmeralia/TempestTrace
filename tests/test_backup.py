@@ -83,6 +83,45 @@ def test_cancel_leaves_marked_incomplete_stage(tmp_path: Path) -> None:
     assert not list(destination.glob("*.zip"))
 
 
+def test_staging_cleanup_failure_keeps_created_backup_successful(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    original_rmtree = shutil.rmtree
+
+    def fail_staging_removal(path: str | Path, *args: object, **kwargs: object) -> None:
+        if Path(path).name.startswith(".TempestTrace-"):
+            raise OSError("synthetic cleanup failure")
+        original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(backup.shutil, "rmtree", fail_staging_removal)
+
+    result = create_backup(source, destination)
+
+    assert result.archive.is_file()
+    assert any("temporary sanitized snapshot" in warning for warning in result.warnings)
+    assert list(destination.glob(".TempestTrace-*.incomplete-*"))
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "token=LOG_TOKEN_SECRET",
+        "api_key=LOG_API_KEY_SECRET",
+        'secret="LOG_QUOTED_SECRET"',
+    ],
+)
+def test_private_verifier_detects_plain_and_quoted_log_credentials(
+    tmp_path: Path, line: str
+) -> None:
+    path = tmp_path / "log.txt"
+    path.write_text(line, encoding="utf-8")
+
+    assert backup._secret_scan(path)
+
+
 def test_bad_json_is_omitted_and_symlinks_are_not_followed(tmp_path: Path) -> None:
     source = fixture(tmp_path / "obs")
     bad = source / "basic/profiles/default/bad.json"

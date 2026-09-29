@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -27,7 +28,7 @@ def test_window_initializes_discovered_locations_and_completion_actions(
     monkeypatch.setattr("tempesttrace.ui.discover_obs", lambda: [obs])
     monkeypatch.setattr("tempesttrace.ui.discover_dropbox", lambda: proposed.parents[1])
 
-    window = MainWindow()
+    window = MainWindow(enable_updates=False)
     assert window.obs_combo.count() == 1
     assert window.obs_combo.currentData() == obs
     assert window.destination == proposed
@@ -50,7 +51,7 @@ def test_incomplete_output_can_be_removed_after_cancel_or_failure(
     obs.mkdir()
     monkeypatch.setattr("tempesttrace.ui.discover_obs", lambda: [obs])
     monkeypatch.setattr("tempesttrace.ui.discover_dropbox", lambda: None)
-    window = MainWindow()
+    window = MainWindow(enable_updates=False)
     output = tmp_path / "out"
     output.mkdir()
     window.destination = output
@@ -119,9 +120,51 @@ def test_worker_stopped_handles_disappearing_destination(tmp_path: Path, monkeyp
     assert app is not None
 
 
-def test_smoke_test_mode_does_not_open_a_window(monkeypatch) -> None:
+def test_smoke_test_mode_opens_window_without_network_updates(monkeypatch) -> None:
+    app = cast(QApplication, QApplication.instance() or QApplication([]))
+    existing_windows = {id(window) for window in app.topLevelWidgets()}
+    lifecycle: list[str] = []
+    monkeypatch.setattr("tempesttrace.ui.discover_obs", lambda: [])
+    monkeypatch.setattr("tempesttrace.ui.discover_dropbox", lambda: None)
+    original_show = MainWindow.show
+    original_close = MainWindow.close
+    original_process_events = QApplication.processEvents
+
+    def record_show(window: MainWindow) -> None:
+        lifecycle.append("show")
+        original_show(window)
+
+    def record_close(window: MainWindow) -> bool:
+        lifecycle.append("close")
+        return original_close(window)
+
+    def record_process_events(*args: object) -> None:
+        lifecycle.append("processEvents")
+        original_process_events(*args)
+
+    monkeypatch.setattr(MainWindow, "show", record_show)
+    monkeypatch.setattr(MainWindow, "close", record_close)
+    monkeypatch.setattr(QApplication, "processEvents", staticmethod(record_process_events))
+
+    def unexpected_network_call(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("smoke test must not contact update services")
+
+    monkeypatch.setattr("tempesttrace.ui.fetch_release_feed", unexpected_network_call)
+    monkeypatch.setattr("tempesttrace.ui.check_for_update", unexpected_network_call)
     monkeypatch.setattr("sys.argv", ["tempesttrace", "--smoke-test"])
+
     assert main() == 0
+
+    created_windows = [
+        window
+        for window in app.topLevelWidgets()
+        if isinstance(window, MainWindow) and id(window) not in existing_windows
+    ]
+    assert len(created_windows) == 1
+    assert not created_windows[0].isVisible()
+    assert not created_windows[0].updates_enabled
+    assert created_windows[0].update_thread is None
+    assert lifecycle == ["show", "processEvents", "close", "processEvents"]
 
 
 def test_window_folder_actions_progress_and_cancel(tmp_path: Path, monkeypatch) -> None:
@@ -328,6 +371,63 @@ def test_sandboxed_package_update_downloads_to_host_visible_folder(
     path = downloaded[0]
     assert isinstance(path, Path)
     assert path.is_relative_to(tmp_path / "Downloads")
+
+
+def test_windows_update_handoff_resets_pyinstaller_environment(tmp_path: Path, monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("tempesttrace.ui.discover_obs", lambda: [])
+    monkeypatch.setattr("tempesttrace.ui.discover_dropbox", lambda: None)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(QApplication, "quit", lambda: None)
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    monkeypatch.setattr(
+        "tempesttrace.ui.subprocess.Popen",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    package = tmp_path / "setup.exe"
+    package.write_bytes(b"installer")
+    window = MainWindow(enable_updates=False)
+
+    window._handoff_windows_installer(package)
+
+    assert calls[0][1]["env"]["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
+    window.close()
+    assert app is not None
+
+
+def test_appimage_update_handoff_resets_pyinstaller_environment(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("tempesttrace.ui.discover_obs", lambda: [])
+    monkeypatch.setattr("tempesttrace.ui.discover_dropbox", lambda: None)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(QApplication, "quit", lambda: None)
+    current = tmp_path / "current.AppImage"
+    current.write_bytes(b"current image")
+    monkeypatch.setenv("APPIMAGE", str(current))
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    monkeypatch.setattr(
+        "tempesttrace.ui.subprocess.Popen",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    package = tmp_path / "update.AppImage"
+    package.write_bytes(b"new image")
+    window = MainWindow(enable_updates=False)
+
+    window._handoff_appimage(package)
+
+    assert calls[0][1]["env"]["PYINSTALLER_RESET_ENVIRONMENT"] == "1"
+    window.close()
+    assert app is not None
 
 
 @pytest.mark.parametrize(

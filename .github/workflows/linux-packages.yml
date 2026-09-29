@@ -18,9 +18,9 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: ubuntu-24.04
+            runner: ubuntu-22.04
           - arch: arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
@@ -35,7 +35,7 @@ jobs:
       - name: Install package build tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes dpkg-dev rpm flatpak squashfs-tools snapd libfuse2t64 xvfb xauth xdotool
+          sudo apt-get install --yes dpkg-dev rpm flatpak squashfs-tools snapd libfuse2 xvfb xauth xdotool
           python -m pip install --upgrade pip
           python -m pip install . pyinstaller==6.22.3
       - name: Install pinned AppImageKit tool
@@ -73,14 +73,118 @@ jobs:
           QT_QPA_PLATFORM=offscreen /usr/bin/tempesttrace --smoke-test
           sudo apt-get remove --yes tempesttrace
           test ! -e /usr/bin/tempesttrace
-      - name: Smoke-test Flatpak install, launch, and uninstall
+      - name: Strict Flatpak native and Flatpak OBS collection
         run: |
           package=$(find dist/linux -maxdepth 1 -name '*.flatpak' -print -quit)
           test -n "$package"
           flatpak install --user --noninteractive --assumeyes "$package"
-          flatpak run --user --command=tempesttrace \
-            --env=QT_QPA_PLATFORM=offscreen io.github.jasmeralia.TempestTrace --smoke-test
-          flatpak uninstall --user --noninteractive --assumeyes io.github.jasmeralia.TempestTrace
+          permissions=$(flatpak info --user --show-permissions io.github.jasmeralia.TempestTrace)
+          grep -Fq 'shared=network' <<<"$permissions"
+          grep -Fq '~/.var/app/com.obsproject.Studio/config/obs-studio:ro' <<<"$permissions"
+          native_obs="$HOME/.config/obs-studio"
+          flatpak_obs="$HOME/.var/app/com.obsproject.Studio/config/obs-studio"
+          dropbox="$HOME/Dropbox"
+          output="$dropbox/Jasmeralia and Rin/obs logs"
+          mkdir -p "$HOME/.dropbox" "$output" \
+            "$HOME/.var/app/io.github.jasmeralia.TempestTrace/config/WindsOfStorm"
+          printf '[updates]\nautomatic=false\n' > \
+            "$HOME/.var/app/io.github.jasmeralia.TempestTrace/config/WindsOfStorm/TempestTrace.conf"
+          cat > "$HOME/.dropbox/info.json" <<EOF
+          {"personal":{"path":"$dropbox"}}
+          EOF
+          make_obs_fixture() {
+            local root=$1
+            local layout=$2
+            local secret=$3
+            mkdir -p "$root/basic/profiles/Fixture" "$root/basic/scenes" "$root/logs"
+            cat > "$root/basic/profiles/Fixture/service.json" <<EOF
+          {"fixture_layout":"$layout","settings":{"key":"$secret"}}
+          EOF
+            cat > "$root/basic/scenes/Fixture.json" <<EOF
+          {"name":"$layout","sources":[]}
+          EOF
+            printf '[General]\nFixture=%s\n' "$layout" > "$root/global.ini"
+            printf 'Synthetic OBS log: key=%s\n' "$secret" > "$root/logs/fixture.txt"
+          }
+          run_flatpak_ui() {
+            local expected_archives=$1
+            FLATPAK_TEST_OUTPUT="$output" FLATPAK_TEST_EXPECTED="$expected_archives" \
+              xvfb-run -a bash -euc '
+                flatpak run --user --command=tempesttrace --env=QT_QPA_PLATFORM=xcb \
+                  io.github.jasmeralia.TempestTrace >"$RUNNER_TEMP/tempesttrace-flatpak.log" 2>&1 &
+                app_pid=$!
+                trap "kill \$app_pid 2>/dev/null || true" EXIT
+                window_id=
+                for _ in $(seq 1 30); do
+                  window_id=$(xdotool search --onlyvisible --name "^TempestTrace$" 2>/dev/null | head -n 1 || true)
+                  [[ -n "$window_id" ]] && break
+                  sleep 1
+                done
+                if [[ -z "$window_id" ]]; then cat "$RUNNER_TEMP/tempesttrace-flatpak.log"; exit 1; fi
+                xdotool windowfocus --sync "$window_id"
+                # OBS combo, OBS chooser, Dropbox chooser, then the default Create Backup button.
+                xdotool key --clearmodifiers Tab Tab Tab Return
+                for _ in $(seq 1 90); do
+                  archive_count=$(find "$FLATPAK_TEST_OUTPUT" -maxdepth 1 -type f \
+                    -name "TempestTrace-*.zip" ! -name "*.incomplete.zip" | wc -l)
+                  [[ "$archive_count" -ge "$FLATPAK_TEST_EXPECTED" ]] && exit 0
+                  sleep 1
+                done
+                cat "$RUNNER_TEMP/tempesttrace-flatpak.log"
+                exit 1
+              '
+          }
+          make_obs_fixture "$native_obs" native FLATPAK-CI-NATIVE-KEY
+          find "$native_obs" -type f -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/native-before.sha256"
+          run_flatpak_ui 1
+          find "$native_obs" -type f -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/native-after.sha256"
+          diff -u "$RUNNER_TEMP/native-before.sha256" "$RUNNER_TEMP/native-after.sha256"
+          rm -rf "$native_obs"
+          make_obs_fixture "$flatpak_obs" flatpak FLATPAK-CI-OBS-FLATPAK-KEY
+          find "$flatpak_obs" -type f -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/flatpak-before.sha256"
+          run_flatpak_ui 2
+          find "$flatpak_obs" -type f -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/flatpak-after.sha256"
+          diff -u "$RUNNER_TEMP/flatpak-before.sha256" "$RUNNER_TEMP/flatpak-after.sha256"
+          python - "$output" <<'PY'
+          import json
+          import zipfile
+          from pathlib import Path
+          import sys
+
+          output = Path(sys.argv[1])
+          archives = sorted(output.glob("TempestTrace-*.zip"))
+          assert len(archives) == 2, f"expected two complete archives, found {archives}"
+          layouts = set()
+          secrets = (b"FLATPAK-CI-NATIVE-KEY", b"FLATPAK-CI-OBS-FLATPAK-KEY")
+          for path in archives:
+              with zipfile.ZipFile(path) as archive:
+                  names = set(archive.namelist())
+                  expected = {
+                      "basic/profiles/Fixture/service.json",
+                      "basic/scenes/Fixture.json",
+                      "global.ini",
+                      "logs/fixture.txt",
+                      "README.txt",
+                      "manifest.json",
+                  }
+                  assert expected <= names, f"missing files in {path}: {expected - names}"
+                  payloads = [archive.read(name) for name in names]
+                  assert all(secret not in payload for secret in secrets for payload in payloads)
+                  profile = json.loads(archive.read("basic/profiles/Fixture/service.json"))
+                  assert profile["settings"]["key"] == "<REDACTED>"
+                  layouts.add(profile["fixture_layout"])
+                  manifest = json.loads(archive.read("manifest.json"))
+                  assert manifest["complete"] is True
+          assert layouts == {"native", "flatpak"}, f"unexpected fixtures: {layouts}"
+          PY
+      - name: Uninstall Flatpak and verify removal
+        if: always()
+        run: |
+          if flatpak info --user io.github.jasmeralia.TempestTrace >/dev/null 2>&1; then
+            flatpak uninstall --user --delete-data --noninteractive --assumeyes \
+              io.github.jasmeralia.TempestTrace
+          fi
+          ! flatpak info --user io.github.jasmeralia.TempestTrace >/dev/null 2>&1
       - name: Smoke-test RPM install and uninstall on Fedora 42
         run: |
           docker run --rm -v "$PWD/dist/linux:/pkgs:ro" fedora:42 bash -euc '
@@ -187,7 +291,7 @@ jobs:
           test -n "$appimage"
           APPIMAGE_EXTRACT_AND_RUN=1 QT_QPA_PLATFORM=offscreen "$appimage" --smoke-test
       - name: Create SHA-256 checksums
-        run: (cd dist/linux && sha256sum * > SHA256SUMS)
+        run: (cd dist/linux && sha256sum -- * > SHA256SUMS)
       - uses: actions/upload-artifact@v7
         with:
           name: linux-packages-${{ matrix.arch }}

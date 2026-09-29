@@ -28,8 +28,9 @@ MAX_TOTAL_SIZE = 512 * 1024 * 1024
 MAX_LOG_FILES = 5
 ALLOWED_PROFILE_SUFFIXES = {".ini", ".json", ".txt"}
 _SECRET_SCAN = re.compile(
-    rb"(?i)(?:\bkey|stream[_ -]?key|bearer[_ -]?token|password|passwd|"
-    rb"access[_ -]?token|client[_ -]?secret)\s*[=:]\s*"
+    rb"(?i)(?:\bkey|api[_ -]?key|stream[_ -]?key|token|auth[_ -]?token|"
+    rb"bearer[_ -]?token|password|passwd|access[_ -]?token|client[_ -]?secret|secret)"
+    rb"\s*[=:]\s*"
     rb"(?!<REDACTED>)(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;\]\"']+)"
 )
 
@@ -407,7 +408,13 @@ def create_backup(  # noqa: PLR0912, PLR0915
         if cancelled is not None and cancelled():
             raise BackupCancelled("Collection cancelled.")
         os.replace(incomplete_zip, final)
-        shutil.rmtree(staging)
+        try:
+            shutil.rmtree(staging)
+        except OSError:
+            warnings.append(
+                "The backup ZIP was created, but the temporary sanitized snapshot "
+                "could not be removed."
+            )
         if progress:
             progress("finishing", len(records), len(records))
         return BackupResult(final, len(records), len(skipped), redaction_counts, tuple(warnings))

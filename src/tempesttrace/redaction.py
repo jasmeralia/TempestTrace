@@ -7,17 +7,20 @@ import re
 from pathlib import Path
 from typing import Any
 
-RULE_VERSION = 6
+RULE_VERSION = 7
 REDACTED = "<REDACTED>"
 _LOG_PATTERNS = (
     re.compile(
         r"(?i)((?<![?&])\b(?:key|stream[_ -]?key|api[_ -]?key|token|auth[_ -]?token|"
         r"bearer[_ -]?token|password|passwd|access[_ -]?token|client[_ -]?secret)"
-        r"(?:\\*[\"']|&quot;)?(?:\s|/\*[^*\r\n]*\*/)*[=:]"
-        r"(?:\s|/\*[^*\r\n]*\*/)*)"
+        r"(?:\\*[\"']|&(?:quot|apos);|&#(?:34|x22);)?"
+        r"(?:\s|/\*[\s\S]*?\*/|//[^\r\n]*(?:\r?\n\s*)?)*[=:]"
+        r"(?:\s|/\*[\s\S]*?\*/|//[^\r\n]*(?:\r?\n\s*)?)*)"
         r'(\\*"(?:\\[^\r\n]|[^"\\\r\n])*\\*"|'
         r"\\*'(?:\\[^\r\n]|[^'\\\r\n])*\\*'|"
-        r"&quot;[^\r\n]*?&quot;|[^\s,;\]\"\'}]+)"
+        r"&quot;[^\r\n]*?&quot;|&apos;[^\r\n]*?&apos;|"
+        r"&#34;[^\r\n]*?&#34;|&#x22;[^\r\n]*?&#x22;|"
+        r"[^\s,;\]\\\"'}]+)"
     ),
     re.compile(r"(?i)(\bAuthorization:\s*(?:Bearer|Basic)\s+)([^\s,;]+)"),
 )
@@ -79,8 +82,9 @@ def _is_sensitive_key(key: str, context: tuple[str, ...] = ()) -> bool:
 
 def _unquote(value: str) -> str:
     value = value.strip()
-    if value.casefold().startswith("&quot;") and value.casefold().endswith("&quot;"):
-        return value[6:-6]
+    for entity in ("&quot;", "&apos;", "&#34;", "&#x22;"):
+        if value.casefold().startswith(entity) and value.casefold().endswith(entity):
+            return value[len(entity) : -len(entity)]
     quoted = re.match(r"^(\\*[\"'])(.*?)(\\*[\"'])$", value)
     if quoted and quoted.group(1).lstrip("\\") == quoted.group(3).lstrip("\\"):
         return quoted.group(2)
@@ -88,8 +92,9 @@ def _unquote(value: str) -> str:
 
 
 def _quoted_redacted(value: str) -> str:
-    if value.casefold().startswith("&quot;") and value.casefold().endswith("&quot;"):
-        return f"&quot;{REDACTED}&quot;"
+    for entity in ("&quot;", "&apos;", "&#34;", "&#x22;"):
+        if value.casefold().startswith(entity) and value.casefold().endswith(entity):
+            return f"{value[: len(entity)]}{REDACTED}{value[-len(entity) :]}"
     quoted = re.match(r"^(\\*[\"'])(.*?)(\\*[\"'])$", value)
     if quoted and quoted.group(1).lstrip("\\") == quoted.group(3).lstrip("\\"):
         return f"{quoted.group(1)}{REDACTED}{quoted.group(3)}"
@@ -171,9 +176,11 @@ def _json_fragments(text: str) -> list[tuple[int, int, Any, tuple[str, ...]]]:
             index = start + 1
             continue
         end = start + length
-        line_start = text.rfind("\n", 0, start) + 1
-        previous_line_start = text.rfind("\n", 0, max(0, line_start - 1)) + 1
-        assignment_prefix = text[previous_line_start:start]
+        assignment_end = start
+        while assignment_end > 0 and text[assignment_end - 1].isspace():
+            assignment_end -= 1
+        line_start = text.rfind("\n", 0, assignment_end) + 1
+        assignment_prefix = text[line_start:assignment_end]
         # OBS stores individual action bindings as JSON-valued INI assignments.
         # Their bare `key` property is a hotkey, while other credential fields
         # in the same object still receive normal structural redaction.

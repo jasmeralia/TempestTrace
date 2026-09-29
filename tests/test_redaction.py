@@ -148,7 +148,13 @@ def test_credential_free_embedded_json_keeps_its_original_formatting(tmp_path: P
         "repr {'token': 'SINGLE_SECRET'}",
         'trail {"token":"TRAILING_SECRET",}',
         '{"token" /*comment*/: "COMMENT_SECRET"}',
+        '{"token" /** user token */: "DOC_COMMENT_SECRET"}',
+        '{"token" /* foo * bar */: "STAR_COMMENT_SECRET"}',
+        '{"token" // note\n: "SLASH_COMMENT_SECRET"}',
         "{&quot;token&quot;:&quot;HTML_SECRET&quot;}",
+        "{&#34;token&#34;:&#34;NUM_ENTITY_SECRET&#34;}",
+        "{&#x22;token&#x22;:&#x22;HEX_ENTITY_SECRET&#x22;}",
+        "{&apos;password&apos;:&apos;APOS_SECRET&apos;}",
     ],
 )
 def test_non_strict_quoted_credential_text_is_redacted(tmp_path: Path, line: str) -> None:
@@ -164,7 +170,13 @@ def test_non_strict_quoted_credential_text_is_redacted(tmp_path: Path, line: str
         "SINGLE_SECRET",
         "TRAILING_SECRET",
         "COMMENT_SECRET",
+        "DOC_COMMENT_SECRET",
+        "STAR_COMMENT_SECRET",
+        "SLASH_COMMENT_SECRET",
         "HTML_SECRET",
+        "NUM_ENTITY_SECRET",
+        "HEX_ENTITY_SECRET",
+        "APOS_SECRET",
     ):
         assert secret not in cleaned
 

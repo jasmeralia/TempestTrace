@@ -365,7 +365,13 @@ def test_private_verifier_detects_credentials_inside_embedded_json(
         "repr {'token': 'SINGLE_SECRET'}",
         'trail {"token":"TRAILING_SECRET",}',
         '{"token" /*comment*/: "COMMENT_SECRET"}',
+        '{"token" /** user token */: "DOC_COMMENT_SECRET"}',
+        '{"token" /* foo * bar */: "STAR_COMMENT_SECRET"}',
+        '{"token" // note\n: "SLASH_COMMENT_SECRET"}',
         "{&quot;token&quot;:&quot;HTML_SECRET&quot;}",
+        "{&#34;token&#34;:&#34;NUM_ENTITY_SECRET&#34;}",
+        "{&#x22;token&#x22;:&#x22;HEX_ENTITY_SECRET&#x22;}",
+        "{&apos;password&apos;:&apos;APOS_SECRET&apos;}",
     ],
 )
 def test_private_verifier_detects_non_strict_quoted_credentials(tmp_path: Path, line: str) -> None:
@@ -445,6 +451,26 @@ def test_backup_redacts_multiline_obsbasic_json_value_without_truncation(tmp_pat
     assert '"key":"<REDACTED>"' in cleaned
     assert "MULTILINE_STREAM_SECRET" not in cleaned
     assert "MULTILINE_TOKEN_SECRET" not in cleaned
+
+
+def test_backup_preserves_hotkey_binding_with_blank_line_before_json(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    ini = (
+        "[Output]\nOBSBasic.StartStreaming=\n\n"
+        '{"key":"OBS_KEY_F9","settings":{"key":"BLANK_LINE_STREAM_SECRET"}}\n'
+    )
+    (source / "basic/profiles/default/basic.ini").write_text(ini, encoding="utf-8")
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    result = create_backup(source, destination)
+
+    assert not result.warnings
+    with zipfile.ZipFile(result.archive) as archive:
+        cleaned = archive.read("basic/profiles/default/basic.ini").decode("utf-8")
+    assert '"key":"OBS_KEY_F9"' in cleaned
+    assert '"key":"<REDACTED>"' in cleaned
+    assert "BLANK_LINE_STREAM_SECRET" not in cleaned
 
 
 def test_backup_verifier_preserves_hotkey_log_lines(tmp_path: Path) -> None:

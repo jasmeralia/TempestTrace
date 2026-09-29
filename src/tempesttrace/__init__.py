@@ -1,1 +1,1 @@
-"""TempestTrace package; collector implementation is planned."""
+"""TempestTrace safe OBS diagnostic backup utility."""

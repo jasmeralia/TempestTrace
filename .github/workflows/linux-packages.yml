@@ -1,0 +1,111 @@
+name: Linux package artifacts
+
+on:
+  workflow_call:
+    inputs:
+      app_version:
+        description: Shared release version tag, such as v0.1.12
+        required: false
+        type: string
+permissions:
+  contents: read
+
+jobs:
+  linux-packages:
+    name: Linux packages (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ startsWith(inputs.app_version, 'v') && format('refs/tags/{0}', inputs.app_version) || github.sha }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install package build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes dpkg-dev rpm flatpak squashfs-tools snapd libfuse2t64
+          python -m pip install --upgrade pip
+          python -m pip install . pyinstaller==6.22.3
+      - name: Install pinned AppImageKit tool
+        run: |
+          case "${{ matrix.arch }}" in
+            amd64) tool_arch=x86_64 ;;
+            arm64) tool_arch=aarch64 ;;
+          esac
+          curl --fail --location --retry 3 \
+            "https://github.com/AppImage/AppImageKit/releases/download/13/appimagetool-${tool_arch}.AppImage" \
+            --output /tmp/appimagetool
+          chmod +x /tmp/appimagetool
+          echo /tmp >> "$GITHUB_PATH"
+      - name: Install Snapcraft 8
+        run: sudo snap install snapcraft --classic --channel=8.x/stable
+      - name: Install Flatpak builder and runtime
+        run: |
+          sudo apt-get install --yes flatpak
+          flatpak --version
+      - name: Set package artifact version
+        env:
+          APP_VERSION: ${{ inputs.app_version }}
+        run: |
+          if [[ -z "$APP_VERSION" ]]; then
+            APP_VERSION="0.0.0+${GITHUB_SHA::12}"
+          fi
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+      - name: Build Linux packages
+        run: packaging/linux/build-packages.sh dist/linux
+      - name: Smoke-test DEB install and uninstall
+        run: |
+          package=$(find dist/linux -maxdepth 1 -name '*.deb' -print -quit)
+          test -n "$package"
+          sudo apt-get install --yes "./$package"
+          QT_QPA_PLATFORM=offscreen /usr/bin/tempesttrace --smoke-test
+          sudo apt-get remove --yes tempesttrace
+          test ! -e /usr/bin/tempesttrace
+      - name: Smoke-test Flatpak install, launch, and uninstall
+        run: |
+          package=$(find dist/linux -maxdepth 1 -name '*.flatpak' -print -quit)
+          test -n "$package"
+          flatpak install --user --noninteractive --assumeyes "$package"
+          flatpak run --user --command=tempesttrace \
+            --env=QT_QPA_PLATFORM=offscreen io.github.jasmeralia.TempestTrace --smoke-test
+          flatpak uninstall --user --noninteractive --assumeyes io.github.jasmeralia.TempestTrace
+      - name: Smoke-test RPM install and uninstall on Fedora 42
+        run: |
+          docker run --rm -v "$PWD/dist/linux:/pkgs:ro" fedora:42 bash -euc '
+            dnf install -y /pkgs/*.rpm
+            QT_QPA_PLATFORM=offscreen /usr/bin/tempesttrace --smoke-test
+            dnf remove -y tempesttrace
+            test ! -e /usr/bin/tempesttrace
+          '
+      - name: Smoke-test local Snap install, launch, and uninstall
+        run: |
+          package=$(find dist/linux -maxdepth 1 -name '*.snap' -print -quit)
+          test -n "$package"
+          sudo snap install --dangerous --devmode "$package"
+          QT_QPA_PLATFORM=offscreen snap run tempesttrace --smoke-test
+          sudo snap remove tempesttrace
+      - name: Verify package metadata and AppImage launch
+        run: |
+          rpm -qp --info dist/linux/*.rpm
+          appimage=$(find dist/linux -maxdepth 1 -name '*.AppImage' -print -quit)
+          test -n "$appimage"
+          APPIMAGE_EXTRACT_AND_RUN=1 QT_QPA_PLATFORM=offscreen "$appimage" --smoke-test
+      - name: Create SHA-256 checksums
+        run: (cd dist/linux && sha256sum * > SHA256SUMS)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-packages-${{ matrix.arch }}
+          path: dist/linux/
+          if-no-files-found: error

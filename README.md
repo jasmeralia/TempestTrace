@@ -1,24 +1,31 @@
 # TempestTrace
 
-TempestTrace is a planned Windows and Linux desktop utility for collecting a safe OBS
+TempestTrace is a Windows and Linux desktop utility in active development for collecting a safe OBS
 Studio diagnostic backup for troubleshooting Rin's screen flicker issue.
 
 The [design and implementation plan](docs/DESIGN.md) defines the collection scope,
-redaction rules, user flow, tests, and release criteria. The collector and executable
-have not been implemented yet; this repository currently contains the plan and
-project setup. The plan includes native Linux packages, automatic update checks, a
-user-approved update flow, beta-channel selection, and test-driven implementation.
-CI runs lint and tests on PRs and master. The gated Windows release scaffold is set
-up to build an executable inside an NSIS setup installer, then smoke-test the
-installer and installed app. It will not publish until the application and Linux
-build and smoke-test jobs are added, and the `build/release-ready` marker is
-deliberately committed.
-Once releases are enabled, prerelease tags use the master commit position
-(`v0.1.<position minus one>`) so each released merge has a stable tag even when
-builds overlap or are retried.
-Every successful master build publishes a prerelease. After testing and validating
-its assets, Morgan promotes that same GitHub release to a full release manually;
-CI never promotes it and reruns leave a promoted release unchanged.
+redaction rules, user flow, tests, and release criteria. The synthetic-fixture
+collector, PyQt desktop flow, updater, and Windows/Linux packaging workflows are
+implemented. PR CI runs lint and synthetic tests only. After a merge to `master`, CI
+builds and smoke-tests the Windows installer and Linux packages, then publishes a
+beta prerelease when the full asset matrix and checksums pass. Morgan manually
+validates the beta and promotes that same release to stable. Hands-on checks cover
+fixture collection, update behavior, sandbox access, and collection while OBS is
+streaming.
+
+After lint and tests pass on a master commit, CI creates the next patch tag in the
+`v0.1.x` beta series (starting at `v0.1.0`) and builds every platform from that tag.
+Package builds are serialized and run only after master merges. Use GitHub's
+**Re-run failed jobs** only when a build job actually failed; it reuses that run's tag
+and successful platform artifacts. A rerun after success does not rebuild or consume
+a version. The next master merge gets the next patch version.
+
+Every successful master build publishes the complete verified asset matrix as a beta
+prerelease. Published files are immutable to CI: a retry verifies existing files and
+adds only missing assets. Changing a release from prerelease to stable does not affect
+that behavior; CI never changes the release's status or replaces existing assets.
+Update checks offer stable releases by default. Users can opt into beta updates in
+Preferences to include prereleases.
 
 `make test` writes `coverage.xml` and `junit.xml`; CI preserves both reports and
 uploads coverage and test results to Codecov. Ruff and mypy are the lint checks;
@@ -35,11 +42,22 @@ The workflow uses this token so Dependabot merges trigger the master release CI.
 
 Rin can install the NSIS setup package and launch TempestTrace, then review the
 proposed output location and start a read-only collection.
-Linux users will use native packages with the same collection and redaction behavior.
+Linux users can use native packages with the same collection and redaction behavior.
 A successful run will leave a single, timestamped ZIP file under
 `Dropbox/Jasmeralia and Rin/obs logs/` containing sanitized OBS
 profiles, scene collections, recent logs, and a readable manifest. The utility will
 never stop OBS or change its source files.
+
+The collector copies an explicit set of OBS profile, scene, global settings, and recent
+log files; it redacts recognized credential fields and patterns in staged copies and
+writes a timestamped ZIP, README, and manifest. Review skipped files and warnings in
+the manifest after collection.
+
+## Development
+
+Install dependencies with `make deps`, launch with `python -m tempesttrace`, and run
+the synthetic suite with `make test`. Collection and redaction live outside Qt so path
+discovery and backup behavior can be exercised with temporary fixture directories.
 
 ## Source references
 

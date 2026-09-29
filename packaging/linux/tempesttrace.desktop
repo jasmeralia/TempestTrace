@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=TempestTrace
+Comment=Create a redacted OBS diagnostic backup
+Exec=tempesttrace
+Icon=io.github.jasmeralia.TempestTrace
+Terminal=false
+Categories=Utility;AudioVideo;
+StartupNotify=true

@@ -26,13 +26,64 @@ SetCompressor /SOLID lzma
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "English"
 
+!macro BackupOwnedFile FILENAME
+  IfFileExists "$INSTDIR\${FILENAME}" 0 +3
+    Rename "$INSTDIR\${FILENAME}" "$INSTDIR\.tempesttrace-upgrade-rollback\${FILENAME}"
+    IfErrors install_failed
+!macroend
+
+!macro RemoveRollbackFile FILENAME
+  Delete "$INSTDIR\.tempesttrace-upgrade-rollback\${FILENAME}"
+!macroend
+
+!macro RestoreOwnedFile FILENAME FLAG LABEL
+  IfFileExists "$INSTDIR\.tempesttrace-upgrade-rollback\${FILENAME}" restore_${LABEL} no_backup_${LABEL}
+  restore_${LABEL}:
+    Delete "$INSTDIR\${FILENAME}"
+    Rename "$INSTDIR\.tempesttrace-upgrade-rollback\${FILENAME}" "$INSTDIR\${FILENAME}"
+    Goto restored_${LABEL}
+  no_backup_${LABEL}:
+    ${If} ${FLAG} == "1"
+      Delete "$INSTDIR\${FILENAME}"
+    ${EndIf}
+  restored_${LABEL}:
+!macroend
+
 Section "TempestTrace" SecMain
   SectionIn RO
   Call KillRunningTempestTrace
+  StrCpy $R7 "0"
+  StrCpy $R4 "0"
+  StrCpy $R5 "0"
+  StrCpy $R6 "0"
+
+  ; Keep only the files owned by this installer in a same-volume rollback
+  ; directory. Arbitrary files in $INSTDIR are never moved or removed.
+  IfFileExists "$INSTDIR\.tempesttrace-upgrade-rollback" rollback_exists
+  CreateDirectory "$INSTDIR\.tempesttrace-upgrade-rollback"
+  IfErrors prepare_failed
+  StrCpy $R7 "1"
+  !insertmacro BackupOwnedFile "TempestTrace.exe"
+  !insertmacro BackupOwnedFile "LICENSE"
+  !insertmacro BackupOwnedFile "Uninstall.exe"
+
   SetOutPath "$INSTDIR"
+  IfErrors install_failed
+  StrCpy $R4 "1"
   File "..\dist\TempestTrace.exe"
+  IfErrors install_failed
+  StrCpy $R5 "1"
   File "..\LICENSE"
+  IfErrors install_failed
+  StrCpy $R6 "1"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
+  IfErrors install_failed
+
+  ; Validate the replacement executable before removing rollback copies.
+  ExecWait '"$INSTDIR\TempestTrace.exe" --smoke-test' $0
+  ${If} $0 != 0
+    Goto install_failed
+  ${EndIf}
 
   CreateDirectory "$SMPROGRAMS\TempestTrace"
   CreateShortCut "$SMPROGRAMS\TempestTrace\TempestTrace.lnk" "$INSTDIR\TempestTrace.exe"
@@ -48,6 +99,23 @@ Section "TempestTrace" SecMain
     "InstallLocation" "$INSTDIR"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TempestTrace" \
     "UninstallString" '$\"$INSTDIR\Uninstall.exe$\"'
+
+  !insertmacro RemoveRollbackFile "TempestTrace.exe"
+  !insertmacro RemoveRollbackFile "LICENSE"
+  !insertmacro RemoveRollbackFile "Uninstall.exe"
+  RMDir "$INSTDIR\.tempesttrace-upgrade-rollback"
+  Goto install_done
+
+  rollback_exists:
+    MessageBox MB_ICONSTOP|MB_OK "A previous TempestTrace upgrade left recovery files at:$\r$\n$INSTDIR\.tempesttrace-upgrade-rollback$\r$\nRestore or remove that directory before running the installer again."
+    Abort
+  prepare_failed:
+    MessageBox MB_ICONSTOP|MB_OK "Could not prepare the TempestTrace upgrade safely. The existing installation was left untouched."
+    Abort
+  install_failed:
+    MessageBox MB_ICONSTOP|MB_OK "TempestTrace could not be installed. The installer will restore the previous files where possible."
+    Abort
+  install_done:
 SectionEnd
 
 Section "Uninstall"
@@ -98,4 +166,16 @@ Function un.KillRunningTempestTrace
       Sleep 1000
       Goto kill_loop_uninstall
     ${EndIf}
+FunctionEnd
+
+Function .onInstFailed
+  ${If} $R7 != "1"
+    Return
+  ${EndIf}
+  ; Restore backed-up files, removing partially installed replacements first.
+  ; If this was a fresh install, this also removes its partial app files.
+  !insertmacro RestoreOwnedFile "TempestTrace.exe" $R4 EXE
+  !insertmacro RestoreOwnedFile "LICENSE" $R5 LICENSE
+  !insertmacro RestoreOwnedFile "Uninstall.exe" $R6 UNINSTALL
+  RMDir "$INSTDIR\.tempesttrace-upgrade-rollback"
 FunctionEnd

@@ -11,6 +11,9 @@ license = "GPL-3.0-or-later"
 authors = [{name = "Morgan Blackthorne", email = "morgan@windsofstorm.net"}]
 dependencies = ["PyQt6>=6.6,<7"]
 
+[project.scripts]
+tempesttrace = "tempesttrace.ui:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

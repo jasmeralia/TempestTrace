@@ -1,6 +1,13 @@
 # TempestTrace design and implementation plan
 
-Status: design; implementation has not started. Source task: Odoo project.task 583,
+Status: implementation in progress. The path adapters, collector, redaction, PyQt
+window, verified updater, Linux package definitions, and cross-platform CI workflows
+are implemented with synthetic fixtures. The full package workflows have not yet run
+in GitHub Actions. Each successful master build will publish a beta prerelease after
+the Windows and Linux CI package builds and smoke tests pass; hands-on installation,
+collection, update, sandbox, and streaming checks validate that beta before Morgan
+promotes it to stable.
+Source task: Odoo project.task 583,
 "Build TempestTrace: Safe OBS Diagnostic Backup."
 
 ## Goal and boundaries
@@ -128,8 +135,8 @@ name or raw absolute OBS path in the manifest unless required to explain a failu
   provide **Help > Check for Updates** for an explicit check. A failed or offline
   check leaves collection usable. Do not contact any service during collection.
 - Ignore drafts and select the highest compatible release with a matching asset for
-  the current OS and architecture. Stable installations default to stable releases;
-  beta installations keep receiving beta updates unless the user opts out. Show
+  the current OS and architecture. Offer stable releases by default for every install;
+  include prereleases only when the user opts into beta updates in Preferences. Show
   current and offered versions, stable/beta label, release notes, download size, and
   an explicit **Download and Update** action. Do not install silently.
 - Embed the CI-created version tag in each binary and compare versions with a
@@ -160,13 +167,21 @@ name or raw absolute OBS path in the manifest unless required to explain a failu
   distinguishes bundles from updateable remotes, and
   [Snap's install-mode guide](https://snapcraft.io/docs/explanation/snap-development/install-modes/)
   documents the trust and confinement flags for local snaps.
-- Once the release-ready gate is enabled, every successful master build publishes a
-  GitHub prerelease with validated assets. After Rin validates a real backup, Morgan
-  manually edits that same release to remove its prerelease designation; no new tag
-  or rebuild is needed. CI must never
-  promote automatically or downgrade a manually promoted release on rerun. Keep the
-  current `v0.1.N` tag strategy, with `N` based on master commit position, during
-  beta development and revise it deliberately when defining the first stable version.
+- After lint and tests pass on an untagged master commit, CI allocates and creates the
+  next patch tag in the `v0.1.x` beta series, beginning at `v0.1.0`. It builds the
+  Windows installer and every Linux format/architecture from that same tag. Serialize
+  release builds. Retry an actual build failure with GitHub's **Re-run failed jobs**;
+  it reuses the workflow's tag and successful platform artifacts. A rerun after success
+  must not rebuild packages or consume a version. The next master merge gets the next
+  patch version.
+- After every successful master build, publish a beta prerelease once Windows and every
+  Linux package/architecture job pass and the complete asset/checksum validation
+  succeeds. PR updates run lint and synthetic tests; package builds run only after a
+  master merge. Existing release assets are immutable to CI: retry publication by
+  verifying same-name assets and adding only missing files. Changing a release from
+  prerelease to stable does not control this behavior. CI never changes release status
+  or replaces existing assets. Morgan promotes the validated release manually without
+  changing its tag or assets.
 
 ## Architecture and toolchain
 
@@ -239,6 +254,11 @@ the initial baseline, and collector tests must maintain those targets.
 
 ## Delivery stages
 
+The current implementation covers the initial synthetic path discovery, allowlisted
+snapshot, redaction, ZIP and manifest workflow, and the basic desktop collection flow.
+It does not yet satisfy the complete acceptance list below. Keep this status current as
+the remaining updater and packaging stages are implemented and tested.
+
 1. **Repository foundation:** README, this design, license and contributor guidance,
    Dependabot for pip and GitHub Actions, CODEOWNERS, PR CI, branch protection,
    automatic Copilot review, and required conversation resolution. Configure
@@ -262,18 +282,15 @@ the initial baseline, and collector tests must maintain those targets.
 5. **Updates and beta channel:** write failing tests for release selection, channel
    preference, checksum validation, interrupted downloads, update rollback, and
    platform-specific application before implementing the updater and UI.
-6. **Release:** expand the current Windows-only workflow to build and smoke-test all
-   required Linux assets before adding the `build/release-ready` marker and enabling
-   publication. A final release job must depend on successful Windows and every Linux
-   package/architecture job, verify the complete asset matrix and checksums, and only
-   then create the tag and publish assets. A failed or missing package job must leave
-   no partial release. After CI passes on a master merge, derive a stable version tag
-   from that commit's first-parent position on master, create the tag in CI, and serialize
-   retries by commit SHA without replacing builds for other master commits;
-   publish the Windows NSIS setup installer and Linux assets as a
-   GitHub beta prerelease with generated notes and SHA-256 checksums. Morgan promotes
-   the validated release manually without changing its tag or assets. Never publish a
-   release from the design-only foundation or without Windows and Linux smoke tests.
+6. **Release:** build and smoke-test the Windows installer and all required Linux
+   assets after each master merge. A final release job depends on successful Windows
+   and every Linux package/architecture job, verifies the complete asset matrix and
+   checksums, then publishes the Windows NSIS setup installer and Linux assets as a
+   GitHub beta prerelease with generated notes and SHA-256 checksums. A failed or
+   missing package job leaves no partial release. Serialize builds and retry actual
+   failed jobs against the same tag without replacing existing assets. Morgan validates
+   a prerelease and promotes that same release to stable without changing its tag or
+   assets.
 
 ## Acceptance checks
 

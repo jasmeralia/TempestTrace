@@ -368,10 +368,18 @@ def test_private_verifier_detects_credentials_inside_embedded_json(
         '{"token" /** user token */: "DOC_COMMENT_SECRET"}',
         '{"token" /* foo * bar */: "STAR_COMMENT_SECRET"}',
         '{"token" // note\n: "SLASH_COMMENT_SECRET"}',
+        '{"token" /* unclosed : "UNCLOSED_COMMENT_SECRET"}',
+        '{"token" /* &#39;password&#39;:&#39;NESTED_COMMENT_SECRET&#39; */'
+        ' : "OUTER_COMMENT_SECRET"}',
         "{&quot;token&quot;:&quot;HTML_SECRET&quot;}",
         "{&#34;token&#34;:&#34;NUM_ENTITY_SECRET&#34;}",
         "{&#x22;token&#x22;:&#x22;HEX_ENTITY_SECRET&#x22;}",
         "{&apos;password&apos;:&apos;APOS_SECRET&apos;}",
+        "{&#39;password&#39;:&#39;NUM_APOS_SECRET&#39;}",
+        "{&#x27;token&#x27;:&#x27;HEX_APOS_SECRET&#x27;}",
+        "{&#034;token&#034;:&#034;PADDED_NUM_SECRET&#034;}",
+        "{&#x0022;token&#x0022;:&#x0022;PADDED_HEX_SECRET&#x0022;}",
+        "{`token`: `BACKTICK_SECRET`}",
     ],
 )
 def test_private_verifier_detects_non_strict_quoted_credentials(tmp_path: Path, line: str) -> None:
@@ -379,6 +387,40 @@ def test_private_verifier_detects_non_strict_quoted_credentials(tmp_path: Path, 
     path.write_text(line, encoding="utf-8")
 
     assert backup._secret_scan(path)
+
+
+def test_backup_redacts_credentials_hidden_by_comments_and_quote_entities(
+    tmp_path: Path,
+) -> None:
+    source = fixture(tmp_path / "obs")
+    lines = (
+        '{"token" /** user token */: "DOC_COMMENT_SECRET"}\n'
+        '{"token" /* &#39;password&#39;:&#39;NESTED_COMMENT_SECRET&#39; */'
+        ' : "OUTER_COMMENT_SECRET"}\n'
+        '{"token" /* unclosed : "UNCLOSED_COMMENT_SECRET"}\n'
+        "{&#x0022;token&#x0022;:&#x0022;PADDED_ENTITY_SECRET&#x0022;}\n"
+        "{`token`: `BACKTICK_SECRET`}\n"
+    )
+    (source / "logs/2026-01-01.txt").write_text(lines, encoding="utf-8")
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    result = create_backup(source, destination)
+
+    assert not result.warnings
+    with zipfile.ZipFile(result.archive) as archive:
+        name = "logs/2026-01-01.txt"
+        assert name in archive.namelist()
+        log = archive.read(name).decode("utf-8")
+    for secret in (
+        "DOC_COMMENT_SECRET",
+        "NESTED_COMMENT_SECRET",
+        "OUTER_COMMENT_SECRET",
+        "UNCLOSED_COMMENT_SECRET",
+        "PADDED_ENTITY_SECRET",
+        "BACKTICK_SECRET",
+    ):
+        assert secret not in log
 
 
 def test_private_verifier_does_not_join_quoted_assignments_across_lines(tmp_path: Path) -> None:
@@ -471,6 +513,30 @@ def test_backup_preserves_hotkey_binding_with_blank_line_before_json(tmp_path: P
     assert '"key":"OBS_KEY_F9"' in cleaned
     assert '"key":"<REDACTED>"' in cleaned
     assert "BLANK_LINE_STREAM_SECRET" not in cleaned
+
+
+@pytest.mark.parametrize("comment", ["# retained\n", "; retained\n"])
+def test_backup_preserves_hotkey_binding_with_comment_before_json(
+    tmp_path: Path, comment: str
+) -> None:
+    source = fixture(tmp_path / "obs")
+    ini = (
+        "[Output]\nOBSBasic.StartStreaming=\n"
+        f"{comment}"
+        '{"key":"OBS_KEY_F9","settings":{"key":"COMMENT_LINE_STREAM_SECRET"}}\n'
+    )
+    (source / "basic/profiles/default/basic.ini").write_text(ini, encoding="utf-8")
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    result = create_backup(source, destination)
+
+    assert not result.warnings
+    with zipfile.ZipFile(result.archive) as archive:
+        cleaned = archive.read("basic/profiles/default/basic.ini").decode("utf-8")
+    assert '"key":"OBS_KEY_F9"' in cleaned
+    assert '"key":"<REDACTED>"' in cleaned
+    assert "COMMENT_LINE_STREAM_SECRET" not in cleaned
 
 
 def test_backup_verifier_preserves_hotkey_log_lines(tmp_path: Path) -> None:

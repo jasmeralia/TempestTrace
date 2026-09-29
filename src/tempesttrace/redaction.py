@@ -7,20 +7,35 @@ import re
 from pathlib import Path
 from typing import Any
 
-RULE_VERSION = 7
+RULE_VERSION = 8
 REDACTED = "<REDACTED>"
+_CREDENTIAL_NAME = (
+    r"(?:key|stream[_ -]?key|api[_ -]?key|token|auth[_ -]?token|bearer[_ -]?token|"
+    r"password|passwd|access[_ -]?token|client[_ -]?secret)"
+)
+_QUOTE_DELIMITER = r"(?:\\*[\"']|`|&(?:quot|apos);|&#0*(?:34|39);|&#x0*(?:22|27);)"
+_QUOTED_CREDENTIAL_VALUE = (
+    r'(\\*"(?:\\[^\r\n]|[^"\\\r\n])*\\*"|'
+    r"\\*'(?:\\[^\r\n]|[^'\\\r\n])*\\*'|"
+    r"`[^\r\n]*?`|"
+    r"&quot;[^\r\n]*?&quot;|&apos;[^\r\n]*?&apos;|"
+    r"&#0*34;[^\r\n]*?&#0*34;|&#x0*22;[^\r\n]*?&#x0*22;|"
+    r"&#0*39;[^\r\n]*?&#0*39;|&#x0*27;[^\r\n]*?&#x0*27;|"
+    r"[^\s,;\]\\\"'`}]+)"
+)
+_COMMENT_SEPARATOR = (
+    r"(?:\s|/\*(?:[\s\S]*?\*/|(?:(?!\*/)[\s\S])*?(?=[=:]))|"
+    r"//[^\r\n]*(?:\r?\n\s*)?)*"
+)
 _LOG_PATTERNS = (
     re.compile(
-        r"(?i)((?<![?&])\b(?:key|stream[_ -]?key|api[_ -]?key|token|auth[_ -]?token|"
-        r"bearer[_ -]?token|password|passwd|access[_ -]?token|client[_ -]?secret)"
-        r"(?:\\*[\"']|&(?:quot|apos);|&#(?:34|x22);)?"
-        r"(?:\s|/\*[\s\S]*?\*/|//[^\r\n]*(?:\r?\n\s*)?)*[=:]"
-        r"(?:\s|/\*[\s\S]*?\*/|//[^\r\n]*(?:\r?\n\s*)?)*)"
-        r'(\\*"(?:\\[^\r\n]|[^"\\\r\n])*\\*"|'
-        r"\\*'(?:\\[^\r\n]|[^'\\\r\n])*\\*'|"
-        r"&quot;[^\r\n]*?&quot;|&apos;[^\r\n]*?&apos;|"
-        r"&#34;[^\r\n]*?&#34;|&#x22;[^\r\n]*?&#x22;|"
-        r"[^\s,;\]\\\"'}]+)"
+        rf"(?i)((?<![?&])\b{_CREDENTIAL_NAME}{_QUOTE_DELIMITER}?\s*[=:]\s*)"
+        rf"({_QUOTED_CREDENTIAL_VALUE})"
+    ),
+    re.compile(
+        rf"(?i)((?<![?&])\b{_CREDENTIAL_NAME}{_QUOTE_DELIMITER}?"
+        rf"{_COMMENT_SEPARATOR}[=:]{_COMMENT_SEPARATOR})"
+        rf"({_QUOTED_CREDENTIAL_VALUE})"
     ),
     re.compile(r"(?i)(\bAuthorization:\s*(?:Bearer|Basic)\s+)([^\s,;]+)"),
 )
@@ -82,9 +97,13 @@ def _is_sensitive_key(key: str, context: tuple[str, ...] = ()) -> bool:
 
 def _unquote(value: str) -> str:
     value = value.strip()
-    for entity in ("&quot;", "&apos;", "&#34;", "&#x22;"):
-        if value.casefold().startswith(entity) and value.casefold().endswith(entity):
-            return value[len(entity) : -len(entity)]
+    entity_quoted = re.match(
+        r"(?i)^(&quot;|&apos;|&#0*34;|&#x0*22;|&#0*39;|&#x0*27;)(.*?)(\1)$", value
+    )
+    if entity_quoted:
+        return entity_quoted.group(2)
+    if len(value) >= 2 and value[0] == value[-1] == "`":
+        return value[1:-1]
     quoted = re.match(r"^(\\*[\"'])(.*?)(\\*[\"'])$", value)
     if quoted and quoted.group(1).lstrip("\\") == quoted.group(3).lstrip("\\"):
         return quoted.group(2)
@@ -92,9 +111,13 @@ def _unquote(value: str) -> str:
 
 
 def _quoted_redacted(value: str) -> str:
-    for entity in ("&quot;", "&apos;", "&#34;", "&#x22;"):
-        if value.casefold().startswith(entity) and value.casefold().endswith(entity):
-            return f"{value[: len(entity)]}{REDACTED}{value[-len(entity) :]}"
+    entity_quoted = re.match(
+        r"(?i)^(&quot;|&apos;|&#0*34;|&#x0*22;|&#0*39;|&#x0*27;)(.*?)(\1)$", value
+    )
+    if entity_quoted:
+        return f"{entity_quoted.group(1)}{REDACTED}{entity_quoted.group(3)}"
+    if len(value) >= 2 and value[0] == value[-1] == "`":
+        return f"`{REDACTED}`"
     quoted = re.match(r"^(\\*[\"'])(.*?)(\\*[\"'])$", value)
     if quoted and quoted.group(1).lstrip("\\") == quoted.group(3).lstrip("\\"):
         return f"{quoted.group(1)}{REDACTED}{quoted.group(3)}"
@@ -177,8 +200,15 @@ def _json_fragments(text: str) -> list[tuple[int, int, Any, tuple[str, ...]]]:
             continue
         end = start + length
         assignment_end = start
-        while assignment_end > 0 and text[assignment_end - 1].isspace():
-            assignment_end -= 1
+        while assignment_end > 0:
+            while assignment_end > 0 and text[assignment_end - 1].isspace():
+                assignment_end -= 1
+            line_start = text.rfind("\n", 0, assignment_end) + 1
+            previous_line = text[line_start:assignment_end].strip()
+            if previous_line.startswith(("#", ";")):
+                assignment_end = max(0, line_start - 1)
+                continue
+            break
         line_start = text.rfind("\n", 0, assignment_end) + 1
         assignment_prefix = text[line_start:assignment_end]
         # OBS stores individual action bindings as JSON-valued INI assignments.

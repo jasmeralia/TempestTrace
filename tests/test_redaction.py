@@ -151,10 +151,18 @@ def test_credential_free_embedded_json_keeps_its_original_formatting(tmp_path: P
         '{"token" /** user token */: "DOC_COMMENT_SECRET"}',
         '{"token" /* foo * bar */: "STAR_COMMENT_SECRET"}',
         '{"token" // note\n: "SLASH_COMMENT_SECRET"}',
+        '{"token" /* unclosed : "UNCLOSED_COMMENT_SECRET"}',
+        '{"token" /* &#39;password&#39;:&#39;NESTED_COMMENT_SECRET&#39; */'
+        ' : "OUTER_COMMENT_SECRET"}',
         "{&quot;token&quot;:&quot;HTML_SECRET&quot;}",
         "{&#34;token&#34;:&#34;NUM_ENTITY_SECRET&#34;}",
         "{&#x22;token&#x22;:&#x22;HEX_ENTITY_SECRET&#x22;}",
         "{&apos;password&apos;:&apos;APOS_SECRET&apos;}",
+        "{&#39;password&#39;:&#39;NUM_APOS_SECRET&#39;}",
+        "{&#x27;token&#x27;:&#x27;HEX_APOS_SECRET&#x27;}",
+        "{&#034;token&#034;:&#034;PADDED_NUM_SECRET&#034;}",
+        "{&#x0022;token&#x0022;:&#x0022;PADDED_HEX_SECRET&#x0022;}",
+        "{`token`: `BACKTICK_SECRET`}",
     ],
 )
 def test_non_strict_quoted_credential_text_is_redacted(tmp_path: Path, line: str) -> None:
@@ -173,10 +181,18 @@ def test_non_strict_quoted_credential_text_is_redacted(tmp_path: Path, line: str
         "DOC_COMMENT_SECRET",
         "STAR_COMMENT_SECRET",
         "SLASH_COMMENT_SECRET",
+        "UNCLOSED_COMMENT_SECRET",
+        "NESTED_COMMENT_SECRET",
+        "OUTER_COMMENT_SECRET",
         "HTML_SECRET",
         "NUM_ENTITY_SECRET",
         "HEX_ENTITY_SECRET",
         "APOS_SECRET",
+        "NUM_APOS_SECRET",
+        "HEX_APOS_SECRET",
+        "PADDED_NUM_SECRET",
+        "PADDED_HEX_SECRET",
+        "BACKTICK_SECRET",
     ):
         assert secret not in cleaned
 

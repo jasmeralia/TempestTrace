@@ -208,6 +208,8 @@ jobs:
           fixture="$HOME/.config/obs-studio"
           dropbox="$HOME/Dropbox"
           output="$dropbox/Jasmeralia and Rin/obs logs"
+          # Flatpak collection used this same synthetic output directory above.
+          rm -rf -- "$output"
           mkdir -p "$fixture/basic/profiles/Fixture" "$fixture/basic/scenes" "$fixture/logs" \
             "$HOME/.dropbox" "$output"
           cat > "$fixture/basic/profiles/Fixture/service.json" <<EOF

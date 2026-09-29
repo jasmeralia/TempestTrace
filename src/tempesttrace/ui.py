@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import cast
 
 from PyQt6.QtCore import QObject, QSettings, Qt, QThread, QTimer, QUrl, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QAction, QDesktopServices, QIcon
+from PyQt6.QtGui import QAction, QCloseEvent, QDesktopServices, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -170,6 +170,8 @@ class MainWindow(QMainWindow):
         self.update_worker: UpdateCheckWorker | UpdateDownloadWorker | None = None
         self._manual_update_check = False
         self._pending_offer: UpdateOffer | None = None
+        self._close_requested = False
+        self._allow_close = False
         menu_bar = self.menuBar()
         help_menu = menu_bar.addMenu("Help") if menu_bar is not None else None
         settings_menu = menu_bar.addMenu("Settings") if menu_bar is not None else None
@@ -441,6 +443,33 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(False)
         self.worker_thread = None
         self.worker = None
+        self._finish_deferred_close()
+
+    def closeEvent(self, event: QCloseEvent | None) -> None:
+        if event is None:
+            return
+        if self._allow_close or not self._has_running_workers():
+            event.accept()
+            return
+        self._close_requested = True
+        event.ignore()
+        if self.worker_thread is not None and self.worker_thread.isRunning():
+            if self.cancel_event is not None:
+                self.cancel_event.set()
+            self.status_bar.showMessage("Cancelling backup before closing…")
+        else:
+            self.status_bar.showMessage("Finishing update activity before closing…")
+
+    def _has_running_workers(self) -> bool:
+        return any(
+            thread is not None and thread.isRunning()
+            for thread in (self.worker_thread, self.update_thread)
+        )
+
+    def _finish_deferred_close(self) -> None:
+        if self._close_requested and not self._has_running_workers():
+            self._allow_close = True
+            self.close()
 
     def _remove_incomplete(self) -> None:
         if not self._incomplete_outputs:
@@ -541,6 +570,8 @@ class MainWindow(QMainWindow):
     @pyqtSlot(object)
     def _on_update_found(self, result: object) -> None:
         self.status_bar.clearMessage()
+        if self._close_requested:
+            return
         beta_preference: bool | None = None
         if isinstance(result, tuple) and len(result) == 2:
             result, beta_preference = result
@@ -585,7 +616,7 @@ class MainWindow(QMainWindow):
     @pyqtSlot()
     def _on_update_failed(self) -> None:
         self.status_bar.clearMessage()
-        if self._manual_update_check:
+        if self._manual_update_check and not self._close_requested:
             QMessageBox.information(
                 self,
                 "Update check unavailable",
@@ -596,6 +627,7 @@ class MainWindow(QMainWindow):
     def _update_thread_stopped(self) -> None:
         self.update_thread = None
         self.update_worker = None
+        self._finish_deferred_close()
 
     def _download_update(self, offer: UpdateOffer) -> None:
         if self.update_thread is not None:
@@ -618,6 +650,8 @@ class MainWindow(QMainWindow):
     @pyqtSlot()
     def _on_update_download_failed(self) -> None:
         self.status_bar.clearMessage()
+        if self._close_requested:
+            return
         QMessageBox.warning(
             self,
             "Update download failed",
@@ -628,6 +662,8 @@ class MainWindow(QMainWindow):
     @pyqtSlot(object)
     def _on_update_downloaded(self, result: object) -> None:
         self.status_bar.clearMessage()
+        if self._close_requested:
+            return
         if not isinstance(result, Path) or self._pending_offer is None:
             QMessageBox.warning(self, "Update", "The verified package could not be located.")
             return

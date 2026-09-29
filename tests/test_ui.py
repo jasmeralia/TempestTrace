@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 from typing import cast
 
@@ -8,7 +9,8 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtGui import QDesktopServices
+from PyQt6.QtCore import QThread
+from PyQt6.QtGui import QCloseEvent, QDesktopServices
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
@@ -40,6 +42,40 @@ def test_window_initializes_discovered_locations_and_completion_actions(
     assert not window.open_dir_button.isHidden()
     assert "credential_field: 2" in window.detail.text()
     window.close()
+    assert app is not None
+
+
+def test_close_waits_for_backup_and_update_workers(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("tempesttrace.ui.discover_obs", lambda: [])
+    monkeypatch.setattr("tempesttrace.ui.discover_dropbox", lambda: None)
+    window = MainWindow(enable_updates=False)
+
+    class RunningThread:
+        running = True
+
+        def isRunning(self) -> bool:
+            return self.running
+
+    backup_thread = RunningThread()
+    update_thread = RunningThread()
+    window.worker_thread = cast(QThread, backup_thread)
+    window.update_thread = cast(QThread, update_thread)
+    window.cancel_event = threading.Event()
+
+    close_event = QCloseEvent()
+    window.closeEvent(close_event)
+    assert not close_event.isAccepted()
+    assert window._close_requested
+    assert window.cancel_event.is_set()
+
+    backup_thread.running = False
+    window._finish_deferred_close()
+    assert not window._allow_close
+
+    update_thread.running = False
+    window._finish_deferred_close()
+    assert window._allow_close
     assert app is not None
 
 

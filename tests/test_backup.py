@@ -125,6 +125,20 @@ def test_private_verifier_detects_plain_and_quoted_log_credentials(
     assert backup._secret_scan(path)
 
 
+@pytest.mark.parametrize(
+    "property_name",
+    ["key", '"key"'],
+    ids=["top-level-key", "quoted-property-name"],
+)
+def test_json_private_verifier_uses_filename_context_for_key_properties(
+    tmp_path: Path, property_name: str
+) -> None:
+    path = tmp_path / "service.json"
+    path.write_text(json.dumps({property_name: "LEAKED_STREAM_KEY"}), encoding="utf-8")
+
+    assert backup._secret_scan(path)
+
+
 def test_short_credentials_do_not_reject_unrelated_substrings_in_backup(
     tmp_path: Path,
 ) -> None:

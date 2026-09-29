@@ -215,7 +215,7 @@ def _secret_scan(path: Path) -> bool:
         return True
     if path.suffix.lower() == ".json" or path.name.lower().endswith(".json.bak"):
         try:
-            return has_unredacted_fields(json.loads(path.read_text(encoding="utf-8")))
+            return has_unredacted_fields(json.loads(path.read_text(encoding="utf-8")), (path.name,))
         except OSError, UnicodeError, json.JSONDecodeError:
             return True
     if path.suffix.lower() == ".ini" or path.name.lower().endswith(".ini.bak"):

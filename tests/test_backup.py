@@ -76,6 +76,22 @@ def test_backup_refuses_destination_inside_source(tmp_path: Path) -> None:
         create_backup(source, source / "basic")
 
 
+def test_raw_source_bytes_never_enter_destination_staging(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "Dropbox/out"
+    destination.mkdir(parents=True)
+
+    def check_destination(phase: str, current: int, total: int) -> None:
+        if phase == "redacting":
+            assert all(
+                b"INI_PROFILE_SECRET" not in item.read_bytes()
+                for item in destination.rglob("*")
+                if item.is_file()
+            )
+
+    create_backup(source, destination, progress=check_destination)
+
+
 def test_cancel_leaves_marked_incomplete_stage(tmp_path: Path) -> None:
     source = fixture(tmp_path / "obs")
     destination = tmp_path / "out"
@@ -95,7 +111,7 @@ def test_staging_cleanup_failure_keeps_created_backup_successful(
     original_rmtree = shutil.rmtree
 
     def fail_staging_removal(path: str | Path, *args: object, **kwargs: object) -> None:
-        if Path(path).name.startswith(".TempestTrace-"):
+        if Path(path).parent == destination and Path(path).name.startswith(".TempestTrace-"):
             raise OSError("synthetic cleanup failure")
         original_rmtree(path, *args, **kwargs)
 

@@ -280,8 +280,10 @@ def create_backup(  # noqa: PLR0912, PLR0915
     warnings: list[str] = []
     records: list[dict[str, object]] = []
     redaction_counts: dict[str, int] = {}
+    private_staging: Path | None = None
     try:
         staging = Path(tempfile.mkdtemp(prefix=f".{base}.incomplete-", dir=target_dir))
+        private_staging = Path(tempfile.mkdtemp(prefix=f".{base}.private-"))
         if progress:
             progress("scanning", 0, 0)
         files = _inventory(root, skipped)
@@ -306,20 +308,21 @@ def create_backup(  # noqa: PLR0912, PLR0915
                 skipped.append({"path": rel_text, "reason": "total_size_limit"})
                 continue
             staged = staging / relative
+            private_staged = private_staging / relative
             try:
                 if progress:
                     progress("copying", index - 1, len(files))
                 byte_limit = min(MAX_FILE_SIZE, MAX_TOTAL_SIZE - total)
-                consistent, actual_size = _read_consistent(source_file, staged, byte_limit)
+                consistent, actual_size = _read_consistent(source_file, private_staged, byte_limit)
                 total += actual_size
                 if progress:
                     progress("redacting", index - 1, len(files))
-                categories, _redaction_count, secrets = redact_file_with_secrets(staged)
+                categories, _redaction_count, secrets = redact_file_with_secrets(private_staged)
             except FileLimitExceeded:
                 skipped.append({"path": rel_text, "reason": "size_limit_exceeded_during_read"})
                 continue
             except OSError, UnicodeError, ValueError, configparser.Error:
-                staged.unlink(missing_ok=True)
+                private_staged.unlink(missing_ok=True)
                 reason = (
                     "unreadable" if relative.parts[0] == "logs" else "unreadable_or_unsanitizable"
                 )
@@ -339,13 +342,23 @@ def create_backup(  # noqa: PLR0912, PLR0915
                 redaction_counts[category] = redaction_counts.get(category, 0) + amount
             if progress:
                 progress("verifying", index, len(files))
-            if _contains_private_secret(staged, secrets) or _secret_scan(staged):
-                staged.unlink(missing_ok=True)
+            if _contains_private_secret(private_staged, secrets) or _secret_scan(private_staged):
+                private_staged.unlink(missing_ok=True)
                 skipped.append({"path": rel_text, "reason": "verification_secret_found"})
                 warnings.append(
                     f"A credential pattern remained in {rel_text}; the file was omitted."
                 )
                 continue
+            try:
+                staged.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(private_staged, staged)
+            except OSError:
+                staged.unlink(missing_ok=True)
+                private_staged.unlink(missing_ok=True)
+                skipped.append({"path": rel_text, "reason": "unreadable_or_unsanitizable"})
+                warnings.append(f"Could not safely include {rel_text}.")
+                continue
+            private_staged.unlink(missing_ok=True)
             records.append(
                 {
                     "source_path": rel_text,
@@ -455,3 +468,5 @@ def create_backup(  # noqa: PLR0912, PLR0915
         raise
     finally:
         reservation.unlink(missing_ok=True)
+        if private_staging is not None:
+            shutil.rmtree(private_staging, ignore_errors=True)

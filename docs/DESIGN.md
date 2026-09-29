@@ -116,17 +116,20 @@ free of secret values. Report counts and file paths, never removed values.
 
 ## Output safety and layout
 
-Stage the collected and redacted files in a uniquely named incomplete folder within
-the target parent, and verify them there. Include a completion marker in the
-manifest before compressing the verified staging tree into the final timestamped
-ZIP file, then remove the staging folder. Write the ZIP under an incomplete name
-first and rename it to its final name only once it is fully written; a failed or
-cancelled run leaves an explicitly named incomplete ZIP (or staging folder, if
-compression never started) that the UI offers to remove, and it must never
-masquerade as a complete backup. Do not overwrite an existing run. Record source
-relative path, output relative path, size, checksum, redaction categories/counts,
-read consistency, and warning state for each file. Avoid storing the Windows user
-name or raw absolute OBS path in the manifest unless required to explain a failure.
+Copy each source file into a private OS temporary directory outside the selected
+backup destination, then redact and verify it there. Only verified sanitized bytes
+may be copied into a uniquely named incomplete staging folder within the target
+parent; a Dropbox sync must never see raw OBS bytes. Include a completion marker in
+the manifest before compressing the verified staging tree into the final
+timestamped ZIP file, then remove the staging folder. Write the ZIP under an
+incomplete name first and rename it to its final name only once it is fully written;
+a failed or cancelled run leaves an explicitly named incomplete ZIP (or sanitized
+staging folder, if compression never started) that the UI offers to remove, and it
+must never masquerade as a complete backup. Do not overwrite an existing run.
+Record source relative path, output relative path, size, checksum, redaction
+categories/counts, read consistency, and warning state for each file. Avoid storing
+the Windows user name or raw absolute OBS path in the manifest unless required to
+explain a failure.
 
 ## Updates and release channels
 

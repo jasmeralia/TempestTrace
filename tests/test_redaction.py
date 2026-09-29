@@ -164,6 +164,37 @@ def test_key_context_and_case_variants_preserve_hotkey_bindings(tmp_path: Path) 
     assert not has_unredacted_fields({"bindings": [{"key": "F9"}]}, ("hotkeys.json",))
 
 
+def test_bare_key_is_redacted_in_backup_and_scene_files_but_not_hotkeys(tmp_path: Path) -> None:
+    for filename in ("service.json.bak", "main.json"):
+        path = tmp_path / filename
+        path.write_text(
+            json.dumps(
+                {
+                    "settings": {"key": "STREAM_KEY_SECRET"},
+                    "hotkeys": [{"key": "F9"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        redact_file(path)
+
+        value = json.loads(path.read_text(encoding="utf-8"))
+        assert value["settings"]["key"] == "<REDACTED>"
+        assert value["hotkeys"][0]["key"] == "F9"
+        assert not has_unredacted_fields(value, (path.name,))
+
+
+def test_log_redaction_preserves_chroma_color_key_value(tmp_path: Path) -> None:
+    log = tmp_path / "current.txt"
+    original = "filter chroma color key: #00ff00\nkey=STREAM_SECRET\n"
+    log.write_text(original, encoding="utf-8")
+
+    redact_file(log)
+
+    assert log.read_text(encoding="utf-8") == ("filter chroma color key: #00ff00\nkey=<REDACTED>\n")
+
+
 def test_short_credentials_do_not_corrupt_substring_matches(tmp_path: Path) -> None:
     log = tmp_path / "short.txt"
     log.write_text("token=x description=texture\n", encoding="utf-8")

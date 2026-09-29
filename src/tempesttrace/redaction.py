@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-RULE_VERSION = 2
+RULE_VERSION = 3
 REDACTED = "<REDACTED>"
 _LOG_PATTERNS = (
     re.compile(
@@ -53,13 +53,7 @@ def _is_sensitive_key(key: str, context: tuple[str, ...] = ()) -> bool:
     }
     if normalized == "key":
         normalized_context = {re.sub(r"[^a-z0-9]", "", part.casefold()) for part in context}
-        if any("hotkey" in part or "binding" in part for part in normalized_context):
-            return False
-        return any(
-            part in {"servicejson", "output", "stream", "stream1", "stream2"}
-            or part.startswith("stream")
-            for part in normalized_context
-        )
+        return not any("hotkey" in part or "binding" in part for part in normalized_context)
     if normalized in credential_names:
         return True
     suffixes = ("key", "token", "password", "passwd", "secret")
@@ -77,15 +71,18 @@ def _unquote(value: str) -> str:
     return value
 
 
-def is_hotkey_log_match(text: str, match: re.Match[str]) -> bool:
-    """Identify key assignments that are hotkeys rather than credentials."""
+def is_noncredential_log_match(text: str, match: re.Match[str]) -> bool:
+    """Identify ambiguous key assignments that are not credential values."""
     field_name = re.split(r"\s*[=:]", match.group(1), maxsplit=1)[0].casefold()
     if field_name != "key":
         return False
     start = text.rfind("\n", 0, match.start()) + 1
     end = text.find("\n", match.end())
     context = text[start:] if end < 0 else text[start:end]
-    return bool(re.search(r"(?i)hotkey|key.?binding|shortcut", context))
+    return bool(
+        re.search(r"(?i)hotkey|key.?binding|shortcut", context)
+        or re.search(r"(?i)\b(?:chroma|colou?r)\s+key\s*[=:]", context)
+    )
 
 
 def _embedded_secrets(text: str) -> set[str]:
@@ -95,7 +92,7 @@ def _embedded_secrets(text: str) -> set[str]:
         values.update(
             _unquote(match.group(2))
             for match in pattern.finditer(text)
-            if not is_hotkey_log_match(text, match)
+            if not is_noncredential_log_match(text, match)
         )
     return {value for value in values if value and value != REDACTED}
 
@@ -145,7 +142,7 @@ def _redact_embedded(text: str, counts: dict[str, int]) -> str:
     def replace(match: re.Match[str]) -> str:
         if _unquote(match.group(2)) == REDACTED:
             return match.group(0)
-        if is_hotkey_log_match(text, match):
+        if is_noncredential_log_match(text, match):
             return match.group(0)
         counts["credential_pattern"] = counts.get("credential_pattern", 0) + 1
         return f"{match.group(1)}{REDACTED}"
@@ -202,6 +199,24 @@ def has_unredacted_fields(value: Any, context: tuple[str, ...] = ()) -> bool:
                 return True
     elif isinstance(value, list):
         return any(has_unredacted_fields(child, context) for child in value)
+    return False
+
+
+def has_unredacted_ini_fields(text: str, filename: str) -> bool:
+    """Check INI assignments using the same key rules as the redactor."""
+    section = ""
+    for line in text.splitlines():
+        section_match = re.match(r"^\s*\[([^]]+)\]", line)
+        if section_match:
+            section = section_match.group(1)
+            continue
+        match = re.match(r"^\s*([^=:#\s]+)\s*[=:]\s*(.*?)\s*$", line)
+        if (
+            match
+            and _is_sensitive_key(match.group(1), (filename, section))
+            and match.group(2) not in ("", REDACTED)
+        ):
+            return True
     return False
 
 

@@ -194,10 +194,17 @@ def _asset_name_matches(
     # still requiring the alias to occupy a whole filename token.
     tokens = re.split(r"[^a-z0-9_]+", stem)
     has_project = "tempesttrace" in tokens
-    arch_tokens = {"amd64": {"amd64", "x86_64", "x64"}, "arm64": {"arm64", "aarch64"}}[arch]
+    architecture_tokens = {
+        "amd64": {"amd64", "x86_64", "x64"},
+        "arm64": {"arm64", "aarch64"},
+    }
+    arch_tokens = architecture_tokens[arch]
+    conflicting_tokens = architecture_tokens["arm64" if arch == "amd64" else "amd64"]
     version = str(SemVer.parse(tag)).casefold()
     has_version = re.search(rf"(?<![0-9.])v?{re.escape(version)}(?![0-9.])", stem) is not None
-    has_arch = bool(arch_tokens.intersection(tokens))
+    has_arch = bool(arch_tokens.intersection(tokens)) and not bool(
+        conflicting_tokens.intersection(tokens)
+    )
     has_platform = "linux" in tokens or package in {"deb", "rpm", "snap"}
     return has_project and has_version and has_arch and has_platform
 

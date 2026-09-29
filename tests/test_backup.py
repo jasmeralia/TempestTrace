@@ -67,6 +67,7 @@ def test_backup_packages_allowlisted_redacted_snapshot_without_source_changes(
         assert "basic/profiles/default/plugin.yaml" not in names
         manifest = json.loads(archive.read("manifest.json"))
         assert manifest["complete"] is True
+        assert manifest["redaction_rules_version"] == backup.RULE_VERSION
         assert manifest["copied_count"] >= 4
 
 
@@ -90,6 +91,77 @@ def test_raw_source_bytes_never_enter_destination_staging(tmp_path: Path) -> Non
             )
 
     create_backup(source, destination, progress=check_destination)
+
+
+def test_backup_redacts_bare_keys_and_keeps_ini_words_and_hotkeys(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    service = {"settings": {"key": "BAK_STREAM_SECRET"}}
+    (source / "basic/profiles/default/service.json.bak").write_text(
+        json.dumps(service), encoding="utf-8"
+    )
+    (source / "basic/scenes/main.json").write_text(
+        json.dumps(
+            {
+                "sources": [{"name": "Camera", "settings": {"key": "SCENE_STREAM_SECRET"}}],
+                "hotkeys": [{"key": "F9"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    notes = source / "basic/profiles/default/notes.ini"
+    notes.write_text("[Video]\nmonkey=keep-me\nhotkey=F9\n", encoding="utf-8")
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    result = create_backup(source, destination)
+
+    with zipfile.ZipFile(result.archive) as archive:
+        names = set(archive.namelist())
+        assert "basic/profiles/default/service.json.bak" in names
+        assert "basic/profiles/default/notes.ini" in names
+        service_text = archive.read("basic/profiles/default/service.json.bak").decode()
+        scene_text = archive.read("basic/scenes/main.json").decode()
+        ini_text = archive.read("basic/profiles/default/notes.ini").decode()
+        all_content = b"".join(archive.read(name) for name in names)
+
+    assert "BAK_STREAM_SECRET" not in all_content.decode()
+    assert "SCENE_STREAM_SECRET" not in all_content.decode()
+    assert json.loads(service_text)["settings"]["key"] == "<REDACTED>"
+    scene = json.loads(scene_text)
+    assert scene["sources"][0]["settings"]["key"] == "<REDACTED>"
+    assert scene["hotkeys"][0]["key"] == "F9"
+    assert ini_text == "[Video]\nmonkey=keep-me\nhotkey=F9\n"
+
+
+def test_backup_promotes_without_hard_links(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    def unsupported_link(*args: object, **kwargs: object) -> None:
+        raise OSError(95, "Operation not supported")
+
+    monkeypatch.setattr(backup.os, "link", unsupported_link)
+
+    result = create_backup(source, destination)
+
+    assert result.archive.is_file()
+    assert not list(destination.glob("*.incomplete.zip"))
+
+
+def test_private_staging_falls_back_outside_destination_when_tempdir_is_inside(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    monkeypatch.setattr(backup.tempfile, "gettempdir", lambda: str(destination))
+
+    create_backup(source, destination)
+
+    assert not list(destination.glob(".*.private-*"))
 
 
 def test_cancel_leaves_marked_incomplete_stage(tmp_path: Path) -> None:

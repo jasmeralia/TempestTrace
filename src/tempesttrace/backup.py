@@ -20,7 +20,8 @@ from pathlib import Path
 from tempesttrace.redaction import (
     RULE_VERSION,
     has_unredacted_fields,
-    is_hotkey_log_match,
+    has_unredacted_ini_fields,
+    is_noncredential_log_match,
     redact_file_with_secrets,
 )
 
@@ -33,10 +34,6 @@ _SECRET_SCAN = re.compile(
     r"bearer[_ -]?token|password|passwd|access[_ -]?token|client[_ -]?secret|secret)"
     r"\s*[=:]\s*)"
     r"(?!<REDACTED>)(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;\]\"']+)"
-)
-_INI_SECRET_SCAN = re.compile(
-    r"(?im)^\s*((?:\w*key|\w*token|\w*password|\w*passwd|\w*secret)\s*[=:]\s*)"
-    r"(?!<REDACTED>)\S+"
 )
 
 
@@ -99,7 +96,7 @@ def _recent_logs(root: Path, candidates: list[Path], skipped: list[dict[str, str
 def _reserve_archive_name(
     target_dir: Path, base: str, start_suffix: int = 0
 ) -> tuple[int, Path, Path, Path]:
-    """Exclusively reserve a candidate name; final promotion still uses no-clobber link."""
+    """Exclusively reserve a candidate name for one backup run."""
     suffix = start_suffix
     while True:
         stem = base if suffix == 0 else f"{base}-{suffix}"
@@ -117,6 +114,41 @@ def _reserve_archive_name(
             suffix += 1
             continue
         return suffix, final, incomplete_zip, reservation
+
+
+def _private_temp_directory(target_dir: Path, prefix: str) -> Path:
+    """Create private staging outside the destination, ignoring an unsafe TMPDIR."""
+    target = target_dir.resolve()
+    candidates = [Path(tempfile.gettempdir()), Path("/tmp"), Path("/var/tmp")]
+    system_root = os.environ.get("SYSTEMROOT")
+    if system_root:
+        candidates.append(Path(system_root) / "Temp")
+    candidates.extend((Path.home(), Path(tempfile.gettempdir()).parent))
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if resolved in seen or not resolved.is_dir():
+            continue
+        seen.add(resolved)
+        try:
+            resolved.relative_to(target)
+        except ValueError:
+            pass
+        else:
+            continue
+        try:
+            created = Path(tempfile.mkdtemp(prefix=prefix, dir=resolved))
+        except OSError:
+            continue
+        try:
+            created.resolve().relative_to(target)
+        except ValueError:
+            return created
+        shutil.rmtree(created, ignore_errors=True)
+    raise ValueError("Could not create private staging outside the backup destination.")
 
 
 def _inventory(root: Path, skipped: list[dict[str, str]]) -> list[Path]:  # noqa: PLR0912
@@ -220,7 +252,7 @@ def _secret_scan(path: Path) -> bool:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return True
-    if any(not is_hotkey_log_match(text, match) for match in _SECRET_SCAN.finditer(text)):
+    if any(not is_noncredential_log_match(text, match) for match in _SECRET_SCAN.finditer(text)):
         return True
     if path.suffix.lower() == ".json" or path.name.lower().endswith(".json.bak"):
         try:
@@ -228,9 +260,7 @@ def _secret_scan(path: Path) -> bool:
         except OSError, UnicodeError, json.JSONDecodeError:
             return True
     if path.suffix.lower() == ".ini" or path.name.lower().endswith(".ini.bak"):
-        return any(
-            not is_hotkey_log_match(text, match) for match in _INI_SECRET_SCAN.finditer(text)
-        )
+        return has_unredacted_ini_fields(text, path.name)
     return False
 
 
@@ -284,7 +314,7 @@ def create_backup(  # noqa: PLR0912, PLR0915
     private_staging: Path | None = None
     try:
         staging = Path(tempfile.mkdtemp(prefix=f".{base}.incomplete-", dir=target_dir))
-        private_staging = Path(tempfile.mkdtemp(prefix=f".{base}.private-"))
+        private_staging = _private_temp_directory(target_dir, f".{base}.private-")
         if progress:
             progress("scanning", 0, 0)
         files = _inventory(root, skipped)
@@ -440,8 +470,14 @@ def create_backup(  # noqa: PLR0912, PLR0915
         if cancelled is not None and cancelled():
             raise BackupCancelled("Collection cancelled.")
         while True:
+            if final.exists():
+                reservation.unlink(missing_ok=True)
+                suffix, final, _reserved_incomplete, reservation = _reserve_archive_name(
+                    target_dir, base, suffix + 1
+                )
+                continue
             try:
-                os.link(incomplete_zip, final)
+                os.rename(incomplete_zip, final)
             except FileExistsError:
                 reservation.unlink(missing_ok=True)
                 suffix, final, _reserved_incomplete, reservation = _reserve_archive_name(
@@ -449,10 +485,6 @@ def create_backup(  # noqa: PLR0912, PLR0915
                 )
             else:
                 break
-        try:
-            incomplete_zip.unlink()
-        except OSError:
-            warnings.append("The backup is complete, but its temporary ZIP could not be removed.")
         try:
             shutil.rmtree(staging)
         except OSError:

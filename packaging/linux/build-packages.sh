@@ -129,10 +129,12 @@ build_flatpak() {
         "$dir/files/share/applications/io.github.jasmeralia.TempestTrace.desktop"
     install -D -m 0644 "$app/usr/share/icons/hicolor/256x256/apps/io.github.jasmeralia.TempestTrace.png" \
         "$dir/files/share/icons/hicolor/256x256/apps/io.github.jasmeralia.TempestTrace.png"
-    # `home` excludes other Flatpak apps' private data, so grant OBS's exact tree read-only.
+    # Keep the user's home read-only and grant only the OBS and Dropbox config paths.
     flatpak build-finish --command=tempesttrace --socket=wayland --socket=fallback-x11 \
-        --share=ipc --share=network --device=dri --filesystem=home \
-        --filesystem='~/.var/app/com.obsproject.Studio/config/obs-studio:ro' "$dir"
+        --share=ipc --share=network --device=dri --filesystem=home:ro \
+        --filesystem=xdg-config/obs-studio:ro \
+        --filesystem='~/.var/app/com.obsproject.Studio/config/obs-studio:ro' \
+        --filesystem='~/.dropbox:ro' "$dir"
     flatpak build-export --arch="$flatpak_arch" "$repo" "$dir" stable
     flatpak build-bundle --arch="$flatpak_arch" "$repo" \
         "$output_dir/TempestTrace-v${version_bare}-linux-${arch}.flatpak" \

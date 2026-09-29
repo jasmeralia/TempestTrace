@@ -165,6 +165,17 @@ def test_linux_x86_64_appimage_asset_is_selected() -> None:
     assert offer is not None and offer.asset.name == name
 
 
+def test_asset_with_conflicting_architecture_tokens_is_rejected() -> None:
+    name = "TempestTrace-v1.2.3-linux-arm64-x64.deb"
+    releases = [release("v1.2.3", assets=[asset(name)])]
+
+    amd64 = check_for_update("1.2.2", releases, "linux", "amd64", "deb", False)
+    arm64 = check_for_update("1.2.2", releases, "linux", "arm64", "deb", False)
+
+    assert amd64 is None
+    assert arm64 is None
+
+
 def test_parse_sha256sums_handles_gnu_and_bsd_lines() -> None:
     digest = "a" * 64
     sums = parse_sha256sums(f"{digest}  one.deb\nSHA256 (two.rpm) = {'b' * 64}\n")

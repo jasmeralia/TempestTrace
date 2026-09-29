@@ -36,15 +36,13 @@ use their core24/Freedesktop 26.08 runtimes rather than the host glibc.
 ## Access and validation limits
 
 DEB, RPM, and AppImage run outside a filesystem sandbox. The Flatpak requests
-network access for GitHub update checks and read/write access to the user's home
-directory so it can read native OBS settings and Dropbox metadata and write the
-selected backup; this is broader than a single-folder portal grant. Flatpak's
-`home` permission excludes `~/.var/app/<app-id>`; TempestTrace separately
-requests read-only access to
-`~/.var/app/com.obsproject.Studio/config/obs-studio` so it can discover OBS's
-Flatpak data. CI tests collection from both native and OBS Flatpak fixture paths.
-Relocated Dropbox folders outside the home directory may require a file chooser
-portal grant; portal behavior remains unverified with this PyQt6 UI. The strict
+network access for GitHub update checks and read-only access to the user's home
+for config discovery. It also grants read-only access to the host native OBS config,
+OBS Flatpak config, and Dropbox metadata. The selected backup folder is writable
+through the file chooser's portal grant. CI tests collection from both native and
+OBS Flatpak fixture paths. Relocated Dropbox folders outside the home directory
+also require a file chooser portal grant; portal behavior remains unverified with
+this PyQt6 UI. The strict
 Snap declares `home` plus an `obs-config`
 personal-files plug for standard hidden OBS and Dropbox metadata paths. The user
 or administrator must connect that plug after installation. Relocated data

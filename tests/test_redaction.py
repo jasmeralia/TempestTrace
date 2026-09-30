@@ -1,16 +1,20 @@
 import json
+import random
+import time
 from pathlib import Path
 
 import pytest
 
-from tempesttrace.backup import _secret_scan
+from tempesttrace.backup import _contains_private_secret, _secret_scan
 from tempesttrace.redaction import (
     RULE_VERSION,
     _is_sensitive_key,
     has_unredacted_embedded_json,
     has_unredacted_fields,
     has_unredacted_ini_fields,
+    read_text_safely,
     redact_file,
+    redact_file_with_secrets,
 )
 
 
@@ -572,8 +576,227 @@ def backup_secret_scan(path: Path) -> bool:
     return _secret_scan(path)
 
 
-def test_rule_version_is_eleven() -> None:
-    assert RULE_VERSION == 11
+def test_rule_version_is_twelve() -> None:
+    assert RULE_VERSION == 12
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "https://example.com/overlay?stream_key=QSECRET123",
+        "https://example.com/overlay?streamkey=QSECRET123",
+        "https://example.com/overlay?streamKey=QSECRET123",
+        "https://example.com/overlay?secret_key=QSECRET123",
+        "https://example.com/overlay?private_key=QSECRET123",
+        "https://example.com/overlay?auth=QSECRET123",
+        "https://example.com/overlay?sig=QSECRET123",
+        "private_key=PKSECRET",
+        "secret_key: SKSECRET",
+        "aws_secret_access_key=AKSECRET",
+        "twitch_stream_key = TSK",
+        '"twitch_stream_key": "TSK"',
+        "'server_password': 'PW'",
+        '{"secret": "S",',
+        "Authorization: token TOKSECRET",
+        "Authorization: Custom TOKSECRET",
+        "https://user:URLPASSWORD@host/path",
+        "rtmp://user:URLPASSWORD@host/app/streamkey",
+        "srt://user:URLPASSWORD@host:9000?streamid=publish:stream",
+        "ftp://user:URLPASSWORD@host/path",
+    ],
+)
+def test_generic_text_credentials_are_redacted_and_detected(tmp_path: Path, line: str) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(line + "\n", encoding="utf-8")
+    assert has_unredacted_embedded_json(line) and _secret_scan(path)
+    redact_file(path)
+    cleaned = path.read_text(encoding="utf-8")
+    for secret in (
+        "QSECRET123",
+        "PKSECRET",
+        "SKSECRET",
+        "AKSECRET",
+        "TSK",
+        "PW",
+        '"S"',
+        "TOKSECRET",
+        "URLPASSWORD",
+    ):
+        assert secret not in cleaned
+    assert not has_unredacted_embedded_json(cleaned) and not _secret_scan(path)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "keyint: 250",
+        "keyint_sec=2",
+        "key_color: 16711935",
+        "frames dropped: 1",
+        "Hotkey key: OBS_KEY_F1",
+        "chroma key: 5",
+        "https://x/?bandwidthtest=true&x=1",
+        "rtmp://live.twitch.tv/app",
+        "user@example.com",
+    ],
+)
+def test_generic_scanner_preserves_noncredential_text(tmp_path: Path, line: str) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(line, encoding="utf-8")
+    redact_file(path)
+    assert path.read_text(encoding="utf-8") == line
+    assert not has_unredacted_embedded_json(line) and not _secret_scan(path)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "info: password=SEC1",
+        'info: key="SEC1"',
+        "info: bearer_token = 'SEC1'",
+        "info: token = 'SEC1'",
+        "12:00:00.000: cookie = 'SEC1'",
+        "config authToken='SEC1'",
+        "[plugin] stream_key=SEC1",
+        "password: SEC1",
+        'key = "SEC1"',
+        "token : 'SEC1'",
+        "[plugin] bearer_token : SEC1",
+    ],
+)
+def test_overlapping_assignment_is_redacted_and_unredacted_input_is_flagged(
+    tmp_path: Path, line: str
+) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(line + "\n", encoding="utf-8")
+
+    assert has_unredacted_embedded_json(line)
+    assert _secret_scan(path)
+    redact_file(path)
+    cleaned = path.read_text(encoding="utf-8")
+    assert "SEC1" not in cleaned
+    assert not has_unredacted_embedded_json(cleaned)
+    assert not _secret_scan(path)
+
+
+def test_overlapping_sensitive_assignments_across_log_lines_preserve_benign_lines(
+    tmp_path: Path,
+) -> None:
+    original = (
+        "info: password=FIRST_SECRET\n"
+        "ordinary diagnostic text stays byte-identical\n"
+        '  StreamKey="SECOND_SECRET"\n'
+        "frames dropped: 1\n"
+        "config token = THIRD_SECRET\n"
+    )
+    path = tmp_path / "current.txt"
+    path.write_text(original, encoding="utf-8")
+
+    redact_file(path)
+
+    cleaned = path.read_text(encoding="utf-8")
+    assert all(
+        secret not in cleaned for secret in ("FIRST_SECRET", "SECOND_SECRET", "THIRD_SECRET")
+    )
+    assert "ordinary diagnostic text stays byte-identical\n" in cleaned
+    assert "frames dropped: 1\n" in cleaned
+    assert not _secret_scan(path)
+
+
+def test_seeded_multishape_fuzz_has_zero_shipped_leaks(tmp_path: Path) -> None:
+    rng = random.Random(7)
+    names = [
+        "key",
+        "stream_key",
+        "StreamKey",
+        "password",
+        "Password",
+        "token",
+        "access_token",
+        "bearer_token",
+        "client_secret",
+        "api_key",
+        "apiKey",
+        "authToken",
+        "passphrase",
+        "refresh_token",
+        "cookie",
+    ]
+    separators = ["=", ": ", " = ", ":", "="]
+    quotes = ["", '"', "'"]
+    prefixes = ["", "12:00:00.000: ", "[plugin] ", "info: ", "  ", "config "]
+
+    def secret(index: int) -> str:
+        return f"SECRETVALUE{index:04d}xyz"
+
+    def case(index: int) -> tuple[str, str, str]:
+        name = rng.choice(names)
+        separator = rng.choice(separators)
+        quote = rng.choice(quotes)
+        prefix = rng.choice(prefixes)
+        value = secret(index)
+        kind = rng.choice(("log", "ini", "json"))
+        if kind == "log":
+            return f"{prefix}{name}{separator}{quote}{value}{quote}\n", "current.txt", value
+        if kind == "ini":
+            return f"[Sec]\n{name}={quote}{value}{quote}\nOther=1\n", "basic.ini", value
+        shapes = (
+            {name: value},
+            {"settings": {"a": {name: value}}},
+            {"items": [{"x": 1}, {name: value}]},
+            {"blob": json.dumps({name: value})},
+            {"blob": f"{name}={value}; other=1"},
+            {"server": f"rtmp://h.example.com/app/{value}"},
+        )
+        return json.dumps(rng.choice(shapes)), "service.json", value
+
+    leaks: list[str] = []
+    for index in range(1500):
+        content, filename, literal = case(index)
+        path = tmp_path / f"case-{index}" / filename
+        path.parent.mkdir()
+        path.write_text(content, encoding="utf-8")
+        _counts, _total, secrets = redact_file_with_secrets(path)
+        output = read_text_safely(path)
+        flagged = _contains_private_secret(path, secrets) or _secret_scan(path)
+        if literal in output and not flagged:
+            leaks.append(f"{filename}: {content!r} -> {output!r}")
+    assert leaks == []
+
+
+def test_sensitive_json_booleans_and_null_are_preserved() -> None:
+    value = {"show_password": False, "secret": None}
+    assert not has_unredacted_fields(value)
+
+
+def test_sensitive_json_boolean_and_null_are_not_replaced(tmp_path: Path) -> None:
+    path = tmp_path / "service.json"
+    path.write_text(json.dumps({"show_password": False, "secret": None, "password": "x"}))
+    redact_file(path)
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "show_password": False,
+        "secret": None,
+        "password": "<REDACTED>",
+    }
+
+
+def test_url_credentials_inside_json_string_are_redacted_and_verified(tmp_path: Path) -> None:
+    path = tmp_path / "service.json"
+    path.write_text(json.dumps({"settings": {"url": "https://host/?stream_key=JSON_URL_SECRET"}}))
+    assert _secret_scan(path)
+    redact_file(path)
+    assert "JSON_URL_SECRET" not in path.read_text(encoding="utf-8")
+    assert not _secret_scan(path)
+
+
+@pytest.mark.parametrize("n", [40])
+def test_comment_separator_adversarial_input_is_fast(tmp_path: Path, n: int) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text("key" + "/**/" * n + "\n", encoding="utf-8")
+    started = time.perf_counter()
+    redact_file(path)
+    assert not has_unredacted_embedded_json(path.read_text(encoding="utf-8"))
+    assert time.perf_counter() - started < 2
 
 
 @pytest.mark.parametrize(

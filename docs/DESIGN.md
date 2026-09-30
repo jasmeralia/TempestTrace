@@ -95,8 +95,13 @@ paths on real Windows and Linux installations before shipping.
 Redact only the staged copies. Parse JSON structurally and INI files by section/key;
 do not apply broad string replacements to scene or profile files. Preserve every
 non-secret value, key order where practical, scene/source object, and diagnostic
-setting. Start with explicit sensitive fields such as OBS service `key`,
-`bearer_token`, `password`, authentication tokens, and client secrets. Redact stream-key
+setting. Classify free-text assignment and URL query names with the same sensitive-key
+rules used for JSON and INI fields, including generic `*_key`, `*_token`,
+`*_password`, and `*_secret` names. Redact URL userinfo passwords while preserving
+the user name and URL structure. Preserve booleans and `null` under sensitive-looking
+JSON keys; redact strings and numbers, and replace objects or arrays wholesale.
+Start with explicit sensitive fields such as OBS service `key`, `bearer_token`,
+`password`, authentication tokens, and client secrets. Redact stream-key
 path segments of RTMP-family URLs and SRT `passphrase`/`streamid` values. Scan logs for
 known credential patterns and redact matching values while keeping the surrounding
 diagnostic line. Maintain a versioned field/path rule list and fixtures taken from

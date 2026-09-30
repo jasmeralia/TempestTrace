@@ -1,6 +1,8 @@
 import hashlib
 import json
+import os
 import shutil
+import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -454,6 +456,82 @@ def test_backup_includes_log_after_quoted_credentials_are_redacted(tmp_path: Pat
         name = "logs/2026-01-03.txt"
         assert name in archive.namelist()
         assert archive.read(name).decode("utf-8") == 'key="<REDACTED>" token="<REDACTED>"\n'
+
+
+@pytest.mark.parametrize("encoding", ["utf-16-le", "utf-16-be"])
+def test_backup_redacts_bom_marked_utf16_logs(tmp_path: Path, encoding: str) -> None:
+    source = fixture(tmp_path / "obs")
+    log = source / "logs/2026-01-01.txt"
+    bom = b"\xff\xfe" if encoding.endswith("le") else b"\xfe\xff"
+    log.write_bytes(bom + "key=UTF16SECRETVAL\n".encode(encoding))
+    destination = tmp_path / "out"
+    destination.mkdir()
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        body = archive.read("logs/2026-01-01.txt")
+    assert b"UTF16SECRETVAL" not in body
+    assert b"<REDACTED>" in body
+
+
+def test_backup_redacts_utf8_bom_and_omits_nul_text_with_warning(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    (source / "logs/2026-01-01.txt").write_bytes(b"\xef\xbb\xbfkey=UTF8SECRET\n")
+    (source / "logs/2026-01-02.txt").write_bytes(b"bad\x00key=NUL_SECRET")
+    unsafe = tmp_path / "unsafe.txt"
+    unsafe.write_bytes(b"bad\x00key=NUL_SECRET")
+    assert backup._secret_scan(unsafe)
+    destination = tmp_path / "out"
+    destination.mkdir()
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        names = archive.namelist()
+        text = archive.read("logs/2026-01-01.txt")
+        all_data = b"".join(archive.read(name) for name in names)
+    assert "logs/2026-01-02.txt" not in names
+    assert b"UTF8SECRET" not in all_data and b"NUL_SECRET" not in all_data
+    assert "Could not safely include" in " ".join(result.warnings)
+    assert b"<REDACTED>" in text
+
+
+def test_bracket_heavy_log_redaction_and_verification_is_fast(tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(('[{"ordinary": [1, 2, 3]}] text\n' * 70000), encoding="utf-8")
+    assert path.stat().st_size >= 2 * 1024 * 1024
+    started = time.perf_counter()
+    backup.redact_file_with_secrets(path)
+    assert not backup._secret_scan(path)
+    assert time.perf_counter() - started < 8
+
+
+def test_fifo_profile_is_skipped_without_blocking_and_source_is_unchanged(tmp_path: Path) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO unsupported on this platform")
+    source = fixture(tmp_path / "obs")
+    fifo = source / "basic/profiles/default/blocked.txt"
+    os.mkfifo(fifo)
+    before = {
+        p.relative_to(source): (p.lstat().st_mode, p.read_bytes() if p.is_file() else None)
+        for p in source.rglob("*")
+        if not p.is_dir()
+    }
+    destination = tmp_path / "out"
+    destination.mkdir()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(create_backup, source, destination)
+        result = future.result(timeout=10)
+    after = {
+        p.relative_to(source): (p.lstat().st_mode, p.read_bytes() if p.is_file() else None)
+        for p in source.rglob("*")
+        if not p.is_dir()
+    }
+    assert before == after
+    with zipfile.ZipFile(result.archive) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+    assert any(
+        item["path"].endswith("blocked.txt") and item["reason"] == "unsupported_file_type"
+        for item in manifest["skipped"]
+    )
+    assert "basic/profiles/default/service.json" in zipfile.ZipFile(result.archive).namelist()
 
 
 @pytest.mark.parametrize(

@@ -22,11 +22,10 @@ from pathlib import Path
 
 from tempesttrace.redaction import (
     RULE_VERSION,
-    _unquote,
     has_unredacted_embedded_json,
     has_unredacted_fields,
     has_unredacted_ini_fields,
-    is_noncredential_log_match,
+    read_text_safely,
     redact_file_with_secrets,
 )
 
@@ -34,19 +33,6 @@ MAX_FILE_SIZE = 32 * 1024 * 1024
 MAX_TOTAL_SIZE = 512 * 1024 * 1024
 MAX_LOG_FILES = 5
 ALLOWED_PROFILE_SUFFIXES = {".ini", ".json", ".txt"}
-_SECRET_SCAN = re.compile(
-    r"(?i)((?<![?&])(?:\bkey|api[_ -]?key|stream[_ -]?key|token|auth[_ -]?token|"
-    r"bearer[_ -]?token|password|passwd|pwd|passphrase|access[_ -]?token|"
-    r"client[_ -]?secret|refresh_token|session[_ -]?id|sessionid|stream[_ -]?id|"
-    r"streamid|cookie|cookies|jwt|credential|credentials|secret)"
-    r"\s*[=:]\s*)"
-    r"(?:\\*\"[^\"\r\n]*\\*\"|\\*'[^'\r\n]*\\*'|"
-    r"&quot;[^\r\n]*?&quot;|&apos;[^\r\n]*?&apos;|"
-    r"&#0*34;[^\r\n]*?&#0*34;|&#x0*22;[^\r\n]*?&#x0*22;|"
-    r"&#0*39;[^\r\n]*?&#0*39;|&#x0*27;[^\r\n]*?&#x0*27;|"
-    r"`[^\r\n]*?`|%22[^\r\n]*?%22|“[^\r\n]*?”|"
-    r"[^\s,;\]\"']+)"
-)
 
 
 class BackupCancelled(Exception):
@@ -55,6 +41,10 @@ class BackupCancelled(Exception):
 
 class FileLimitExceeded(Exception):
     """Raised if a file grows beyond its permitted read size."""
+
+
+class UnsupportedFileType(Exception):
+    """Raised when a selected path is not a regular file."""
 
 
 @dataclass(frozen=True)
@@ -214,7 +204,7 @@ def _renameat2_call(source: Path, destination: Path) -> None:
         raise OSError(error, os.strerror(error), destination)
 
 
-def _inventory(root: Path, skipped: list[dict[str, str]]) -> list[Path]:  # noqa: PLR0912
+def _inventory(root: Path, skipped: list[dict[str, str]]) -> list[Path]:  # noqa: PLR0912, PLR0915
     candidates: list[Path] = []
     profiles = root / "basic/profiles"
     if profiles.exists() and _path_has_link(root, profiles):
@@ -240,6 +230,8 @@ def _inventory(root: Path, skipped: list[dict[str, str]]) -> list[Path]:  # noqa
                 rel = item.relative_to(root).as_posix()
                 if _is_link_or_reparse(item):
                     skipped.append({"path": rel, "reason": "link_or_reparse_point"})
+                elif not stat.S_ISREG(item.lstat().st_mode):
+                    skipped.append({"path": rel, "reason": "unsupported_file_type"})
                 elif item.suffix.lower() in ALLOWED_PROFILE_SUFFIXES or item.name.lower().endswith(
                     (".json.bak", ".ini.bak")
                 ):
@@ -255,7 +247,7 @@ def _inventory(root: Path, skipped: list[dict[str, str]]) -> list[Path]:  # noqa
                 skipped.append(
                     {"path": item.relative_to(root).as_posix(), "reason": "link_or_reparse_point"}
                 )
-            elif item.is_file() and (
+            elif stat.S_ISREG(item.lstat().st_mode) and (
                 item.suffix.lower() == ".json" or item.name.lower().endswith(".json.bak")
             ):
                 candidates.append(item)
@@ -275,9 +267,13 @@ def _inventory(root: Path, skipped: list[dict[str, str]]) -> list[Path]:  # noqa
         skipped.append({"path": "logs", "reason": "link_or_reparse_point"})
     elif logs.is_dir():
         for item in logs.iterdir():
-            if item.is_file() and item.suffix.lower() == ".txt" and not _is_link_or_reparse(item):
+            if (
+                not _is_link_or_reparse(item)
+                and stat.S_ISREG(item.lstat().st_mode)
+                and item.suffix.lower() == ".txt"
+            ):
                 log_candidates.append(item)
-            elif item.is_file():
+            elif not item.is_dir():
                 skipped.append(
                     {"path": item.relative_to(root).as_posix(), "reason": "unsupported_file_type"}
                 )
@@ -292,9 +288,14 @@ def _inventory(root: Path, skipped: list[dict[str, str]]) -> list[Path]:  # noqa
 
 def _read_consistent(source: Path, target: Path, max_bytes: int) -> tuple[bool, int]:
     for attempt in range(3):
-        descriptor = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(
+            source,
+            os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
         with os.fdopen(descriptor, "rb") as source_file:
             before = os.fstat(source_file.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise UnsupportedFileType
             data = source_file.read(max_bytes + 1)
             after = os.fstat(source_file.fileno())
         if len(data) > max_bytes:
@@ -312,20 +313,16 @@ def _read_consistent(source: Path, target: Path, max_bytes: int) -> tuple[bool, 
 
 def _secret_scan(path: Path) -> bool:
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+        text = read_text_safely(path)
+    except OSError, ValueError:
         return True
-    contains_secret = any(
-        _unquote(match.group(0)[len(match.group(1)) :]) != "<REDACTED>"
-        and not is_noncredential_log_match(text, match)
-        for match in _SECRET_SCAN.finditer(text)
-    ) or has_unredacted_embedded_json(text)
+    contains_secret = has_unredacted_embedded_json(text)
     if path.suffix.lower() == ".json" or path.name.lower().endswith(".json.bak"):
         try:
             contains_secret = contains_secret or has_unredacted_fields(
                 json.loads(text), (path.name,)
             )
-        except OSError, UnicodeError, json.JSONDecodeError:
+        except OSError, ValueError, UnicodeError, json.JSONDecodeError:
             return True
     elif path.suffix.lower() == ".ini" or path.name.lower().endswith(".ini.bak"):
         contains_secret = contains_secret or has_unredacted_ini_fields(text, path.name)
@@ -337,8 +334,8 @@ def _contains_private_secret(path: Path, secrets: set[str]) -> bool:
     if not secrets:
         return False
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+        text = read_text_safely(path)
+    except OSError, ValueError:
         return True
     return any(
         secret and re.search(rf"(?<!\w){re.escape(secret)}(?!\w)", text) for secret in secrets
@@ -417,6 +414,10 @@ def create_backup(  # noqa: PLR0912, PLR0915
                 if progress:
                     progress("redacting", index - 1, len(files))
                 categories, _redaction_count, secrets = redact_file_with_secrets(private_staged)
+            except UnsupportedFileType:
+                private_staged.unlink(missing_ok=True)
+                skipped.append({"path": rel_text, "reason": "unsupported_file_type"})
+                continue
             except FileLimitExceeded:
                 skipped.append({"path": rel_text, "reason": "size_limit_exceeded_during_read"})
                 continue

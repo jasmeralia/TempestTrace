@@ -7,13 +7,13 @@ import re
 from pathlib import Path
 from typing import Any
 
-RULE_VERSION = 8
+RULE_VERSION = 9
 REDACTED = "<REDACTED>"
 _CREDENTIAL_NAME = (
     r"(?:key|stream[_ -]?key|api[_ -]?key|token|auth[_ -]?token|bearer[_ -]?token|"
     r"password|passwd|access[_ -]?token|client[_ -]?secret)"
 )
-_QUOTE_DELIMITER = r"(?:\\*[\"']|`|&(?:quot|apos);|&#0*(?:34|39);|&#x0*(?:22|27);)"
+_QUOTE_DELIMITER = r"(?:\\*['\"]|`|&(?:quot|apos);|&#0*(?:34|39);|&#x0*(?:22|27);|%22|[“”])"
 _QUOTED_CREDENTIAL_VALUE = (
     r'(\\*"(?:\\[^\r\n]|[^"\\\r\n])*\\*"|'
     r"\\*'(?:\\[^\r\n]|[^'\\\r\n])*\\*'|"
@@ -21,19 +21,22 @@ _QUOTED_CREDENTIAL_VALUE = (
     r"&quot;[^\r\n]*?&quot;|&apos;[^\r\n]*?&apos;|"
     r"&#0*34;[^\r\n]*?&#0*34;|&#x0*22;[^\r\n]*?&#x0*22;|"
     r"&#0*39;[^\r\n]*?&#0*39;|&#x0*27;[^\r\n]*?&#x0*27;|"
+    r"%22[^\r\n]*?%22|“[^\r\n]*?”|"
     r"[^\s,;\]\\\"'`}]+)"
 )
 _COMMENT_SEPARATOR = (
-    r"(?:\s|/\*(?:[\s\S]*?\*/|(?:(?!\*/)[\s\S])*?(?=[=:]))|"
+    r"(?:\s|/\*(?:[^\r\n]*?\*/|(?:(?!\*/)[^\r\n])*(?=[=:]))|"
     r"//[^\r\n]*(?:\r?\n\s*)?)*"
 )
 _LOG_PATTERNS = (
     re.compile(
-        rf"(?i)((?<![?&])\b{_CREDENTIAL_NAME}{_QUOTE_DELIMITER}?\s*[=:]\s*)"
+        rf"(?i)((?<![?&])(?<![A-Za-z0-9_])(?:%22)?{_CREDENTIAL_NAME}"
+        rf"(?![A-Za-z0-9_]){_QUOTE_DELIMITER}?\s*[=:]\s*)"
         rf"({_QUOTED_CREDENTIAL_VALUE})"
     ),
     re.compile(
-        rf"(?i)((?<![?&])\b{_CREDENTIAL_NAME}{_QUOTE_DELIMITER}?"
+        rf"(?i)((?<![?&])(?<![A-Za-z0-9_])(?:%22)?{_CREDENTIAL_NAME}"
+        rf"(?![A-Za-z0-9_]){_QUOTE_DELIMITER}?"
         rf"{_COMMENT_SEPARATOR}[=:]{_COMMENT_SEPARATOR})"
         rf"({_QUOTED_CREDENTIAL_VALUE})"
     ),
@@ -98,11 +101,13 @@ def _is_sensitive_key(key: str, context: tuple[str, ...] = ()) -> bool:
 def _unquote(value: str) -> str:
     value = value.strip()
     entity_quoted = re.match(
-        r"(?i)^(&quot;|&apos;|&#0*34;|&#x0*22;|&#0*39;|&#x0*27;)(.*?)(\1)$", value
+        r"(?i)^(&quot;|&apos;|&#0*34;|&#x0*22;|&#0*39;|&#x0*27;|%22)(.*?)(\1)$", value
     )
     if entity_quoted:
         return entity_quoted.group(2)
     if len(value) >= 2 and value[0] == value[-1] == "`":
+        return value[1:-1]
+    if len(value) >= 2 and value[0] == "“" and value[-1] == "”":
         return value[1:-1]
     quoted = re.match(r"^(\\*[\"'])(.*?)(\\*[\"'])$", value)
     if quoted and quoted.group(1).lstrip("\\") == quoted.group(3).lstrip("\\"):
@@ -112,12 +117,14 @@ def _unquote(value: str) -> str:
 
 def _quoted_redacted(value: str) -> str:
     entity_quoted = re.match(
-        r"(?i)^(&quot;|&apos;|&#0*34;|&#x0*22;|&#0*39;|&#x0*27;)(.*?)(\1)$", value
+        r"(?i)^(&quot;|&apos;|&#0*34;|&#x0*22;|&#0*39;|&#x0*27;|%22)(.*?)(\1)$", value
     )
     if entity_quoted:
         return f"{entity_quoted.group(1)}{REDACTED}{entity_quoted.group(3)}"
     if len(value) >= 2 and value[0] == value[-1] == "`":
         return f"`{REDACTED}`"
+    if len(value) >= 2 and value[0] == "“" and value[-1] == "”":
+        return f"“{REDACTED}”"
     quoted = re.match(r"^(\\*[\"'])(.*?)(\\*[\"'])$", value)
     if quoted and quoted.group(1).lstrip("\\") == quoted.group(3).lstrip("\\"):
         return f"{quoted.group(1)}{REDACTED}{quoted.group(3)}"
@@ -153,7 +160,8 @@ def _sub_outside_json(text: str, pattern: re.Pattern[str], replace: Any) -> str:
 def is_noncredential_log_match(_text: str, match: re.Match[str]) -> bool:
     """Identify ambiguous key assignments that are not credential values."""
     field_name = re.split(r"\s*[=:]", match.group(1), maxsplit=1)[0].casefold()
-    field_name = re.sub(r"[\\\"']", "", field_name)
+    field_name = re.sub(r"/\*[\s\S]*?(?:\*/|$)|//[^\r\n]*", "", field_name)
+    field_name = re.sub(r"[\\\"']", "", field_name).strip()
     if field_name != "key":
         return False
     match_text = match.string
@@ -205,7 +213,9 @@ def _json_fragments(text: str) -> list[tuple[int, int, Any, tuple[str, ...]]]:
                 assignment_end -= 1
             line_start = text.rfind("\n", 0, assignment_end) + 1
             previous_line = text[line_start:assignment_end].strip()
-            if previous_line.startswith(("#", ";")):
+            if previous_line.startswith(("#", ";", "//")) or (
+                previous_line.startswith("/*") and previous_line.endswith("*/")
+            ):
                 assignment_end = max(0, line_start - 1)
                 continue
             break

@@ -22,6 +22,7 @@ from pathlib import Path
 
 from tempesttrace.redaction import (
     RULE_VERSION,
+    _unquote,
     has_unredacted_embedded_json,
     has_unredacted_fields,
     has_unredacted_ini_fields,
@@ -37,8 +38,12 @@ _SECRET_SCAN = re.compile(
     r"(?i)((?:\bkey|api[_ -]?key|stream[_ -]?key|token|auth[_ -]?token|"
     r"bearer[_ -]?token|password|passwd|access[_ -]?token|client[_ -]?secret|secret)"
     r"\s*[=:]\s*)"
-    r"(?!(?:\\*[\"'])?<REDACTED>)"
-    r"(?:\\*\"[^\"\r\n]*\\*\"|\\*'[^'\r\n]*\\*'|[^\s,;\]\"']+)"
+    r"(?:\\*\"[^\"\r\n]*\\*\"|\\*'[^'\r\n]*\\*'|"
+    r"&quot;[^\r\n]*?&quot;|&apos;[^\r\n]*?&apos;|"
+    r"&#0*34;[^\r\n]*?&#0*34;|&#x0*22;[^\r\n]*?&#x0*22;|"
+    r"&#0*39;[^\r\n]*?&#0*39;|&#x0*27;[^\r\n]*?&#x0*27;|"
+    r"`[^\r\n]*?`|%22[^\r\n]*?%22|“[^\r\n]*?”|"
+    r"[^\s,;\]\"']+)"
 )
 
 
@@ -283,7 +288,9 @@ def _secret_scan(path: Path) -> bool:
     except OSError:
         return True
     contains_secret = any(
-        not is_noncredential_log_match(text, match) for match in _SECRET_SCAN.finditer(text)
+        _unquote(match.group(0)[len(match.group(1)) :]) != "<REDACTED>"
+        and not is_noncredential_log_match(text, match)
+        for match in _SECRET_SCAN.finditer(text)
     ) or has_unredacted_embedded_json(text)
     if path.suffix.lower() == ".json" or path.name.lower().endswith(".json.bak"):
         try:

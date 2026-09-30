@@ -423,6 +423,86 @@ def test_backup_redacts_credentials_hidden_by_comments_and_quote_entities(
         assert secret not in log
 
 
+@pytest.mark.parametrize("comment", ["// note\n", "/* note */\n"])
+def test_backup_preserves_hotkey_binding_with_c_style_comment_before_json(
+    tmp_path: Path, comment: str
+) -> None:
+    source = fixture(tmp_path / "obs")
+    (source / "basic/profiles/default/basic.ini").write_text(
+        "[Output]\nOBSBasic.StartStreaming=\n"
+        f"{comment}"
+        '{"key":"OBS_KEY_F9","settings":{"key":"NESTED_HOTKEY_SECRET"}}\n'
+        "OBSBasic.StopRecording=\n"
+        f"{comment}"
+        '{"key":"OBS_KEY_F10","settings":{"key":"NESTED_HOTKEY_SECRET_2"}}\n',
+        encoding="utf-8",
+    )
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    result = create_backup(source, destination)
+
+    assert not result.warnings
+    with zipfile.ZipFile(result.archive) as archive:
+        ini = archive.read("basic/profiles/default/basic.ini").decode("utf-8")
+    assert '"key":"OBS_KEY_F9"' in ini
+    assert '"key":"OBS_KEY_F10"' in ini
+    assert "NESTED_HOTKEY_SECRET" not in ini
+    assert "NESTED_HOTKEY_SECRET_2" not in ini
+
+
+def test_backup_includes_redacted_logs_with_mixed_quote_encodings(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    (source / "logs/2026-01-01.txt").write_text(
+        '{"token" /* note: "<REDACTED>" more : "UNCLOSED_SECOND_SECRET"}\n'
+        "password: &#39;ENTITY_QUOTE_SECRET&#39;\n"
+        "token: `BACKTICK_QUOTE_SECRET`\n"
+        "{“token”: “CURLY_QUOTE_SECRET”}\n"
+        "{%22token%22:%22PERCENT_QUOTE_SECRET%22}\n"
+        "filter chroma color key /* note */: #00ff00\n"
+        "hotkey binding key // note\n: F9\n",
+        encoding="utf-8",
+    )
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    result = create_backup(source, destination)
+
+    assert not result.warnings
+    with zipfile.ZipFile(result.archive) as archive:
+        name = "logs/2026-01-01.txt"
+        assert name in archive.namelist()
+        log = archive.read(name).decode("utf-8")
+    for secret in (
+        "UNCLOSED_SECOND_SECRET",
+        "ENTITY_QUOTE_SECRET",
+        "BACKTICK_QUOTE_SECRET",
+        "CURLY_QUOTE_SECRET",
+        "PERCENT_QUOTE_SECRET",
+    ):
+        assert secret not in log
+    assert "key /* note */: #00ff00" in log
+    assert "key // note\n: F9" in log
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "password: &#39;<REDACTED>&#39;",
+        "token: `<REDACTED>`",
+        "{“token”: “<REDACTED>”}",
+        "{%22token%22:%22<REDACTED>%22}",
+    ],
+)
+def test_private_verifier_accepts_redacted_values_with_encoded_quotes(
+    tmp_path: Path, line: str
+) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(line, encoding="utf-8")
+
+    assert not backup._secret_scan(path)
+
+
 def test_private_verifier_does_not_join_quoted_assignments_across_lines(tmp_path: Path) -> None:
     path = tmp_path / "current.txt"
     path.write_text('loaded {\\"token\\"\nsee "docs"\n', encoding="utf-8")

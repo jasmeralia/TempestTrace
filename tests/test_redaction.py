@@ -152,6 +152,7 @@ def test_credential_free_embedded_json_keeps_its_original_formatting(tmp_path: P
         '{"token" /* foo * bar */: "STAR_COMMENT_SECRET"}',
         '{"token" // note\n: "SLASH_COMMENT_SECRET"}',
         '{"token" /* unclosed : "UNCLOSED_COMMENT_SECRET"}',
+        '{"token" /* note: "<REDACTED>" more : "UNCLOSED_SECOND_SECRET"}',
         '{"token" /* &#39;password&#39;:&#39;NESTED_COMMENT_SECRET&#39; */'
         ' : "OUTER_COMMENT_SECRET"}',
         "{&quot;token&quot;:&quot;HTML_SECRET&quot;}",
@@ -163,6 +164,8 @@ def test_credential_free_embedded_json_keeps_its_original_formatting(tmp_path: P
         "{&#034;token&#034;:&#034;PADDED_NUM_SECRET&#034;}",
         "{&#x0022;token&#x0022;:&#x0022;PADDED_HEX_SECRET&#x0022;}",
         "{`token`: `BACKTICK_SECRET`}",
+        "{“token”: “CURLY_QUOTE_SECRET”}",
+        "{%22token%22:%22PERCENT_QUOTE_SECRET%22}",
     ],
 )
 def test_non_strict_quoted_credential_text_is_redacted(tmp_path: Path, line: str) -> None:
@@ -193,6 +196,9 @@ def test_non_strict_quoted_credential_text_is_redacted(tmp_path: Path, line: str
         "PADDED_NUM_SECRET",
         "PADDED_HEX_SECRET",
         "BACKTICK_SECRET",
+        "UNCLOSED_SECOND_SECRET",
+        "CURLY_QUOTE_SECRET",
+        "PERCENT_QUOTE_SECRET",
     ):
         assert secret not in cleaned
 
@@ -338,6 +344,24 @@ def test_log_redaction_preserves_chroma_color_key_value(tmp_path: Path) -> None:
     redact_file(log)
 
     assert log.read_text(encoding="utf-8") == "filter chroma color key: #00ff00 key=<REDACTED>\n"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "filter chroma color key /* note */: #00ff00",
+        "filter chroma color key // note\n: #00ff00",
+        "hotkey binding key /* note */: F9",
+        "hotkey binding key // note\n: F9",
+    ],
+)
+def test_noncredential_key_with_comment_is_preserved(tmp_path: Path, line: str) -> None:
+    log = tmp_path / "current.txt"
+    log.write_text(line + "\n", encoding="utf-8")
+
+    redact_file(log)
+
+    assert log.read_text(encoding="utf-8") == line + "\n"
 
 
 def test_short_credentials_do_not_corrupt_substring_matches(tmp_path: Path) -> None:

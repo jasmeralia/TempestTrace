@@ -478,10 +478,18 @@ def test_update_error_states_keep_collection_available(monkeypatch) -> None:
     assert app is not None
 
 
-def test_sandboxed_package_update_downloads_to_host_visible_folder(
+@pytest.mark.skipif(os.geteuid() == 0, reason="read-only HOME permissions are ineffective as root")
+def test_flatpak_update_download_uses_writable_cache_when_home_is_read_only(
     tmp_path: Path, monkeypatch
 ) -> None:
-    monkeypatch.setattr("tempesttrace.ui.Path.home", lambda: tmp_path)
+    read_only_home = tmp_path / "readonly-home"
+    read_only_home.mkdir(mode=0o500)
+    os.chmod(read_only_home, 0o500)
+    cache_home = tmp_path / "cache"
+    cache_home.mkdir()
+    monkeypatch.setenv("HOME", str(read_only_home))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache_home))
+    monkeypatch.setattr("tempesttrace.ui.Path.home", lambda: read_only_home)
     monkeypatch.setattr("tempesttrace.ui.detect_package_type", lambda: "flatpak")
 
     def fake_download(_url, _size, _digest, destination):
@@ -505,6 +513,34 @@ def test_sandboxed_package_update_downloads_to_host_visible_folder(
     assert len(downloaded) == 1
     path = downloaded[0]
     assert isinstance(path, Path)
+    assert path.is_relative_to(cache_home / "TempestTrace" / "updates")
+
+
+def test_deb_update_download_still_uses_downloads(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("tempesttrace.ui.Path.home", lambda: tmp_path)
+    monkeypatch.setattr("tempesttrace.ui.detect_package_type", lambda: "deb")
+
+    def fake_download(_url, _size, _digest, destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"verified")
+        return destination
+
+    monkeypatch.setattr("tempesttrace.ui.verify_download", fake_download)
+    offer = UpdateOffer(
+        "1.2.3",
+        False,
+        "",
+        "",
+        ReleaseAsset("TempestTrace.deb", "https://example.test/pkg", 8, "a" * 64),
+    )
+    worker = UpdateDownloadWorker(offer)
+    downloaded: list[object] = []
+    worker.finished.connect(downloaded.append)
+    worker.run()
+
+    assert len(downloaded) == 1
+    path = downloaded[0]
+    assert isinstance(path, Path)
     assert path.is_relative_to(tmp_path / "Downloads")
 
 
@@ -512,6 +548,7 @@ def test_update_download_removes_temporary_folder_after_failure(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.setattr("tempesttrace.ui.Path.home", lambda: tmp_path)
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
     monkeypatch.setattr("tempesttrace.ui.detect_package_type", lambda: "flatpak")
 
     def fail_download(*_args):
@@ -532,7 +569,7 @@ def test_update_download_removes_temporary_folder_after_failure(
     worker.run()
 
     assert failures == [True]
-    assert list((tmp_path / "Downloads").iterdir()) == []
+    assert list((tmp_path / ".cache" / "TempestTrace" / "updates").iterdir()) == []
 
 
 def test_windows_update_handoff_resets_pyinstaller_environment(tmp_path: Path, monkeypatch) -> None:

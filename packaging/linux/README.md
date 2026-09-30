@@ -18,6 +18,9 @@ the complete package matrix and checksums, then publishes a beta prerelease.
 - RPM: `rpmbuild` (Ubuntu runner package `rpm`; the workflow install-smokes the
   RPM in the Fedora 42 container).
 - AppImage: `appimagetool` 1.9.1 from the `AppImage/appimagetool` release, verified by SHA-256.
+- AppImage runtime: `AppImage/type2-runtime` release `20251108`, downloaded for the
+  target architecture and verified by SHA-256 before use. `APPIMAGE_RUNTIME_FILE`
+  must point to this verified regular file when running `build-packages.sh`.
 - Flatpak: Flatpak 1.14 or newer, Flathub's pinned Freedesktop 26.08 runtime
   and SDK for the host architecture.
 - Snap: Snapcraft's `8.x/stable` channel and the core24 base. Local installation
@@ -26,12 +29,15 @@ the complete package matrix and checksums, then publishes a beta prerelease.
   Connect it once with `sudo snap connect tempesttrace:obs-config` if snapd does
   not connect it automatically.
 
-The binary is frozen with PyInstaller on Ubuntu 22.04, so its glibc
-floor is glibc 2.35. DEB, RPM, and AppImage builds depend on Qt platform plugins
+The binary is frozen with PyInstaller on Ubuntu 24.04, so its glibc
+floor is glibc 2.39. DEB, RPM, and AppImage builds depend on Qt platform plugins
 and system libraries supplied by the target machine; the package metadata is a
 starting point and still needs testing on each promised distribution. Fedora
-42 is the RPM install smoke-test container. The Flatpak and Snap assets
-use their core24/Freedesktop 26.08 runtimes rather than the host glibc.
+42 is the RPM install smoke-test container. Release notes identify Windows 10/11 x64,
+Ubuntu 24.04 amd64/arm64, the glibc floor for DEB/RPM/AppImage, and Fedora 42 RPM smoke
+coverage. Flatpak and Snap are sideloaded without a configured remote or store channel.
+The Flatpak and Snap assets use their core24/Freedesktop 26.08 runtimes rather than
+the host glibc.
 
 ## Access and validation limits
 

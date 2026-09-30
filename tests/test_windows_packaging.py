@@ -76,3 +76,21 @@ def test_uninstaller_removes_only_owned_files_and_keeps_nonempty_install_dir() -
     assert 'Delete "$INSTDIR\\LICENSE"' in uninstall_section
     assert 'RMDir "$INSTDIR"' in uninstall_section
     assert 'RMDir /r "$INSTDIR"' not in uninstall_section
+
+
+def test_gui_executable_smoke_tests_wait_for_process_exit() -> None:
+    workflow = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+
+    assert "& ./dist/TempestTrace.exe --smoke-test" not in workflow
+    assert "& $app --smoke-test" not in workflow
+    executable_step = workflow[
+        workflow.index("Smoke-test executable") : workflow.index("Ensure NSIS")
+    ]
+    assert "$LASTEXITCODE -ne 0" not in executable_step
+    installed_smoke = "Start-Process -FilePath $app -ArgumentList '--smoke-test' -Wait -PassThru"
+    build_smoke = (
+        "Start-Process -FilePath (Resolve-Path 'dist/TempestTrace.exe').Path "
+        "-ArgumentList '--smoke-test' -Wait -PassThru"
+    )
+    assert workflow.count(installed_smoke) == 1
+    assert workflow.count(build_smoke) == 1

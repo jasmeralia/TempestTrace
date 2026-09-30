@@ -10,6 +10,8 @@ import subprocess
 import sys
 import time
 import types
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,7 @@ import pytest
 
 from tempesttrace import updater
 from tempesttrace.updater import (
+    HTTPSRedirectHandler,
     SemVer,
     asset_name,
     check_for_update,
@@ -66,6 +69,18 @@ def test_release_selection_uses_semver_and_matching_windows_asset() -> None:
     assert offer is not None
     assert offer.version == "0.1.10"
     assert offer.asset.name == "TempestTrace-Setup-v0.1.10.exe"
+
+
+def test_https_redirect_handler_rejects_http_and_accepts_https() -> None:
+    handler = HTTPSRedirectHandler()
+    request = urllib.request.Request("https://example.test/start")
+    with pytest.raises(urllib.error.HTTPError):
+        handler.redirect_request(request, None, 302, "Found", {}, "http://example.test/target")
+    redirected = handler.redirect_request(
+        request, None, 302, "Found", {}, "https://example.test/target"
+    )
+    assert redirected is not None
+    assert redirected.full_url == "https://example.test/target"
 
 
 def test_semver_orders_numeric_prerelease_identifiers_before_stable() -> None:

@@ -96,7 +96,11 @@ class UpdateDownloadWorker(QObject):
                 current = Path(os.environ["APPIMAGE"]).absolute()
                 folder = Path(tempfile.mkdtemp(prefix=".TempestTrace-update-", dir=current.parent))
             elif package in {"deb", "rpm", "flatpak", "snap"}:
-                downloads = Path.home() / "Downloads"
+                if package == "flatpak":
+                    cache_home = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+                    downloads = cache_home / "TempestTrace" / "updates"
+                else:
+                    downloads = Path.home() / "Downloads"
                 downloads.mkdir(parents=True, exist_ok=True)
                 folder = Path(tempfile.mkdtemp(prefix="TempestTrace-update-", dir=downloads))
             else:

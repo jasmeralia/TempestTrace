@@ -174,8 +174,8 @@ jobs:
         shell: pwsh
         run: |
           if (-not (Test-Path dist/TempestTrace.exe)) { throw "Missing Windows executable" }
-          & ./dist/TempestTrace.exe --smoke-test
-          if ($LASTEXITCODE -ne 0) { throw "Windows executable smoke test failed" }
+          $proc = Start-Process -FilePath (Resolve-Path 'dist/TempestTrace.exe').Path -ArgumentList '--smoke-test' -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { throw "Windows executable smoke test failed with exit code $($proc.ExitCode)" }
       - name: Ensure NSIS
         shell: pwsh
         run: |
@@ -210,8 +210,8 @@ jobs:
           $app = Join-Path $installDir 'TempestTrace.exe'
           if (-not (Test-Path $app)) { throw "Installed executable is missing" }
           if (-not (Test-Path (Join-Path $installDir 'LICENSE'))) { throw "Installed license is missing" }
-          & $app --smoke-test
-          if ($LASTEXITCODE -ne 0) { throw "Installed executable smoke test failed" }
+          $smoke = Start-Process -FilePath $app -ArgumentList '--smoke-test' -Wait -PassThru
+          if ($smoke.ExitCode -ne 0) { throw "Installed executable smoke test failed with exit code $($smoke.ExitCode)" }
           $uninstaller = Join-Path $installDir 'Uninstall.exe'
           $uninstall = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassThru
           if ($uninstall.ExitCode -ne 0) { throw "NSIS silent uninstall failed" }
@@ -308,8 +308,18 @@ jobs:
           mapfile -t assets < <(find release-assets -maxdepth 1 -type f \
             \( -name 'TempestTrace-*' -o -name 'SHA256SUMS' \) -print | sort)
           if ! gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            notes_file="$RUNNER_TEMP/supported-platforms.md"
+            printf '%s\n' \
+              '## Supported platforms' \
+              '' \
+              '- Windows 10/11 x64 NSIS installer.' \
+              '- Linux amd64/arm64 built on Ubuntu 24.04. DEB, RPM, and AppImage require glibc 2.39 or newer; Flatpak and Snap use pinned runtimes.' \
+              '- RPM smoke-tested on Fedora 42.' \
+              '- Snap requires `sudo snap connect tempesttrace:obs-config`.' \
+              '- Flatpak and Snap are sideloaded packages with no configured remote or store channel.' \
+              > "$notes_file"
             gh release create "$TAG_NAME" "${assets[@]}" \
-              --verify-tag --prerelease --generate-notes
+              --verify-tag --prerelease --notes-file "$notes_file" --generate-notes
             exit 0
           fi
 

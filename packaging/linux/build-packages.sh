@@ -43,7 +43,7 @@ Section: utils
 Priority: optional
 Architecture: $arch
 Maintainer: TempestTrace contributors
-Depends: libc6 (>= 2.35), libx11-6, libxcb1, libxkbcommon-x11-0, libxcb-cursor0, libxcb-icccm4, libxcb-image0, libxcb-keysyms1, libxcb-render-util0, libxcb-xinerama0, libxcb-xkb1
+Depends: libc6 (>= 2.39), libx11-6, libxcb1, libxkbcommon-x11-0, libxcb-cursor0, libxcb-icccm4, libxcb-image0, libxcb-keysyms1, libxcb-render-util0, libxcb-xinerama0, libxcb-xkb1
 Description: Safe OBS diagnostic backup utility
  Creates a redacted diagnostic archive without modifying OBS configuration.
 EOF
@@ -63,10 +63,11 @@ Release:        1
 Summary:        Safe OBS diagnostic backup utility
 License:        GPL-3.0-or-later
 BuildArch:      $rpm_arch
-Requires:       glibc >= 2.35
+Requires:       glibc >= 2.39
 Requires:       libX11
 Requires:       libxcb
 Requires:       libxkbcommon-x11
+Requires:       xcb-util-cursor
 Requires:       xcb-util-wm
 Requires:       xcb-util-image
 Requires:       xcb-util-keysyms
@@ -88,6 +89,10 @@ EOF
 }
 
 build_appimage() {
+    if [[ -z "${APPIMAGE_RUNTIME_FILE:-}" || ! -f "$APPIMAGE_RUNTIME_FILE" ]]; then
+        echo "APPIMAGE_RUNTIME_FILE must name the verified AppImage runtime file" >&2
+        return 1
+    fi
     local dir=$work/AppDir
     mkdir -p "$dir/usr/bin" "$dir/usr/share/applications" \
         "$dir/usr/share/icons/hicolor/256x256/apps"
@@ -108,7 +113,8 @@ EOF
     chmod 0755 "$dir/AppRun"
     local appimage_arch=x86_64
     [[ "$arch" == arm64 ]] && appimage_arch=aarch64
-    APPIMAGE_EXTRACT_AND_RUN=1 VERSION="$version" ARCH="$appimage_arch" appimagetool "$dir" \
+    APPIMAGE_EXTRACT_AND_RUN=1 VERSION="$version" ARCH="$appimage_arch" appimagetool \
+        --runtime-file "$APPIMAGE_RUNTIME_FILE" "$dir" \
         "$output_dir/TempestTrace-v${version_bare}-linux-${arch}.AppImage"
     chmod 0755 "$output_dir/TempestTrace-v${version_bare}-linux-${arch}.AppImage"
 }
@@ -138,7 +144,8 @@ build_flatpak() {
     flatpak build-export --arch="$flatpak_arch" "$repo" "$dir" stable
     flatpak build-bundle --arch="$flatpak_arch" "$repo" \
         "$output_dir/TempestTrace-v${version_bare}-linux-${arch}.flatpak" \
-        io.github.jasmeralia.TempestTrace stable
+        io.github.jasmeralia.TempestTrace stable \
+        --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo
 }
 
 build_snap() {

@@ -12,17 +12,39 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import total_ordering
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, cast, override
 
 SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 MAX_DOWNLOAD_SIZE = 1024 * 1024 * 1024
 READ_CHUNK_SIZE = 64 * 1024
+
+
+class HTTPSRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject redirects that would downgrade a verified HTTPS request."""
+
+    @override
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        if urllib.parse.urlsplit(newurl).scheme.casefold() != "https":
+            raise urllib.error.HTTPError(
+                req.full_url, code, "refusing non-HTTPS redirect", headers, fp
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 @total_ordering
@@ -439,7 +461,8 @@ def fetch_release_feed(  # noqa: PLR0912
     opener: Callable[[str], Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch GitHub releases and attach hashes parsed from each release manifest."""
-    open_url = opener or (lambda target: urllib.request.urlopen(target, timeout=20))
+    default_opener = urllib.request.build_opener(HTTPSRedirectHandler())
+    open_url = opener or (lambda target: default_opener.open(target, timeout=20))
     if not url.startswith("https://"):
         raise ValueError("release feed must use HTTPS")
     parsed: list[dict[str, Any]] = []
@@ -517,7 +540,8 @@ def verify_download(  # noqa: PLR0913
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
         raise FileExistsError(target)
-    open_url = opener or (lambda target_url: urllib.request.urlopen(target_url, timeout=30))
+    default_opener = urllib.request.build_opener(HTTPSRedirectHandler())
+    open_url = opener or (lambda target_url: default_opener.open(target_url, timeout=30))
     temporary_path: Path | None = None
     response = open_url(url)
     try:

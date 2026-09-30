@@ -18,9 +18,9 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: ubuntu-22.04
+            runner: ubuntu-24.04
           - arch: arm64
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
@@ -35,7 +35,7 @@ jobs:
       - name: Install package build tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes dpkg-dev rpm flatpak squashfs-tools snapd libfuse2 xvfb xauth xdotool
+          sudo apt-get install --yes dpkg-dev rpm flatpak squashfs-tools snapd libfuse2t64 xvfb xauth xdotool
           python -m pip install --upgrade pip
           python -m pip install . pyinstaller==6.22.3
       - name: Install pinned appimagetool
@@ -56,6 +56,24 @@ jobs:
           echo "${tool_sha256}  /tmp/appimagetool" | sha256sum --check --strict -
           chmod +x /tmp/appimagetool
           echo /tmp >> "$GITHUB_PATH"
+      - name: Install pinned AppImage runtime
+        run: |
+          case "${{ matrix.arch }}" in
+            amd64)
+              runtime_arch=x86_64
+              runtime_sha256=2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
+              ;;
+            arm64)
+              runtime_arch=aarch64
+              runtime_sha256=00cbdfcf917cc6c0ff6d3347d59e0ca1f7f45a6df1a428a0d6d8a78664d87444
+              ;;
+          esac
+          curl --fail --location --retry 3 \
+            "https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-${runtime_arch}" \
+            --output /tmp/appimage-runtime
+          printf '%s  /tmp/appimage-runtime\n' "$runtime_sha256" | sha256sum --check --strict -
+          chmod +x /tmp/appimage-runtime
+          echo "APPIMAGE_RUNTIME_FILE=/tmp/appimage-runtime" >> "$GITHUB_ENV"
       - name: Install Snapcraft 8
         run: sudo snap install snapcraft --classic --channel=8.x/stable
       - name: Install Flatpak builder and runtime
@@ -87,11 +105,23 @@ jobs:
           flatpak install --user --noninteractive --assumeyes "$package"
           permissions=$(flatpak info --user --show-permissions io.github.jasmeralia.TempestTrace)
           grep -Fq 'shared=network' <<<"$permissions"
-          grep -Fq 'home:ro' <<<"$permissions"
-          grep -Fq '~/Dropbox:rw' <<<"$permissions"
-          grep -Fq 'xdg-config/obs-studio:ro' <<<"$permissions"
-          grep -Fq '~/.dropbox:ro' <<<"$permissions"
-          grep -Fq '~/.var/app/com.obsproject.Studio/config/obs-studio:ro' <<<"$permissions"
+          filesystems_line=$(sed -n 's/^filesystems=//p' <<<"$permissions")
+          IFS=';' read -r -a filesystem_tokens <<<"$filesystems_line"
+          has_filesystem() {
+            local expected=$1 token
+            for token in "${filesystem_tokens[@]}"; do
+              [[ "$token" == "$expected" ]] && return 0
+            done
+            return 1
+          }
+          has_filesystem 'home:ro'
+          has_filesystem 'xdg-config/obs-studio:ro'
+          has_filesystem '~/.dropbox:ro'
+          has_filesystem '~/.var/app/com.obsproject.Studio/config/obs-studio:ro'
+          if ! has_filesystem '~/Dropbox' && ! has_filesystem '~/Dropbox:rw'; then
+            echo 'Flatpak writable Dropbox permission is missing' >&2
+            exit 1
+          fi
           native_obs="$HOME/.config/obs-studio"
           flatpak_obs="$HOME/.var/app/com.obsproject.Studio/config/obs-studio"
           dropbox="$HOME/Dropbox"

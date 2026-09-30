@@ -177,7 +177,9 @@ explain a failure.
   verified local package and the appropriate user-approved package-manager action;
   do not claim that `apt`, `dnf`, `flatpak update`, or Snap refresh will discover a
   future GitHub asset on its own. For Flatpak, update the installed app from a new
-  local bundle and retain the app data; for Snap, document the required local-install
+  local bundle and retain the app data. Download its temporary update package under
+  the app's writable XDG cache; DEB, RPM, and Snap downloads use `~/Downloads`.
+  For Snap, document the required local-install
   trust mode and confinement. Never overwrite a managed package from inside the app
   or invoke a privileged package command silently.
   [Flatpak's single-file bundle guide](https://docs.flatpak.org/en/latest/single-file-bundles.html)
@@ -240,6 +242,11 @@ explain a failure.
   metadata paths read-only, and allow writes to the default `~/Dropbox` destination.
   Relocated or custom destinations need a tested, user-approved portal grant before
   claiming support. No FFmpeg dependency is needed.
+  Build Linux amd64 and arm64 packages on Ubuntu 24.04 with a glibc 2.39 floor for
+  DEB, RPM, and AppImage; smoke-test RPM installation on Fedora 42. Flatpak and Snap
+  use pinned runtimes. Release notes state these tested platforms and the glibc floor,
+  and identify Flatpak/Snap as sideloaded packages with no configured remote or store
+  channel. Snap users connect `tempesttrace:obs-config` with sudo for OBS access.
 - Run a Windows smoke test of the built `.exe`, including launch from Explorer and
   a synthetic OBS/Dropbox fixture. Silently install the NSIS asset in CI, smoke-test
   the installed executable, uninstall, and verify removal of installed files.

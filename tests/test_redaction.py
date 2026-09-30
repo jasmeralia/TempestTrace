@@ -759,6 +759,8 @@ def test_seeded_multishape_fuzz_has_zero_shipped_leaks(tmp_path: Path) -> None:
         _counts, _total, secrets = redact_file_with_secrets(path)
         output = read_text_safely(path)
         flagged = _contains_private_secret(path, secrets) or _secret_scan(path)
+        if flagged:
+            leaks.append(f"verifier rejected redacted {filename}: {content!r} -> {output!r}")
         if literal in output and not flagged:
             leaks.append(f"{filename}: {content!r} -> {output!r}")
     assert leaks == []
@@ -787,6 +789,217 @@ def test_url_credentials_inside_json_string_are_redacted_and_verified(tmp_path: 
     redact_file(path)
     assert "JSON_URL_SECRET" not in path.read_text(encoding="utf-8")
     assert not _secret_scan(path)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "dbpassword",
+        "serverpassword",
+        "adminpassword",
+        "userpassword",
+        "apitoken",
+        "sessiontoken",
+        "oauthtoken",
+        "idtoken",
+        "twitchtoken",
+    ],
+)
+@pytest.mark.parametrize("separator", ["=", ": "])
+def test_compound_credential_suffixes_redact_in_free_text(
+    name: str, separator: str, tmp_path: Path
+) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(f"{name}{separator}ABCD#LEAKTAIL\n", encoding="utf-8")
+    assert _secret_scan(path)
+    redact_file(path)
+    assert "ABCD" not in path.read_text(encoding="utf-8")
+    assert not _secret_scan(path)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "dbpassword",
+        "serverpassword",
+        "adminpassword",
+        "userpassword",
+        "apitoken",
+        "sessiontoken",
+        "oauthtoken",
+        "idtoken",
+        "twitchtoken",
+    ],
+)
+def test_compound_credential_suffixes_redact_in_json_and_ini(name: str, tmp_path: Path) -> None:
+    secret = "COMPOUND_SECRET_987"
+    json_path = tmp_path / "service.json"
+    json_path.write_text(json.dumps({"settings": {name: secret}}), encoding="utf-8")
+    assert _secret_scan(json_path)
+    redact_file(json_path)
+    assert secret not in json_path.read_text(encoding="utf-8")
+    assert not _secret_scan(json_path)
+
+    ini_path = tmp_path / "basic.ini"
+    ini_path.write_text(f"{name}={secret}\n", encoding="utf-8")
+    assert _secret_scan(ini_path)
+    redact_file(ini_path)
+    assert secret not in ini_path.read_text(encoding="utf-8")
+    assert not _secret_scan(ini_path)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "hunter2#LEAKTAIL",
+        "hunter2&3xLEAKTAIL",
+        "hunter2;LEAKTAILQ",
+        "hunter2\\Zq9LEAK",
+        "hunter2`TAIL",
+        "hunter2}TAIL",
+    ],
+)
+def test_log_unquoted_value_punctuation_is_fully_redacted(value: str, tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(f"password={value}\n", encoding="utf-8")
+    assert _secret_scan(path)
+    redact_file(path)
+    assert value not in path.read_text(encoding="utf-8")
+    assert not _secret_scan(path)
+
+
+@pytest.mark.parametrize("name", ["password", "token"])
+@pytest.mark.parametrize("tail", ["#TAIL", "&x", "\\x"])
+def test_verifier_rejects_trailing_token_after_redacted_marker(
+    name: str, tail: str, tmp_path: Path
+) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(f"{name}=<REDACTED>{tail}\n", encoding="utf-8")
+    assert _secret_scan(path)
+
+
+@pytest.mark.parametrize("text", ["authorization=SECRET", "authorization: SECRET"])
+def test_authorization_without_scheme_is_redacted(text: str, tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(text + "\n", encoding="utf-8")
+    assert _secret_scan(path)
+    redact_file(path)
+    assert "SECRET" not in path.read_text(encoding="utf-8")
+    assert not _secret_scan(path)
+
+
+@pytest.mark.parametrize(
+    "line,secret,expected",
+    [
+        ("Authorization: Bearer LEAKBE", "LEAKBE", "Authorization: Bearer <REDACTED>\n"),
+        ("Authorization: Basic LEAKB64", "LEAKB64", "Authorization: Basic <REDACTED>\n"),
+        (
+            "info: Authorization: Bearer LEAKBE",
+            "LEAKBE",
+            "info: Authorization: Bearer <REDACTED>\n",
+        ),
+        (
+            "x Authorization: Basic LEAKB64 y",
+            "LEAKB64",
+            "x Authorization: Basic <REDACTED> y\n",
+        ),
+        (
+            "debug: aUtHoRiZaTiOn : dIgEsT DIGEST_SECRET trailing",
+            "DIGEST_SECRET",
+            "debug: aUtHoRiZaTiOn : dIgEsT <REDACTED> trailing\n",
+        ),
+        ("Authorization=Bearer LEAKBE", "LEAKBE", "Authorization=Bearer <REDACTED>\n"),
+        ("authorization=LEAKAUTH", "LEAKAUTH", "authorization=<REDACTED>\n"),
+        ("authorization: LEAKAUTH", "LEAKAUTH", "authorization: <REDACTED>\n"),
+        ("Authorization: token LEAKT", "LEAKT", "Authorization: token <REDACTED>\n"),
+    ],
+)
+def test_authorization_headers_redact_value_and_verifier_agrees(
+    line: str, secret: str, expected: str, tmp_path: Path
+) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(line + "\n", encoding="utf-8")
+    assert _secret_scan(path)
+
+    _counts, _total, secrets = redact_file_with_secrets(path)
+
+    cleaned = path.read_text(encoding="utf-8")
+    assert cleaned == expected
+    assert secret not in cleaned
+    assert not _contains_private_secret(path, secrets)
+    assert not _secret_scan(path)
+
+
+@pytest.mark.parametrize("url", ["redis://:SECRET@host", "https://user:ab@SECRET@host/path"])
+def test_url_userinfo_redacts_through_last_authority_at(url: str, tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(url + "\n", encoding="utf-8")
+    assert _secret_scan(path)
+    redact_file(path)
+    output = path.read_text(encoding="utf-8")
+    assert "SECRET" not in output
+    assert not _secret_scan(path)
+
+
+def test_url_query_delimiters_end_only_that_query_parameter(tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text("https://host/?token=QUERYSECRET&region=us\n", encoding="utf-8")
+    redact_file(path)
+    output = path.read_text(encoding="utf-8")
+    assert "QUERYSECRET" not in output
+    assert "&region=us" in output
+    assert not _secret_scan(path)
+
+
+def test_punctuation_seeded_fuzz_has_no_shipped_leaks(tmp_path: Path) -> None:
+    rng = random.Random(9031)
+    names = [
+        "password",
+        "stream_key",
+        "token",
+        "api_key",
+        "StreamKey",
+        "passphrase",
+        "client_secret",
+        "auth_token",
+        "secret",
+        "access_token",
+        "dbpassword",
+        "twitchtoken",
+    ]
+    alphabet = "abcXYZ123#&;\\`~!@$%^*(){}[]|/+.,-_="
+    leaks = []
+    for index in range(3000):
+        name = rng.choice(names)
+        secret = "".join(rng.choice(alphabet) for _ in range(rng.randint(8, 20)))
+        if rng.random() < 0.2:
+            secret += chr(233)
+        quote = rng.choice(["", "'", '"'])
+        kind = rng.choice(["log", "ini", "json"])
+        value = f"{quote}{secret}{quote}"
+        if kind == "log":
+            content, filename = f"info: {name} = {value}\n", "current.txt"
+        elif kind == "ini":
+            content, filename = f"[General]\nNote={name}={value}\n", "global.ini"
+        else:
+            content, filename = json.dumps({"note": f"{name}={value}"}), "scene.json"
+        path = tmp_path / f"fuzz-{index}" / filename
+        path.parent.mkdir()
+        path.write_text(content, encoding="utf-8")
+        _counts, _total, secrets = redact_file_with_secrets(path)
+        output = read_text_safely(path)
+        flagged = _contains_private_secret(path, secrets) or _secret_scan(path)
+        if secret in output and not flagged:
+            leaks.append(content)
+    assert leaks == []
+
+
+@pytest.mark.parametrize("name", ["SortKey", "audio_key"])
+def test_short_numeric_values_do_not_drop_log(name: str, tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(f"{name}: 1\nvalue=1 and 0\n", encoding="utf-8")
+    secrets = {"1", "0"}
+    assert not _contains_private_secret(path, secrets)
 
 
 @pytest.mark.parametrize("n", [40])

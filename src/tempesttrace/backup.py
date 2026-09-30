@@ -33,6 +33,13 @@ MAX_FILE_SIZE = 32 * 1024 * 1024
 MAX_TOTAL_SIZE = 512 * 1024 * 1024
 MAX_LOG_FILES = 5
 ALLOWED_PROFILE_SUFFIXES = {".ini", ".json", ".txt"}
+_INDEPENDENT_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)(?<![?&;A-Za-z0-9_.\-\"'])(?=(?P<name>[\"']?[A-Za-z0-9_.-]+[\"']?)"
+    r"[ \t]*[=:][ \t]*(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s]+))"
+)
+_INDEPENDENT_QUERY_ASSIGNMENT = re.compile(
+    r"(?i)[?&;]([A-Za-z0-9_.-]+)=((?:[^&;\s]|[&;](?![A-Za-z0-9_.-]+=))+)"
+)
 
 
 class BackupCancelled(Exception):
@@ -316,7 +323,7 @@ def _secret_scan(path: Path) -> bool:
         text = read_text_safely(path)
     except OSError, ValueError:
         return True
-    contains_secret = has_unredacted_embedded_json(text)
+    contains_secret = has_unredacted_embedded_json(text) or _independent_secret_scan(text)
     if path.suffix.lower() == ".json" or path.name.lower().endswith(".json.bak"):
         try:
             contains_secret = contains_secret or has_unredacted_fields(
@@ -329,6 +336,126 @@ def _secret_scan(path: Path) -> bool:
     return contains_secret
 
 
+def _independent_secret_scan(text: str) -> bool:
+    """Fail closed on credential assignments with a scanner independent of redactor patterns."""
+    for match in _INDEPENDENT_SECRET_ASSIGNMENT.finditer(text):
+        name = match.group("name").strip("\\\"'")
+        normalized = re.sub(r"[^a-z0-9]", "", name.casefold())
+        if not _is_sensitive_signature_name(name):
+            continue
+        if (
+            normalized == "key"
+            and match.group("name").startswith(('"', "'"))
+            and _is_hotkey_signature_context(text, match.start("name"))
+        ):
+            continue
+        if normalized == "key":
+            line_start = text.rfind("\n", 0, match.start()) + 1
+            if re.search(
+                r"(?i)\b(?:hotkey(?:\s+binding)?|key.?binding|shortcut|chroma|colou?r)\s*$",
+                text[line_start : match.start()],
+            ):
+                continue
+        value = match.group("value").strip()
+        unquoted = _unwrap_signature_value(value)
+        if unquoted in {"", "<REDACTED>"} or unquoted.casefold() in {"true", "false", "null"}:
+            continue
+        if normalized == "authorization":
+            scheme_value = re.match(r"[ \t]+(\S+)", text[match.end("value") :])
+            if scheme_value and _unwrap_signature_value(scheme_value.group(1)) == "<REDACTED>":
+                continue
+        return True
+    for match in _INDEPENDENT_QUERY_ASSIGNMENT.finditer(text):
+        normalized = re.sub(r"[^a-z0-9]", "", match.group(1).casefold())
+        value = match.group(2)
+        following = re.search(r"[&;](?=[A-Za-z0-9_.-]+=)", value)
+        if following:
+            value = value[: following.start()]
+        value = _unwrap_signature_value(value)
+        if (
+            normalized in {"auth", "sig"} or _is_sensitive_signature_name(match.group(1))
+        ) and value != "<REDACTED>":
+            return True
+    return False
+
+
+def _is_sensitive_signature_name(name: str) -> bool:
+    """Classify known credential signatures without relying on redactor boundaries."""
+    normalized = re.sub(r"[^a-z0-9]", "", name.casefold())
+    return (
+        normalized
+        in {
+            "authorization",
+            "passphrase",
+            "pwd",
+            "cookie",
+            "cookies",
+            "sessionid",
+            "jwt",
+            "credential",
+            "credentials",
+            "streamid",
+        }
+        or normalized == "key"
+        or normalized.endswith(("password", "passwd", "secret", "token"))
+        or (
+            normalized.endswith("key")
+            and normalized != "key"
+            and (name[-3:] != "key" or name.casefold().endswith(("_key", "-key", ".key")))
+        )
+    )
+
+
+def _is_hotkey_signature_context(text: str, start: int) -> bool:
+    line_start = text.rfind("\n", 0, start) + 1
+    prefix = text[line_start:start]
+    if re.search(r"(?i)OBSBasic\.[\w.]+\s*=\s*(?:\r?\n\s*)*$", prefix):
+        return True
+    preceding = text[:start]
+    assignments = list(re.finditer(r"(?i)OBSBasic\.[\w.]+\s*=", preceding))
+    if assignments:
+        between = preceding[assignments[-1].end() :]
+        between = re.sub(r"(?m)^\s*(?:#|;|//)[^\r\n]*", "", between)
+        between = re.sub(r"/\*[\s\S]*?(?:\*/|$)", "", between)
+        if re.fullmatch(r"\s*\{\s*", between):
+            return True
+    for field in ("hotkey", "hotkeys", "binding", "bindings", "keybinding", "keybindings"):
+        candidates = (
+            text.rfind(f'"{field}"', 0, start),
+            text.rfind(f"'{field}'", 0, start),
+        )
+        field_start = max(candidates)
+        if field_start < 0:
+            continue
+        between = text[field_start:start].casefold()
+        if "}" not in between and '"settings"' not in between and "'settings'" not in between:
+            return True
+    return False
+
+
+def _unwrap_signature_value(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'`":
+        return value[1:-1]
+    if len(value) >= 2 and value[-1] in "\"'`" and value[0] != value[-1]:
+        value = value[:-1]
+    for opening, closing in (
+        ("&#39;", "&#39;"),
+        ("&#x27;", "&#x27;"),
+        ("&apos;", "&apos;"),
+        ("&quot;", "&quot;"),
+        ("%27", "%27"),
+        ("%22", "%22"),
+        ("&#34;", "&#34;"),
+        ("&#x22;", "&#x22;"),
+    ):
+        if value.casefold().startswith(opening.casefold()) and value.casefold().endswith(
+            closing.casefold()
+        ):
+            return value[len(opening) : -len(closing)]
+    return value
+
+
 def _contains_private_secret(path: Path, secrets: set[str]) -> bool:
     """Check that redacted credential literals did not survive in the staged file."""
     if not secrets:
@@ -338,7 +465,10 @@ def _contains_private_secret(path: Path, secrets: set[str]) -> bool:
     except OSError, ValueError:
         return True
     return any(
-        secret and re.search(rf"(?<!\w){re.escape(secret)}(?!\w)", text) for secret in secrets
+        len(secret) >= 4
+        and not secret.isdigit()
+        and re.search(rf"(?<!\w){re.escape(secret)}(?!\w)", text)
+        for secret in secrets
     )
 
 

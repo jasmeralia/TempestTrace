@@ -115,6 +115,10 @@ the binding field in `OBSBasic.*` JSON-valued INI assignments, including multili
 values; nested settings named `key` remain sensitive. Leave credential-free embedded
 JSON text byte-for-byte intact.
 
+Free-text credential assignments redact the full non-whitespace token. URL query
+redaction preserves a following named parameter such as `&region=us` while absorbing
+punctuation into the credential value when it does not begin another parameter.
+
 Streamlabs source settings must remain equivalent to the original at the parsed JSON
 subtree level, with one exception: values matching a known credential pattern (stream
 keys, tokens, passwords, etc.) are redacted in place, the same as any other detected

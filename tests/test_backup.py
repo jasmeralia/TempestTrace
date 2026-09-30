@@ -7,7 +7,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from threading import Barrier, Lock
+from threading import Barrier, Lock, Thread
 
 import pytest
 
@@ -532,6 +532,134 @@ def test_fifo_profile_is_skipped_without_blocking_and_source_is_unchanged(tmp_pa
         for item in manifest["skipped"]
     )
     assert "basic/profiles/default/service.json" in zipfile.ZipFile(result.archive).namelist()
+
+
+def test_read_consistent_rejects_fifo_without_blocking(tmp_path: Path) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO unsupported on this platform")
+    fifo = tmp_path / "blocked.txt"
+    os.mkfifo(fifo)
+    target = tmp_path / "target.txt"
+    errors: list[Exception] = []
+
+    def read_fifo() -> None:
+        try:
+            backup._read_consistent(fifo, target, 1024)
+        except Exception as error:
+            errors.append(error)
+
+    worker = Thread(target=read_fifo, daemon=True)
+    worker.start()
+    worker.join(timeout=10)
+    assert not worker.is_alive(), "FIFO read blocked"
+    assert len(errors) == 1 and isinstance(errors[0], backup.UnsupportedFileType)
+
+
+def test_create_backup_fifo_inventory_handler_collects_regular_files(
+    tmp_path: Path, monkeypatch
+) -> None:
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO unsupported on this platform")
+    source = fixture(tmp_path / "obs")
+    fifo = source / "basic/profiles/default/blocked.txt"
+    os.mkfifo(fifo)
+    ordinary = backup._inventory
+
+    def inventory_with_fifo(root: Path, skipped: list[dict[str, str]]) -> list[Path]:
+        return [*ordinary(root, skipped), fifo]
+
+    monkeypatch.setattr(backup, "_inventory", inventory_with_fifo)
+    destination = tmp_path / "out"
+    destination.mkdir()
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+        assert "basic/profiles/default/service.json" in archive.namelist()
+    assert any(
+        item["path"].endswith("blocked.txt") and item["reason"] == "unsupported_file_type"
+        for item in manifest["skipped"]
+    )
+
+
+def test_short_numeric_secret_does_not_omit_log_but_long_duplicate_is_caught(
+    tmp_path: Path,
+) -> None:
+    source = fixture(tmp_path / "obs")
+    log = source / "logs/2026-01-01.txt"
+    log.write_text("SortKey: 1\naudio_key: 0\nother=1 0\n", encoding="utf-8")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        assert "logs/2026-01-01.txt" in archive.namelist()
+        log_body = archive.read("logs/2026-01-01.txt")
+        assert b"SortKey: <REDACTED>" in log_body
+        assert b"other=1 0" in log_body
+
+    private = tmp_path / "duplicate.txt"
+    private.write_text("password=LONGSECRET123\ncopy LONGSECRET123\n", encoding="utf-8")
+    assert backup._contains_private_secret(private, {"LONGSECRET123"})
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "password=VALUE#TAIL\n",
+        "apitoken=<REDACTED>&x\n",
+        "serverpassword=<REDACTED>\\tail\n",
+        "?twitchtoken=VALUE#TAIL\n",
+        '{"key":"VALUE"}\n',
+    ],
+)
+def test_independent_signature_scan_rejects_redactor_blind_spots(
+    tmp_path: Path, monkeypatch, content: str
+) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(content, encoding="utf-8")
+    monkeypatch.setattr(backup, "has_unredacted_embedded_json", lambda _text: False)
+    monkeypatch.setattr(backup, "has_unredacted_fields", lambda *_args: False)
+    monkeypatch.setattr(backup, "has_unredacted_ini_fields", lambda *_args: False)
+    assert backup._secret_scan(path)
+
+
+def test_large_assignment_log_redact_and_verify_is_fast(tmp_path: Path) -> None:
+    path = tmp_path / "large.txt"
+    path.write_text("key=1\n" * ((2 * 1024 * 1024 + 5) // 6), encoding="utf-8")
+    assert path.stat().st_size >= 2 * 1024 * 1024
+    started = time.perf_counter()
+    backup.redact_file_with_secrets(path)
+    assert not backup._secret_scan(path)
+    assert time.perf_counter() - started < 8
+
+
+def test_realistic_token_console_log_redact_and_verify_is_fast(tmp_path: Path) -> None:
+    path = tmp_path / "console.txt"
+    line = (
+        "console: request token refreshed for browser source id=1234567890 status=ok "
+        "method=GET response=200 latency=32ms\n"
+    )
+    path.write_text(line * ((1024 * 1024 + len(line) - 1) // len(line)), encoding="utf-8")
+    assert path.stat().st_size >= 1024 * 1024
+    started = time.perf_counter()
+    backup.redact_file_with_secrets(path)
+    assert not backup._secret_scan(path)
+    assert time.perf_counter() - started < 8
+
+
+def test_backslash_assignment_name_is_fast(tmp_path: Path) -> None:
+    path = tmp_path / "hostile.txt"
+    path.write_text("key " + "\\" * 20000 + "\n", encoding="utf-8")
+    started = time.perf_counter()
+    backup.redact_file_with_secrets(path)
+    assert time.perf_counter() - started < 2
+
+
+def test_backslash_quoted_password_is_fast(tmp_path: Path) -> None:
+    path = tmp_path / "hostile.txt"
+    path.write_text('password="' + "\\" * 16000 + "\n", encoding="utf-8")
+    started = time.perf_counter()
+    backup.redact_file_with_secrets(path)
+    assert time.perf_counter() - started < 2
 
 
 @pytest.mark.parametrize(

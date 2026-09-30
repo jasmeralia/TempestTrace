@@ -478,7 +478,10 @@ def test_update_error_states_keep_collection_available(monkeypatch) -> None:
     assert app is not None
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="read-only HOME permissions are ineffective as root")
+@pytest.mark.skipif(
+    getattr(os, "geteuid", lambda: -1)() == 0,
+    reason="read-only HOME permissions are ineffective as root",
+)
 def test_flatpak_update_download_uses_writable_cache_when_home_is_read_only(
     tmp_path: Path, monkeypatch
 ) -> None:

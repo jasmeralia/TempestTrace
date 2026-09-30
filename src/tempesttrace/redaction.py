@@ -7,13 +7,16 @@ import re
 from pathlib import Path
 from typing import Any
 
-RULE_VERSION = 9
+RULE_VERSION = 10
 REDACTED = "<REDACTED>"
 _CREDENTIAL_NAME = (
     r"(?:key|stream[_ -]?key|api[_ -]?key|token|auth[_ -]?token|bearer[_ -]?token|"
     r"password|passwd|access[_ -]?token|client[_ -]?secret)"
 )
-_QUOTE_DELIMITER = r"(?:\\*['\"]|`|&(?:quot|apos);|&#0*(?:34|39);|&#x0*(?:22|27);|%22|[“”])"
+_QUOTE_DELIMITER = (
+    r"(?:\\*['\"]|`|&(?:quot|apos|ldquo|rdquo|lsquo|rsquo);|"
+    r"&#0*(?:34|39);|&#x0*(?:22|27);|%22|%27|[\u201c\u201d\u2018\u2019])"
+)
 _QUOTED_CREDENTIAL_VALUE = (
     r'(\\*"(?:\\[^\r\n]|[^"\\\r\n])*\\*"|'
     r"\\*'(?:\\[^\r\n]|[^'\\\r\n])*\\*'|"
@@ -21,21 +24,25 @@ _QUOTED_CREDENTIAL_VALUE = (
     r"&quot;[^\r\n]*?&quot;|&apos;[^\r\n]*?&apos;|"
     r"&#0*34;[^\r\n]*?&#0*34;|&#x0*22;[^\r\n]*?&#x0*22;|"
     r"&#0*39;[^\r\n]*?&#0*39;|&#x0*27;[^\r\n]*?&#x0*27;|"
-    r"%22[^\r\n]*?%22|“[^\r\n]*?”|"
+    r"%22[^\r\n]*?%22|%27[^\r\n]*?%27|"
+    r"&ldquo;[^\r\n]*?&rdquo;|&lsquo;[^\r\n]*?&rsquo;|"
+    r"\u201c[^\r\n]*?\u201d|\u2018[^\r\n]*?\u2019|"
     r"[^\s,;\]\\\"'`}]+)"
 )
 _COMMENT_SEPARATOR = (
-    r"(?:\s|/\*(?:[^\r\n]*?\*/|(?:(?!\*/)[^\r\n])*(?=[=:]))|"
+    r"(?:\s|/\*(?:(?:(?![{}])[\s\S])*?\*/|"
+    r"(?:(?!\*/)[^\r\n])*(?=[=:])|"
+    r"(?:(?![{}]|\*/)[\s\S])*?\r?\n\s*(?=[=:]))|"
     r"//[^\r\n]*(?:\r?\n\s*)?)*"
 )
 _LOG_PATTERNS = (
     re.compile(
-        rf"(?i)((?<![?&])(?<![A-Za-z0-9_])(?:%22)?{_CREDENTIAL_NAME}"
+        rf"(?i)((?<![?&])(?<![A-Za-z0-9_])(?:%22|%27)?{_CREDENTIAL_NAME}"
         rf"(?![A-Za-z0-9_]){_QUOTE_DELIMITER}?\s*[=:]\s*)"
         rf"({_QUOTED_CREDENTIAL_VALUE})"
     ),
     re.compile(
-        rf"(?i)((?<![?&])(?<![A-Za-z0-9_])(?:%22)?{_CREDENTIAL_NAME}"
+        rf"(?i)((?<![?&])(?<![A-Za-z0-9_])(?:%22|%27)?{_CREDENTIAL_NAME}"
         rf"(?![A-Za-z0-9_]){_QUOTE_DELIMITER}?"
         rf"{_COMMENT_SEPARATOR}[=:]{_COMMENT_SEPARATOR})"
         rf"({_QUOTED_CREDENTIAL_VALUE})"
@@ -101,13 +108,21 @@ def _is_sensitive_key(key: str, context: tuple[str, ...] = ()) -> bool:
 def _unquote(value: str) -> str:
     value = value.strip()
     entity_quoted = re.match(
-        r"(?i)^(&quot;|&apos;|&#0*34;|&#x0*22;|&#0*39;|&#x0*27;|%22)(.*?)(\1)$", value
+        r"(?i)^(&quot;|&apos;|&#0*34;|&#x0*22;|&#0*39;|&#x0*27;|%22|%27)(.*?)(\1)$", value
     )
     if entity_quoted:
         return entity_quoted.group(2)
+    for opening, closing in (
+        ("&ldquo;", "&rdquo;"),
+        ("&lsquo;", "&rsquo;"),
+        ("“", "”"),
+        ("\u2018", "\u2019"),
+    ):
+        if value.casefold().startswith(opening.casefold()) and value.casefold().endswith(
+            closing.casefold()
+        ):
+            return value[len(opening) : -len(closing)]
     if len(value) >= 2 and value[0] == value[-1] == "`":
-        return value[1:-1]
-    if len(value) >= 2 and value[0] == "“" and value[-1] == "”":
         return value[1:-1]
     quoted = re.match(r"^(\\*[\"'])(.*?)(\\*[\"'])$", value)
     if quoted and quoted.group(1).lstrip("\\") == quoted.group(3).lstrip("\\"):
@@ -117,14 +132,22 @@ def _unquote(value: str) -> str:
 
 def _quoted_redacted(value: str) -> str:
     entity_quoted = re.match(
-        r"(?i)^(&quot;|&apos;|&#0*34;|&#x0*22;|&#0*39;|&#x0*27;|%22)(.*?)(\1)$", value
+        r"(?i)^(&quot;|&apos;|&#0*34;|&#x0*22;|&#0*39;|&#x0*27;|%22|%27)(.*?)(\1)$", value
     )
     if entity_quoted:
         return f"{entity_quoted.group(1)}{REDACTED}{entity_quoted.group(3)}"
+    for opening, closing in (
+        ("&ldquo;", "&rdquo;"),
+        ("&lsquo;", "&rsquo;"),
+        ("“", "”"),
+        ("\u2018", "\u2019"),
+    ):
+        if value.casefold().startswith(opening.casefold()) and value.casefold().endswith(
+            closing.casefold()
+        ):
+            return f"{value[: len(opening)]}{REDACTED}{value[-len(closing) :]}"
     if len(value) >= 2 and value[0] == value[-1] == "`":
         return f"`{REDACTED}`"
-    if len(value) >= 2 and value[0] == "“" and value[-1] == "”":
-        return f"“{REDACTED}”"
     quoted = re.match(r"^(\\*[\"'])(.*?)(\\*[\"'])$", value)
     if quoted and quoted.group(1).lstrip("\\") == quoted.group(3).lstrip("\\"):
         return f"{quoted.group(1)}{REDACTED}{quoted.group(3)}"
@@ -218,6 +241,17 @@ def _json_fragments(text: str) -> list[tuple[int, int, Any, tuple[str, ...]]]:
             ):
                 assignment_end = max(0, line_start - 1)
                 continue
+            if previous_line.endswith("*/"):
+                comment_cursor = line_start
+                while comment_cursor > 0:
+                    comment_line_start = text.rfind("\n", 0, comment_cursor - 1) + 1
+                    comment_line = text[comment_line_start:comment_cursor].strip()
+                    if comment_line.startswith("/*"):
+                        assignment_end = max(0, comment_line_start - 1)
+                        break
+                    comment_cursor = max(0, comment_line_start - 1)
+                if assignment_end < line_start:
+                    continue
             break
         line_start = text.rfind("\n", 0, assignment_end) + 1
         assignment_prefix = text[line_start:assignment_end]

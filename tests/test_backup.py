@@ -423,7 +423,7 @@ def test_backup_redacts_credentials_hidden_by_comments_and_quote_entities(
         assert secret not in log
 
 
-@pytest.mark.parametrize("comment", ["// note\n", "/* note */\n"])
+@pytest.mark.parametrize("comment", ["// note\n", "/* note */\n", "/* note\n*/\n"])
 def test_backup_preserves_hotkey_binding_with_c_style_comment_before_json(
     tmp_path: Path, comment: str
 ) -> None:
@@ -455,10 +455,15 @@ def test_backup_includes_redacted_logs_with_mixed_quote_encodings(tmp_path: Path
     source = fixture(tmp_path / "obs")
     (source / "logs/2026-01-01.txt").write_text(
         '{"token" /* note: "<REDACTED>" more : "UNCLOSED_SECOND_SECRET"}\n'
+        '{"token" /*\n: "UNCLOSED_MULTILINE_SECRET"}\n'
+        '{"token" /*\nnote\n*/ : "CLOSED_MULTILINE_SECRET"}\n'
         "password: &#39;ENTITY_QUOTE_SECRET&#39;\n"
         "token: `BACKTICK_QUOTE_SECRET`\n"
         "{“token”: “CURLY_QUOTE_SECRET”}\n"
         "{%22token%22:%22PERCENT_QUOTE_SECRET%22}\n"
+        "{%27password%27:%27PERCENT_APOS_SECRET%27}\n"
+        "{\u2018token\u2019: \u2018CURLY_APOS_VALUE\u2019}\n"
+        "{&ldquo;token&rdquo;:&ldquo;NAMED_CURLY_SECRET&rdquo;}\n"
         "filter chroma color key /* note */: #00ff00\n"
         "hotkey binding key // note\n: F9\n",
         encoding="utf-8",
@@ -475,10 +480,15 @@ def test_backup_includes_redacted_logs_with_mixed_quote_encodings(tmp_path: Path
         log = archive.read(name).decode("utf-8")
     for secret in (
         "UNCLOSED_SECOND_SECRET",
+        "UNCLOSED_MULTILINE_SECRET",
+        "CLOSED_MULTILINE_SECRET",
         "ENTITY_QUOTE_SECRET",
         "BACKTICK_QUOTE_SECRET",
         "CURLY_QUOTE_SECRET",
         "PERCENT_QUOTE_SECRET",
+        "PERCENT_APOS_SECRET",
+        "CURLY_APOS_VALUE",
+        "NAMED_CURLY_SECRET",
     ):
         assert secret not in log
     assert "key /* note */: #00ff00" in log
@@ -492,6 +502,9 @@ def test_backup_includes_redacted_logs_with_mixed_quote_encodings(tmp_path: Path
         "token: `<REDACTED>`",
         "{“token”: “<REDACTED>”}",
         "{%22token%22:%22<REDACTED>%22}",
+        "{%27password%27:%27<REDACTED>%27}",
+        "{\u2018token\u2019: \u2018<REDACTED>\u2019}",
+        "{&ldquo;token&rdquo;:&ldquo;<REDACTED>&rdquo;}",
     ],
 )
 def test_private_verifier_accepts_redacted_values_with_encoded_quotes(

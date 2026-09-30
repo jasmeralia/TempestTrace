@@ -153,6 +153,8 @@ def test_credential_free_embedded_json_keeps_its_original_formatting(tmp_path: P
         '{"token" // note\n: "SLASH_COMMENT_SECRET"}',
         '{"token" /* unclosed : "UNCLOSED_COMMENT_SECRET"}',
         '{"token" /* note: "<REDACTED>" more : "UNCLOSED_SECOND_SECRET"}',
+        '{"token" /*\n: "UNCLOSED_MULTILINE_SECRET"}',
+        '{"token" /*\nnote\n*/ : "CLOSED_MULTILINE_SECRET"}',
         '{"token" /* &#39;password&#39;:&#39;NESTED_COMMENT_SECRET&#39; */'
         ' : "OUTER_COMMENT_SECRET"}',
         "{&quot;token&quot;:&quot;HTML_SECRET&quot;}",
@@ -166,6 +168,9 @@ def test_credential_free_embedded_json_keeps_its_original_formatting(tmp_path: P
         "{`token`: `BACKTICK_SECRET`}",
         "{“token”: “CURLY_QUOTE_SECRET”}",
         "{%22token%22:%22PERCENT_QUOTE_SECRET%22}",
+        "{%27password%27:%27PERCENT_APOS_SECRET%27}",
+        "{\u2018token\u2019: \u2018CURLY_APOS_VALUE\u2019}",
+        "{&ldquo;token&rdquo;:&ldquo;NAMED_CURLY_SECRET&rdquo;}",
     ],
 )
 def test_non_strict_quoted_credential_text_is_redacted(tmp_path: Path, line: str) -> None:
@@ -199,6 +204,11 @@ def test_non_strict_quoted_credential_text_is_redacted(tmp_path: Path, line: str
         "UNCLOSED_SECOND_SECRET",
         "CURLY_QUOTE_SECRET",
         "PERCENT_QUOTE_SECRET",
+        "UNCLOSED_MULTILINE_SECRET",
+        "CLOSED_MULTILINE_SECRET",
+        "PERCENT_APOS_SECRET",
+        "CURLY_APOS_VALUE",
+        "NAMED_CURLY_SECRET",
     ):
         assert secret not in cleaned
 

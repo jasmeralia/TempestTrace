@@ -3,7 +3,15 @@ from pathlib import Path
 
 import pytest
 
-from tempesttrace.redaction import _is_sensitive_key, has_unredacted_fields, redact_file
+from tempesttrace.backup import _secret_scan
+from tempesttrace.redaction import (
+    RULE_VERSION,
+    _is_sensitive_key,
+    has_unredacted_embedded_json,
+    has_unredacted_fields,
+    has_unredacted_ini_fields,
+    redact_file,
+)
 
 
 def test_structured_redaction_preserves_other_values(tmp_path: Path) -> None:
@@ -413,3 +421,181 @@ def test_duplicate_credentials_under_nonsensitive_keys_are_counted(tmp_path: Pat
     }
     assert categories == {"credential_field": 3}
     assert count == 3
+
+
+@pytest.mark.parametrize("scheme", ["rtmp", "RTMPS", "rtmpe", "rtmpt", "rtmpte", "rtmfp"])
+def test_rtmp_family_stream_key_redaction_preserves_punctuation_and_query(
+    tmp_path: Path, scheme: str
+) -> None:
+    path = tmp_path / "network.txt"
+    path.write_text(
+        f"{scheme}://host:1935/app/live_SECRET?quality=high...\n",
+        encoding="utf-8",
+    )
+    categories, count = redact_file(path)
+    assert path.read_text(encoding="utf-8") == (
+        f"{scheme}://host:1935/app/<REDACTED>?quality=high...\n"
+    )
+    assert categories == {"credential_pattern": 1} and count == 1
+    assert not _secret_scan(path)
+
+
+@pytest.mark.parametrize("punctuation", [",", ")", '"', "'", "..."])
+def test_rtmp_key_redaction_preserves_attached_sentence_punctuation(
+    tmp_path: Path, punctuation: str
+) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(f"connect rtmp://host/app/key_SECRET{punctuation}\n", encoding="utf-8")
+    redact_file(path)
+    assert path.read_text(encoding="utf-8") == (
+        f"connect rtmp://host/app/<REDACTED>{punctuation}\n"
+    )
+
+
+def test_rtmp_single_segment_is_preserved_and_query_secrets_redacted(tmp_path: Path) -> None:
+    path = tmp_path / "service.json"
+    path.write_text(
+        json.dumps(
+            {
+                "one": "rtmp://live.twitch.tv/app",
+                "two": "rtmps://a.rtmps.youtube.com:443/live2",
+                "srt": "srt://host:9000?streamid=publish:live/SID&passphrase=PASS",
+            }
+        ),
+        encoding="utf-8",
+    )
+    redact_file(path)
+    value = json.loads(path.read_text(encoding="utf-8"))
+    assert value["one"] == "rtmp://live.twitch.tv/app"
+    assert value["two"] == "rtmps://a.rtmps.youtube.com:443/live2"
+    assert "SID" not in value["srt"] and "PASS" not in value["srt"]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "passphrase",
+        "pwd",
+        "cookie",
+        "cookies",
+        "sessionid",
+        "session_id",
+        "jwt",
+        "credential",
+        "credentials",
+        "streamid",
+        "SESSION-ID",
+    ],
+)
+def test_new_sensitive_field_names_redacted_and_verified(tmp_path: Path, name: str) -> None:
+    path = tmp_path / "service.json"
+    path.write_text(json.dumps({name: "FIELD_SECRET"}), encoding="utf-8")
+    redact_file(path)
+    assert json.loads(path.read_text(encoding="utf-8"))[name] == "<REDACTED>"
+    assert not has_unredacted_fields({name: "<REDACTED>"})
+    assert has_unredacted_fields({name: "FIELD_SECRET"})
+
+
+def test_false_positive_fields_and_single_segment_url_are_preserved(tmp_path: Path) -> None:
+    original = {
+        "use_auth": True,
+        "auth_type": "basic",
+        "key_color": "#00ff00",
+        "key_color_type": 1,
+        "keyint_sec": 2,
+        "hotkeys": [{"key": "F9"}],
+        "server": "rtmp://live.twitch.tv/app",
+    }
+    path = tmp_path / "scene.json"
+    path.write_text(json.dumps(original), encoding="utf-8")
+    redact_file(path)
+    assert json.loads(path.read_text(encoding="utf-8")) == original
+    assert not _is_sensitive_key("auth") and not _is_sensitive_key("pass")
+    assert not _is_sensitive_key("signature")
+
+
+def test_url_embedded_stream_key_is_collected_for_document_wide_scrubbing(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "service.json"
+    path.write_text(
+        json.dumps(
+            {"server": "rtmp://host/app/SAME_STREAM_SECRET", "mirror": "SAME_STREAM_SECRET"}
+        ),
+        encoding="utf-8",
+    )
+    redact_file(path)
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "server": "rtmp://host/app/<REDACTED>",
+        "mirror": "<REDACTED>",
+    }
+
+
+def test_nonsecret_obs_ini_values_and_obsbasic_hotkey_survive(tmp_path: Path) -> None:
+    path = tmp_path / "basic.ini"
+    original = (
+        "use_auth=true\nauth_type=basic\nkey_color=#00ff00\nkey_color_type=1\n"
+        'keyint_sec=2\nOBSBasic.StartStreaming={"key":"F9"}\n'
+    )
+    path.write_text(original, encoding="utf-8")
+    redact_file(path)
+    assert path.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize("filename", ["service.json", "basic.ini", "network.txt"])
+def test_url_path_and_query_secrets_are_detected_in_all_formats(
+    tmp_path: Path, filename: str
+) -> None:
+    value = "rtmp://host/app/STREAM_SECRET?passphrase=PASS_SECRET&streamid=SID_SECRET"
+    path = tmp_path / filename
+    content = (
+        json.dumps({"server": value})
+        if filename.endswith(".json")
+        else (f"server={value}\n" if filename.endswith(".ini") else f"Connecting to {value}...\n")
+    )
+    path.write_text(content, encoding="utf-8")
+    assert backup_secret_scan(path)
+    redact_file(path)
+    cleaned = path.read_text(encoding="utf-8")
+    for secret in ("STREAM_SECRET", "PASS_SECRET", "SID_SECRET"):
+        assert secret not in cleaned
+    assert not backup_secret_scan(path)
+    if filename.endswith(".json"):
+        assert not has_unredacted_fields(json.loads(cleaned))
+    elif filename.endswith(".ini"):
+        assert not has_unredacted_ini_fields(cleaned, filename)
+    else:
+        assert not has_unredacted_embedded_json(cleaned)
+
+
+def backup_secret_scan(path: Path) -> bool:
+    return _secret_scan(path)
+
+
+def test_rule_version_is_eleven() -> None:
+    assert RULE_VERSION == 11
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "passphrase",
+        "pwd",
+        "cookie",
+        "cookies",
+        "session_id",
+        "jwt",
+        "credential",
+        "credentials",
+        "streamid",
+    ],
+)
+def test_new_log_credential_assignments_are_redacted_and_verified(
+    tmp_path: Path, name: str
+) -> None:
+    path = tmp_path / "network.txt"
+    path.write_text(f"{name}=LOG_SECRET\n", encoding="utf-8")
+    assert backup_secret_scan(path)
+    redact_file(path)
+    assert path.read_text(encoding="utf-8") == f"{name}=<REDACTED>\n"
+    assert not backup_secret_scan(path)

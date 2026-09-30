@@ -257,6 +257,122 @@ def test_racing_final_file_is_not_replaced_during_promotion(
         assert archive.testzip() is None
 
 
+@pytest.mark.parametrize("fallback", ["link", "rename"])
+def test_rename_noreplace_falls_back_without_replacing_existing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fallback: str
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_bytes(b"new")
+    destination.write_bytes(b"old")
+
+    def unsupported_renameat2(_source: Path, _destination: Path) -> None:
+        raise OSError(backup.errno.EINVAL, "unsupported")
+
+    monkeypatch.setattr(backup, "_renameat2_call", unsupported_renameat2)
+    if fallback == "link":
+        with pytest.raises(FileExistsError):
+            backup._rename_noreplace(source, destination)
+    else:
+
+        def unsupported_link(*_args: object, **_kwargs: object) -> None:
+            raise OSError(backup.errno.EPERM, "unsupported")
+
+        monkeypatch.setattr(backup.os, "link", unsupported_link)
+        with pytest.raises(FileExistsError):
+            backup._rename_noreplace(source, destination)
+    assert destination.read_bytes() == b"old"
+
+
+@pytest.mark.parametrize(
+    "link_errno",
+    [
+        backup.errno.EPERM,
+        backup.errno.ENOTSUP,
+        backup.errno.EOPNOTSUPP,
+        backup.errno.EINVAL,
+        backup.errno.ENOSYS,
+    ],
+)
+def test_rename_noreplace_fallback_matrix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, link_errno: int
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_bytes(b"content")
+
+    def unavailable(_source: Path, _destination: Path) -> None:
+        raise OSError(backup.errno.EINVAL, "unsupported")
+
+    monkeypatch.setattr(backup, "_renameat2_call", unavailable)
+    backup._rename_noreplace(source, destination)
+    assert destination.read_bytes() == b"content" and not source.exists()
+
+    source.write_bytes(b"rename")
+
+    def unsupported_link(*_args: object, **_kwargs: object) -> None:
+        raise OSError(link_errno, "unsupported")
+
+    monkeypatch.setattr(backup.os, "link", unsupported_link)
+    backup._rename_noreplace(source, destination.with_name("renamed"))
+    assert destination.with_name("renamed").read_bytes() == b"rename"
+
+    def other_error(_source: Path, _destination: Path) -> None:
+        raise OSError(backup.errno.EIO, "other")
+
+    monkeypatch.setattr(backup, "_renameat2_call", other_error)
+    with pytest.raises(OSError) as error:
+        backup._rename_noreplace(source, destination.with_name("other"))
+    assert error.value.errno == backup.errno.EIO
+
+
+def test_rename_noreplace_preserves_renameat2_eexist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_bytes(b"new")
+    destination.write_bytes(b"old")
+
+    def collision(_source: Path, _destination: Path) -> None:
+        raise FileExistsError(backup.errno.EEXIST, "exists")
+
+    monkeypatch.setattr(backup, "_renameat2_call", collision)
+    with pytest.raises(FileExistsError):
+        backup._rename_noreplace(source, destination)
+    assert destination.read_bytes() == b"old"
+
+
+def test_backup_redacts_rtmp_and_srt_secrets_everywhere_without_source_writes(
+    tmp_path: Path,
+) -> None:
+    source = fixture(tmp_path / "obs")
+    service = source / "basic/profiles/default/service.json"
+    original_service = (
+        '{"type":"rtmp_custom","settings":{"server":"rtmp://live.example.com/app/'
+        'LIVE_SECRET_123","key":"","srt":"srt://host:9000?streamid=publish:live/'
+        'SRT_ID_SECRET&passphrase=SRT_PASS_SECRET"}}'
+    )
+    service.write_text(original_service, encoding="utf-8")
+    log = source / "logs/2026-01-01.txt"
+    original_log = (
+        "[obs-outputs] Connecting to RTMP URL rtmp://live.example.com/app/LIVE_SECRET_123...\n"
+        "SRT srt://host:9000?streamid=publish:live/SRT_ID_SECRET&passphrase=SRT_PASS_SECRET\n"
+    )
+    log.write_text(original_log, encoding="utf-8")
+    before = {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()}
+    destination = tmp_path / "out"
+    destination.mkdir()
+    result = create_backup(source, destination)
+    assert before == {
+        p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()
+    }
+    with zipfile.ZipFile(result.archive) as archive:
+        contents = b"\n".join(archive.read(name) for name in archive.namelist())
+        for secret in (b"LIVE_SECRET_123", b"SRT_ID_SECRET", b"SRT_PASS_SECRET"):
+            assert secret not in contents
+
+
 def test_cancel_leaves_marked_incomplete_stage(tmp_path: Path) -> None:
     source = fixture(tmp_path / "obs")
     destination = tmp_path / "out"

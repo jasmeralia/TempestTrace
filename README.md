@@ -51,7 +51,8 @@ profiles, scene collections, recent logs, and a readable manifest. The utility w
 never stop OBS or change its source files.
 
 The collector copies an explicit set of OBS profile, scene, global settings, and recent
-log files; it redacts recognized credential fields and patterns in staged copies and
+log files; it redacts recognized credential fields and patterns in staged copies,
+including RTMP-family stream-key path segments and SRT `passphrase`/`streamid` values, and
 writes a timestamped ZIP, README, and manifest. Review skipped files and warnings in
 the manifest after collection.
 

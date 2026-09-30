@@ -35,8 +35,10 @@ MAX_TOTAL_SIZE = 512 * 1024 * 1024
 MAX_LOG_FILES = 5
 ALLOWED_PROFILE_SUFFIXES = {".ini", ".json", ".txt"}
 _SECRET_SCAN = re.compile(
-    r"(?i)((?:\bkey|api[_ -]?key|stream[_ -]?key|token|auth[_ -]?token|"
-    r"bearer[_ -]?token|password|passwd|access[_ -]?token|client[_ -]?secret|secret)"
+    r"(?i)((?<![?&])(?:\bkey|api[_ -]?key|stream[_ -]?key|token|auth[_ -]?token|"
+    r"bearer[_ -]?token|password|passwd|pwd|passphrase|access[_ -]?token|"
+    r"client[_ -]?secret|refresh_token|session[_ -]?id|sessionid|stream[_ -]?id|"
+    r"streamid|cookie|cookies|jwt|credential|credentials|secret)"
     r"\s*[=:]\s*)"
     r"(?:\\*\"[^\"\r\n]*\\*\"|\\*'[^'\r\n]*\\*'|"
     r"&quot;[^\r\n]*?&quot;|&apos;[^\r\n]*?&apos;|"
@@ -163,13 +165,39 @@ def _private_temp_directory(target_dir: Path, prefix: str) -> Path:
 
 def _rename_noreplace(source: Path, destination: Path) -> None:
     """Atomically rename a file without replacing any existing destination."""
-    if not sys.platform.startswith("linux"):
-        os.rename(source, destination)
+    unsupported_rename = {errno.EINVAL, errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP}
+    unsupported_link = unsupported_rename | {errno.EPERM}
+    try:
+        if not sys.platform.startswith("linux"):
+            raise OSError(errno.ENOTSUP, "renameat2 is unavailable", destination)
+        _renameat2_call(source, destination)
         return
+    except OSError as error:
+        if error.errno == errno.EEXIST:
+            raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), destination) from error
+        if error.errno not in unsupported_rename:
+            raise
+
+    try:
+        os.link(source, destination)
+    except FileExistsError:
+        raise
+    except OSError as error:
+        if error.errno not in unsupported_link:
+            raise
+        if os.path.lexists(destination):
+            raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), destination) from error
+        os.rename(source, destination)
+    else:
+        os.unlink(source)
+
+
+def _renameat2_call(source: Path, destination: Path) -> None:
+    """Call Linux renameat2 with RENAME_NOREPLACE, raising its errno on failure."""
     libc = ctypes.CDLL(None, use_errno=True)
     renameat2 = getattr(libc, "renameat2", None)
     if renameat2 is None:
-        raise OSError(errno.ENOTSUP, "atomic no-replace rename is unavailable", destination)
+        raise OSError(errno.ENOTSUP, "renameat2 is unavailable", destination)
     renameat2.argtypes = [
         ctypes.c_int,
         ctypes.c_char_p,

@@ -17,7 +17,7 @@ the complete package matrix and checksums, then publishes a beta prerelease.
 - DEB: `dpkg-deb` (Ubuntu runner package `dpkg`).
 - RPM: `rpmbuild` (Ubuntu runner package `rpm`; the workflow install-smokes the
   RPM in the Fedora 42 container).
-- AppImage: `appimagetool` 13 from the AppImageKit GitHub release.
+- AppImage: `appimagetool` 1.9.1 from the `AppImage/appimagetool` release, verified by SHA-256.
 - Flatpak: Flatpak 1.14 or newer, Flathub's pinned Freedesktop 26.08 runtime
   and SDK for the host architecture.
 - Snap: Snapcraft's `8.x/stable` channel and the core24 base. Local installation

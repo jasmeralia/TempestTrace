@@ -7,11 +7,13 @@ import re
 from pathlib import Path
 from typing import Any
 
-RULE_VERSION = 10
+RULE_VERSION = 11
 REDACTED = "<REDACTED>"
 _CREDENTIAL_NAME = (
     r"(?:key|stream[_ -]?key|api[_ -]?key|token|auth[_ -]?token|bearer[_ -]?token|"
-    r"password|passwd|access[_ -]?token|client[_ -]?secret)"
+    r"password|passwd|pwd|passphrase|access[_ -]?token|client[_ -]?secret|"
+    r"refresh_token|session[_ -]?id|sessionid|stream[_ -]?id|streamid|"
+    r"cookie|cookies|jwt|credential|credentials)"
 )
 _QUOTE_DELIMITER = (
     r"(?:\\*['\"]|`|&(?:quot|apos|ldquo|rdquo|lsquo|rsquo);|"
@@ -50,8 +52,14 @@ _LOG_PATTERNS = (
     re.compile(r"(?i)(\bAuthorization:\s*(?:Bearer|Basic)\s+)([^\s,;]+)"),
 )
 _URL_QUERY_SECRET = re.compile(
-    r"(?i)([?&](?:token|key|api[_-]?key|access[_-]?token|auth[_-]?token)=)"
+    r"(?i)([?&](?:token|key|api[_-]?key|access[_-]?token|auth[_-]?token|"
+    r"passphrase|stream[_-]?id|password|passwd|pwd|secret|client_secret|"
+    r"refresh_token|session[_-]?id|jwt|cookie)=)"
     r"([^&#\s\"'<>]+)"
+)
+_RTMP_STREAM_KEY = re.compile(
+    r"(?i)\b((?:rtmp|rtmps|rtmpe|rtmpt|rtmpte|rtmfp)://[^/?#\s\"'<>]+/"
+    r"(?:[^/?#\s\"'<>]+/)+)([^/?#\s\"'<>]+)"
 )
 _STREAMLABS_WIDGET_TOKEN = re.compile(
     r"(?i)(https?://(?:www\.)?streamlabs\.com/(?:widgets/)?[^/?#\s]+/v\d+/)"
@@ -81,6 +89,15 @@ def _is_sensitive_key(key: str, context: tuple[str, ...] = ()) -> bool:
         "clientsecret",
         "secret",
         "authorization",
+        "passphrase",
+        "pwd",
+        "cookie",
+        "cookies",
+        "sessionid",
+        "jwt",
+        "credential",
+        "credentials",
+        "streamid",
     }
     if normalized == "key":
         if context and context[-1] == "__obsbasic_hotkey_binding__":
@@ -198,6 +215,7 @@ def is_noncredential_log_match(_text: str, match: re.Match[str]) -> bool:
 
 def _embedded_secrets(text: str) -> set[str]:
     values = {match.group(2) for match in _URL_QUERY_SECRET.finditer(text)}
+    values.update(_rtmp_key(match.group(2)) for match in _RTMP_STREAM_KEY.finditer(text))
     values.update(match.group(2) for match in _STREAMLABS_WIDGET_TOKEN.finditer(text))
     for pattern in _LOG_PATTERNS:
 
@@ -210,6 +228,11 @@ def _embedded_secrets(text: str) -> set[str]:
     for _start, _end, value, context in _json_fragments(text):
         values.update(_credential_values(value, context))
     return {value for value in values if value and value != REDACTED}
+
+
+def _rtmp_key(value: str) -> str:
+    """Drop sentence punctuation accidentally attached to a URL path segment."""
+    return value.rstrip(".,;:!?)]}\\'\u201d\u2019")
 
 
 def _json_fragments(text: str) -> list[tuple[int, int, Any, tuple[str, ...]]]:
@@ -333,6 +356,16 @@ def _redact_embedded(text: str, counts: dict[str, int], secrets: set[str] | None
             cursor = end
         pieces.append(text[cursor:])
         text = "".join(pieces)
+
+    def redact_rtmp(match: re.Match[str]) -> str:
+        key = _rtmp_key(match.group(2))
+        if not key or key == REDACTED:
+            return match.group(0)
+        trailing = match.group(2)[len(key) :]
+        counts["credential_pattern"] = counts.get("credential_pattern", 0) + 1
+        return f"{match.group(1)}{REDACTED}{trailing}"
+
+    text = _sub_outside_json(text, _RTMP_STREAM_KEY, redact_rtmp)
     text = _sub_outside_json(text, _URL_QUERY_SECRET, replace)
     text = _sub_outside_json(text, _STREAMLABS_WIDGET_TOKEN, replace)
     for pattern in _LOG_PATTERNS:
@@ -393,6 +426,10 @@ def has_unredacted_fields(value: Any, context: tuple[str, ...] = ()) -> bool:
 def has_unredacted_embedded_json(text: str) -> bool:
     """Check JSON-like credential assignments embedded in other text."""
     if any(has_unredacted_fields(value, context) for _, _, value, context in _json_fragments(text)):
+        return True
+    if any(_rtmp_key(match.group(2)) != REDACTED for match in _RTMP_STREAM_KEY.finditer(text)):
+        return True
+    if any(_unquote(match.group(2)) != REDACTED for match in _URL_QUERY_SECRET.finditer(text)):
         return True
     for pattern in _LOG_PATTERNS:
         for start, end in _outside_json_segments(text):

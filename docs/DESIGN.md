@@ -96,7 +96,8 @@ Redact only the staged copies. Parse JSON structurally and INI files by section/
 do not apply broad string replacements to scene or profile files. Preserve every
 non-secret value, key order where practical, scene/source object, and diagnostic
 setting. Start with explicit sensitive fields such as OBS service `key`,
-`bearer_token`, `password`, authentication tokens, and client secrets. Scan logs for
+`bearer_token`, `password`, authentication tokens, and client secrets. Redact stream-key
+path segments of RTMP-family URLs and SRT `passphrase`/`streamid` values. Scan logs for
 known credential patterns and redact matching values while keeping the surrounding
 diagnostic line. Maintain a versioned field/path rule list and fixtures taken from
 synthetic OBS data; never commit Rin's real configuration or log samples.

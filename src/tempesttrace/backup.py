@@ -23,7 +23,6 @@ from pathlib import Path
 from urllib.parse import quote, quote_plus
 
 from tempesttrace.redaction import (
-    _SCHEME_NAMES,
     _SENSITIVE_FREE_NAME,
     REDACTED,
     RULE_VERSION,
@@ -46,6 +45,7 @@ from tempesttrace.redaction import (
     has_unredacted_ini_fields,
     read_text_safely,
     redact_file_with_secrets,
+    resolve_credential_token,
 )
 
 MAX_FILE_SIZE = 32 * 1024 * 1024
@@ -501,15 +501,10 @@ def _independent_secret_scan(text: str) -> bool:  # noqa: PLR0912
         if _is_weak_camel_key(name) and not _looks_like_key_material(unquoted):
             continue
         if normalized == "authorization" or _is_sensitive_signature_name(name):
-            parts = unquoted.split(None, 1)
-            if parts and parts[0].casefold() in _SCHEME_NAMES:
-                if len(parts) == 1:
-                    continue
-                tail = text[match.end("value") :]
-                next_value = re.match(r"[ \t]+([^\s,;]+)", tail)
-                if next_value and _unwrap_signature_value(next_value.group(1)) == "<REDACTED>":
-                    continue
-                if _unwrap_signature_value(parts[1].split(None, 1)[0]) == "<REDACTED>":
+            resolved = resolve_credential_token(text, match.start("value"))
+            if resolved is not None and resolved[0] > match.start("value"):
+                resolved_value = _unwrap_signature_value(text[resolved[0] : resolved[1]])
+                if resolved_value == "<REDACTED>":
                     continue
         return True
     if _has_sensitive_query_assignment(text):

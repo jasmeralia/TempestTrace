@@ -2159,6 +2159,145 @@ def test_round4_end_to_end_structural_redaction_keeps_scene_ini_and_log(tmp_path
     assert after == before
 
 
+def test_round8_scheme_credentials_scrub_scene_and_second_log_copies(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    planted = {
+        "AUTH_NEXTLINE_G8_123456": (
+            "14:22:01.123: [obs-browser] Authorization:\n    Bearer AUTH_NEXTLINE_G8_123456\n"
+        ),
+        "TOKEN_DOUBLE_G8_123456": "token: Bearer token TOKEN_DOUBLE_G8_123456\n",
+        "TOKEN_COLON_G8_123456": "password: Basic: TOKEN_COLON_G8_123456\n",
+    }
+    (source / "logs/2026-01-01.txt").write_text("".join(planted.values()), encoding="utf-8")
+    (source / "logs/2026-01-02.txt").write_text(
+        "Copies: AUTH_NEXTLINE_G8_123456 TOKEN_DOUBLE_G8_123456 TOKEN_COLON_G8_123456\n",
+        encoding="utf-8",
+    )
+    (source / "basic/scenes/main.json").write_text(
+        json.dumps({"sources": [], "scene_name": "AUTH_NEXTLINE_G8_123456"}), encoding="utf-8"
+    )
+
+    result = create_backup(source, destination)
+
+    with zipfile.ZipFile(result.archive) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+    payload = b"".join(members.values())
+    assert all(secret.encode() not in payload for secret in planted)
+    scene = json.loads(members["basic/scenes/main.json"])
+    assert scene["scene_name"] == "<REDACTED>"
+    log = members["logs/2026-01-01.txt"].decode()
+    assert "Bearer <REDACTED>" in log
+    assert not result.warnings
+
+
+def test_authorization_and_cookie_promotion_preserves_prose_and_scrubs_real_values(
+    tmp_path: Path,
+) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    prose = [
+        "Failed Overlay",
+        "Failed to open encoder",
+        "connection failed",
+        "WebSocket session started",
+        "jim_nvenc_h264",
+    ]
+    copies = ["AUTH_SCHEME_G8_123456", "COOKIE_PAIR_G8_123456", "Qk7mN2pL9xR4"]
+    (source / "logs/2026-01-01.txt").write_text(
+        "Authorization: failed to authenticate\n"
+        "Cookie: session\n"
+        "Authorization: Bearer AUTH_SCHEME_G8_123456\n"
+        "Cookie: sid=COOKIE_PAIR_G8_123456; theme=dark\n"
+        "Authorization: Qk7mN2pL9xR4\n",
+        encoding="utf-8",
+    )
+    (source / "basic/scenes/main.json").write_text(
+        json.dumps({"sources": [], "scene_name": "Failed Overlay", "note": " ".join(copies)}),
+        encoding="utf-8",
+    )
+    (source / "logs/2026-01-02.txt").write_text("\n".join([*prose[1:], *copies]), encoding="utf-8")
+
+    result = create_backup(source, destination)
+
+    with zipfile.ZipFile(result.archive) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+    payload = b"".join(members.values())
+    assert all(secret.encode() not in payload for secret in copies)
+    scene = json.loads(members["basic/scenes/main.json"])
+    assert scene["scene_name"] == "Failed Overlay"
+    for expected in prose:
+        assert expected.encode() in payload
+    assert not result.warnings
+
+
+@pytest.mark.parametrize(
+    "label",
+    ["token", "password", "key", "secret", "pwd", "Authorization", "Proxy-Authorization", "Cookie"],
+)
+@pytest.mark.parametrize(
+    "scheme", ["Bearer", "Basic", "Digest", "Token", "Bot", "ApiKey", "AWS4-HMAC-SHA256"]
+)
+@pytest.mark.parametrize(
+    "form",
+    [
+        "space",
+        "tab",
+        "quoted",
+        "trailing-colon",
+        "double-scheme",
+        "next-line",
+        "scheme-next-line",
+        "blank-lines",
+        "yaml-block",
+    ],
+)
+def test_scheme_label_form_matrix_scrubs_backup_copies(
+    tmp_path: Path, label: str, scheme: str, form: str
+) -> None:
+    secret = "BACKUPMATRIXSECRET123456"
+    values = {
+        "space": f"{scheme} {secret}",
+        "tab": f"{scheme}\t{secret}",
+        "quoted": f'"{scheme} {secret}"',
+        "trailing-colon": f"{scheme}: {secret}",
+        "double-scheme": f"{scheme} token {secret}",
+        "next-line": f"\n    {scheme} {secret}",
+        "scheme-next-line": f"{scheme}\n    {secret}",
+        "blank-lines": f"{scheme}\n\n      {secret}",
+        "yaml-block": f"|\n    {secret}",
+    }
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    (source / "logs/2026-01-01.txt").write_text(
+        f"{label}: {values[form]}\nordinary diagnostic line\n", encoding="utf-8"
+    )
+    (source / "logs/2026-01-02.txt").write_text(f"copy={secret}\n", encoding="utf-8")
+    (source / "basic/scenes/main.json").write_text(
+        json.dumps({"sources": [], "scene_name": f"scene {secret}"}), encoding="utf-8"
+    )
+
+    result = create_backup(source, destination)
+
+    with zipfile.ZipFile(result.archive) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+    payload = b"".join(members.values())
+    assert secret.encode() not in payload
+    cleaned_log = members["logs/2026-01-01.txt"].decode()
+    assert "ordinary diagnostic line" in cleaned_log
+    if form == "yaml-block":
+        assert f"{label}: |\n    <REDACTED>" in cleaned_log
+    else:
+        assert scheme in cleaned_log
+    assert members["logs/2026-01-02.txt"].decode().strip() == "copy=<REDACTED>"
+    scene = json.loads(members["basic/scenes/main.json"])
+    assert scene["scene_name"] == "scene <REDACTED>"
+    assert not result.warnings
+
+
 @pytest.mark.parametrize("line", ["[" * 100000, "x" * (512 * 1024 + 1)])
 def test_unsafe_deep_or_long_log_is_omitted_and_backup_continues(tmp_path: Path, line: str) -> None:
     source = fixture(tmp_path / "obs")

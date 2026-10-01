@@ -9,7 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-RULE_VERSION = 20
+RULE_VERSION = 21
 REDACTED = "<REDACTED>"
 _QUOTE_DELIMITER = (
     r"(?:\\*['\"]|`|&(?:quot|apos|ldquo|rdquo|lsquo|rsquo);|"
@@ -171,6 +171,7 @@ _CLI_ASSIGNMENT = re.compile(
     r"(?i)(?<!\S)(--?[A-Za-z0-9_.-]+(?:[ \t]*[=:][ \t]*|[ \t]+))([^\s-][^\s]*)"
 )
 _COOKIE_HEADER = re.compile(r"(?im)^([ \t]*(?:set-cookie|cookie)[ \t]*:[ \t]*)([^\r\n]*)")
+_COOKIE_PAIR = re.compile(r"(?:^|;)[ \t]*[^=;\s]+[ \t]*=[ \t]*([^;\s]+)")
 _AUTH_HEADER = re.compile(
     r"(?im)^([ \t]*[A-Za-z0-9_.-]*authorization[ \t]*[=:][ \t]*)([^\s,;]+)(?:[ \t]+([^\s,;]+))?"
 )
@@ -273,7 +274,7 @@ def _never_promote_literal(value: str) -> bool:
         not cleaned
         or cleaned == REDACTED
         or folded in {"null", "undefined", "none", "nil", "true", "false"}
-        or folded in _SCHEME_NAMES
+        or _scheme_word(cleaned)
         or cleaned in _OBS_KEY_NAMES
         or cleaned.startswith("(")
         or cleaned.endswith(")")
@@ -286,6 +287,81 @@ def _promotable_free_text(value: str, *, explicit_auth: bool = False) -> bool:
     return not _never_promote_literal(cleaned) and (
         explicit_auth or _looks_like_key_material(cleaned)
     )
+
+
+def _scheme_word(value: str) -> bool:
+    cleaned = _unquote(value).strip("\"'`").casefold().rstrip(":=,")
+    return cleaned in _SCHEME_NAMES
+
+
+def _yaml_block_marker(value: str) -> bool:
+    return bool(re.fullmatch(r"[|>][+-]?[0-9]?", value))
+
+
+def resolve_credential_token(text: str, label_end: int) -> tuple[int, int] | None:
+    """Find the credential token following a sensitive label and optional schemes."""
+    position = label_end
+    skipped_scheme = False
+
+    def next_token(start: int) -> tuple[int, int] | None:
+        cursor = start
+        while cursor < len(text) and text[cursor] in " \t":
+            cursor += 1
+        while cursor < len(text) and text[cursor] in "\r\n":
+            if text.startswith("\r\n", cursor):
+                cursor += 2
+            else:
+                cursor += 1
+            line_start = cursor
+            while cursor < len(text) and text[cursor] in " \t":
+                cursor += 1
+            if cursor < len(text) and text[cursor] in "\r\n":
+                continue
+            if cursor == line_start:
+                line_end = min(
+                    (
+                        index
+                        for index in (text.find("\n", cursor), text.find("\r", cursor))
+                        if index >= 0
+                    ),
+                    default=len(text),
+                )
+                if any(char.isspace() for char in text[cursor:line_end]):
+                    return None
+            break
+        if cursor >= len(text):
+            return None
+        end = cursor
+        while end < len(text) and not text[end].isspace():
+            end += 1
+        if end == cursor:
+            return None
+        return cursor, end
+
+    token = next_token(position)
+    if token is None:
+        return None
+    start, end = token
+    # YAML block markers are empty same-line values. The block's first indented
+    # content line is resolved by the same continuation rule.
+    if _yaml_block_marker(text[start:end]):
+        token = next_token(end)
+        if token is None:
+            return None
+        start, end = token
+    while _scheme_word(text[start:end]):
+        skipped_scheme = True
+        token = next_token(end)
+        if token is None:
+            return None
+        start, end = token
+    if skipped_scheme:
+        if end > start + 1 and text[start] in "\"'`" and text[end - 1] == text[start]:
+            start += 1
+            end -= 1
+        elif end > start and text[end - 1] in "\"'`":
+            end -= 1
+    return (start, end) if not skipped_scheme or start < end else None
 
 
 _RTMP_APPLICATION_NAMES = frozenset(
@@ -1383,24 +1459,12 @@ def _authorization_has_scheme(match: re.Match[str]) -> bool:
     if match.re is _LOG_PATTERNS[-1]:
         cleaned = match.group(2).rstrip("'\"` ,;}")
         return _authorization_scheme(match) and _unquote(cleaned) == REDACTED
-    tail = match.string[match.end(1) :]
-    tail = tail.splitlines()[0]
-    tail = re.sub(r"^[ \t'\"`,;}]+|[ \t'\"`,;}]+$", "", tail)
-    value = tail.split(None, 1)
-    if value and value[0].strip('"').casefold().rstrip(":=") in _SCHEME_NAMES:
-        return len(value) == 1 or bool(
-            re.match(r"(?i)^[\"'`]?<REDACTED>[\"'`]?(?=[,;}\s]|$)", value[1])
-        )
-    prefix = match.group(1).rstrip()
-    scheme_match = re.search(r"(?i)([A-Za-z][A-Za-z0-9_-]*)[ \t]*$", prefix)
-    if scheme_match and scheme_match.group(1).casefold() in _SCHEME_NAMES:
-        value_text = _unquote(match.group(2).rstrip("'\"` ,;}"))
-        return value_text == REDACTED
-    return bool(
-        value
-        and value[0].casefold().rstrip(":=") in _SCHEME_NAMES
-        and len(value) > 1
-        and _unquote(value[1].rstrip(",;} ")).strip("'\"`") == REDACTED
+    token = resolve_credential_token(match.string, match.start(2))
+    if token is None or token[0] == match.start(2):
+        return False
+    prefix = match.string[match.start(2) : token[0]]
+    return any(_scheme_word(part) for part in re.findall(r"[^\s]+", prefix)) and (
+        _unquote(match.string[token[0] : token[1]].rstrip(",;}")) == REDACTED
     )
 
 
@@ -1415,16 +1479,21 @@ def _authorization_scheme(match: re.Match[str]) -> bool:
 
 def _scheme_prefixed_value_is_redacted(match: re.Match[str]) -> bool:
     """Recognize a preserved scheme followed by a redacted credential token."""
-    value = _unquote(match.group(2)).strip()
-    pieces = value.split(None, 1)
-    if not pieces or pieces[0].casefold().rstrip(":=") not in _SCHEME_NAMES:
+    token = resolve_credential_token(match.string, match.start(2))
+    if token is None or token[0] == match.start(2):
         return False
-    if len(pieces) > 1:
-        credential = pieces[1].split(None, 1)[0].rstrip(",;}")
-        return _unquote(credential) == REDACTED
-    tail = match.string[match.end(2) :].splitlines()[0]
-    next_token = re.match(r"[ \t]+([^\s,;]+)", tail)
-    return bool(next_token and _unquote(next_token.group(1).rstrip(",;}")) == REDACTED)
+    start, end = token
+    return _unquote(match.string[start:end].rstrip(",;}")) == REDACTED
+
+
+def _resolved_value_has_scheme(match: re.Match[str]) -> bool:
+    token = resolve_credential_token(match.string, match.start(2))
+    if token is None or token[0] == match.start(2):
+        return False
+    return any(
+        _scheme_word(part)
+        for part in re.findall(r"[^\s]+", match.string[match.start(2) : token[0]])
+    )
 
 
 def _redact_authorization_remainders(  # noqa: PLR0912, PLR0915
@@ -1445,6 +1514,20 @@ def _redact_authorization_remainders(  # noqa: PLR0912, PLR0915
                 continue
             value_start = line_start + match.end()
             value = text[value_start:line_end]
+            if _yaml_block_marker(value.strip()):
+                continue
+            resolved = resolve_credential_token(text, value_start)
+            if resolved is not None and resolved[0] > value_start:
+                token_start, token_end = resolved
+                prefix = text[value_start:token_start]
+                if (
+                    any(_scheme_word(part) for part in re.findall(r"[^\s]+", prefix))
+                    and _unquote(text[token_start:token_end].rstrip(",;}")) == REDACTED
+                ):
+                    if token_start < line_end:
+                        replacements.append((token_end, line_end, ""))
+                    covered_end = line_end
+                    continue
             leading = len(value) - len(value.lstrip())
             stripped = value.strip()
             if not stripped:
@@ -1640,12 +1723,10 @@ def _clean_log_key(token: str) -> str:
 
 
 @lru_cache(maxsize=2)
-def _free_text_credential_spans(  # noqa: PLR0912, PLR0915
+def _free_text_credential_spans(
     text: str,
 ) -> list[tuple[int, int, str, bool]]:
     """Return sensitive free-text credentials, including scheme and next-line forms."""
-    if not _FREE_TEXT_SPECIAL_HINT.search(text):
-        return []
     found: list[tuple[int, int, str, bool]] = []
     assignment = re.compile(
         rf"(?i)(?<![A-Za-z0-9_.-])({_SENSITIVE_FREE_NAME})"
@@ -1654,83 +1735,68 @@ def _free_text_credential_spans(  # noqa: PLR0912, PLR0915
     json_spans = [(start, end) for start, end, _value, _context in _json_fragments(text)]
     json_starts = [start for start, _end in json_spans]
     lines = list(re.finditer(r"[^\r\n]*(?:\r?\n|\r|$)", text))
-    for line_index, line in enumerate(lines):
+    for line in lines:
         body = line.group(0).rstrip("\r\n")
         for match in assignment.finditer(body):
             absolute_start = line.start() + match.start()
+            if _is_url_query_assignment(text, absolute_start):
+                continue
             fragment_index = bisect_right(json_starts, absolute_start) - 1
             if fragment_index >= 0 and absolute_start < json_spans[fragment_index][1]:
                 continue
             key = _clean_log_key(match.group(1))
             if not key or not _is_sensitive_key(key):
                 continue
-            raw_value = match.group(2)
-            value_offset = line.start() + match.start(2)
-            stripped = raw_value.strip()
-            auth = "authorization" in key.casefold() or "cookie" in key.casefold()
-            if auth and re.search(r"\\[\"'`]", raw_value):
-                continue
-            if stripped:
-                leading = len(raw_value) - len(raw_value.lstrip())
-                scheme_value = re.match(
-                    rf"(?i)[\"'`]?(?P<scheme>{_FREE_TEXT_SCHEME_WORDS})[\"'`]?[ \t]+"
-                    r"[\"'`]?(?P<credential>[^\s\"'`]+)",
-                    raw_value[leading:],
-                )
-                if scheme_value:
-                    token = scheme_value.group("credential")
-                    literal = _unquote(token.rstrip(",;}"))
+            auth = "authorization" in key.casefold()
+            cookie = key.casefold() in {"cookie", "set-cookie"}
+            token = resolve_credential_token(text, line.start() + match.start(2))
+            has_cookie_pairs = (
+                cookie and "=" in text[line.start() + match.start(2) : line.start() + len(body)]
+            )
+            if token is not None and not has_cookie_pairs:
+                start, end = token
+                raw = text[start:end]
+                literal = _unquote(raw.rstrip(",;}"))
+                if literal and literal != REDACTED:
+                    prefix = text[line.start() + match.start(2) : start]
+                    scheme_credential = any(
+                        _scheme_word(part) for part in re.findall(r"[^\s]+", prefix)
+                    )
+                    continuation = "\n" in prefix or "\r" in prefix
+                    if scheme_credential or continuation:
+                        found.append((start, end, literal, (auth or cookie) and scheme_credential))
+            if cookie:
+                line_end = line.start() + len(body)
+                header_value_start = line.start() + match.start(2)
+                for pair in _COOKIE_PAIR.finditer(text[header_value_start:line_end]):
+                    start = header_value_start + pair.start(1)
+                    end = header_value_start + pair.end(1)
+                    literal = _unquote(text[start:end].rstrip(",;}"))
                     if literal and literal != REDACTED:
-                        start = value_offset + leading + scheme_value.start("credential")
-                        found.append((start, start + len(token), literal, auth))
-                    continue
-                pieces = list(re.finditer(r"[^\s]+", raw_value))
-                first = _unquote(pieces[0].group(0)).rstrip(",;}") if pieces else ""
-                if first.casefold() in _SCHEME_NAMES:
-                    if len(pieces) > 1:
-                        token = pieces[1]
-                        literal = _unquote(token.group(0).rstrip(",;}"))
-                        if literal and literal != REDACTED:
-                            found.append(
-                                (
-                                    value_offset + token.start(),
-                                    value_offset + token.end(),
-                                    literal,
-                                    auth,
-                                )
-                            )
-                        continue
-                    following_index = line_index + 1
-                else:
-                    continue
-            else:
-                following_index = line_index + 1
-            while following_index < len(lines):
-                following = lines[following_index]
-                next_body = following.group(0).rstrip("\r\n")
-                if next_body.strip():
-                    indent_length = len(next_body) - len(next_body.lstrip())
-                    next_value = next_body[indent_length:]
-                    if indent_length or not re.search(r"\s", next_value):
-                        token_match = re.search(r"\S+", next_value)
-                        if token_match:
-                            token_text = token_match.group(0)
-                            literal = _unquote(token_text.rstrip(",;}"))
-                            if literal and literal != REDACTED:
-                                start = following.start() + indent_length + token_match.start()
-                                found.append((start, start + len(token_text), literal, auth))
-                    break
-                following_index += 1
+                        found.append((start, end, literal, True))
     return list(dict.fromkeys(found))
 
 
 def _redact_free_text_credential_spans(text: str, counts: dict[str, int]) -> str:
     spans = _free_text_credential_spans(text)
-    for start, end, _literal, _explicit_auth in reversed(spans):
+    if not spans:
+        return text
+    replacements: list[tuple[int, int, str]] = []
+    for start, end, _literal, _explicit_auth in spans:
         if _unquote(text[start:end]) != REDACTED:
-            text = text[:start] + _quoted_redacted(text[start:end]) + text[end:]
-            counts["credential_pattern"] = counts.get("credential_pattern", 0) + 1
-    return text
+            replacements.append((start, end, _quoted_redacted(text[start:end])))
+    if not replacements:
+        return text
+    pieces: list[str] = []
+    cursor = 0
+    for start, end, replacement in sorted(replacements):
+        if start < cursor:
+            continue
+        pieces.extend((text[cursor:start], replacement))
+        cursor = end
+        counts["credential_pattern"] = counts.get("credential_pattern", 0) + 1
+    pieces.append(text[cursor:])
+    return "".join(pieces)
 
 
 def _embedded_secrets(text: str) -> set[str]:  # noqa: PLR0912
@@ -1763,6 +1829,11 @@ def _embedded_secrets(text: str) -> set[str]:  # noqa: PLR0912
         values.update(text[start:end] for start, end in _rtmp_harvest_spans(text))
     if "streamlabs.com/" in text.casefold():
         values.update(match.group(2) for match in _STREAMLABS_WIDGET_TOKEN.finditer(text))
+    for header in _COOKIE_HEADER.finditer(text):
+        for pair in _COOKIE_PAIR.finditer(header.group(2)):
+            literal = _unquote(pair.group(1).rstrip(",;}"))
+            if literal and literal != REDACTED:
+                values.add(literal)
     if _SENSITIVE_NAME_HINT.search(text):
         for match in _CLI_ASSIGNMENT.finditer(_mask_urls(text)):
             option = re.match(r"--?([A-Za-z0-9_.-]+)", match.group(1))
@@ -1807,9 +1878,20 @@ def _embedded_secrets(text: str) -> set[str]:  # noqa: PLR0912
                     return match.group(0)
                 if pattern is _LOG_PATTERNS[-1] and not _authorization_scheme(match):
                     return match.group(0)
+                if _log_match_key(match).casefold() in {"cookie", "set-cookie"}:
+                    return match.group(0)
                 literal = _unquote(match.group(2))
                 match_key = _log_match_key(match).casefold()
-                explicit_auth = "authorization" in match_key or "cookie" in match_key
+                explicit_auth = False
+                if "authorization" in match_key:
+                    resolved = resolve_credential_token(match.string, match.start(2))
+                    if resolved is not None:
+                        explicit_auth = any(
+                            _scheme_word(part)
+                            for part in re.findall(
+                                r"[^\s]+", match.string[match.start(2) : resolved[0]]
+                            )
+                        )
                 if _promotable_free_text(literal, explicit_auth=explicit_auth):
                     key = _log_match_key(match)
                     if _is_weak_camel_key(key) and not _looks_like_key_material(literal):
@@ -1826,7 +1908,7 @@ def _embedded_secrets(text: str) -> set[str]:  # noqa: PLR0912
     return {value for value in values if value and not _never_promote_literal(value)}
 
 
-def _strong_embedded_secrets(text: str) -> set[str]:
+def _strong_embedded_secrets(text: str) -> set[str]:  # noqa: PLR0912
     """Keep explicit assignment provenance when a value also appears in a weak source."""
     weak = _weak_credential_values(text)
     values = _embedded_secrets(text) - weak
@@ -1836,17 +1918,27 @@ def _strong_embedded_secrets(text: str) -> set[str]:
         for match in pattern.finditer(_mask_urls(text)):
             key = _log_match_key(match)
             literal = _unquote(match.group(2))
+            if key.casefold() in {"cookie", "set-cookie"}:
+                continue
+            explicit_auth = False
+            if "authorization" in key.casefold():
+                resolved = resolve_credential_token(match.string, match.start(2))
+                explicit_auth = resolved is not None and any(
+                    _scheme_word(part)
+                    for part in re.findall(r"[^\s]+", match.string[match.start(2) : resolved[0]])
+                )
             if (
                 _is_sensitive_key(key, value=literal)
                 and not _is_weak_camel_key(key)
                 and literal
                 and not _never_promote_literal(literal)
-                and (
-                    "authorization" in key.casefold()
-                    or "cookie" in key.casefold()
-                    or _looks_like_key_material(literal)
-                )
+                and _promotable_free_text(literal, explicit_auth=explicit_auth)
             ):
+                values.add(literal)
+    for header in _COOKIE_HEADER.finditer(text):
+        for pair in _COOKIE_PAIR.finditer(header.group(2)):
+            literal = _unquote(pair.group(1).rstrip(",;}"))
+            if literal and not _never_promote_literal(literal):
                 values.add(literal)
     if _has_sensitive_query_assignment(text):
         values.update(
@@ -2149,6 +2241,10 @@ def _redact_embedded(  # noqa: PLR0912, PLR0915
 
     def replace(match: re.Match[str], *, check_noncredential: bool = True) -> str:
         literal = _unquote(match.group(2))
+        if _yaml_block_marker(literal):
+            return match.group(1) + match.group(2)
+        if _resolved_value_has_scheme(match):
+            return match.group(1) + match.group(2)
         if literal == REDACTED or literal.casefold() in {
             "null",
             "undefined",
@@ -2158,7 +2254,7 @@ def _redact_embedded(  # noqa: PLR0912, PLR0915
             "false",
         }:
             return match.group(1) + match.group(2)
-        if literal.casefold() in _SCHEME_NAMES:
+        if _scheme_word(literal):
             return match.group(1) + match.group(2)
         if (
             check_noncredential
@@ -2171,6 +2267,10 @@ def _redact_embedded(  # noqa: PLR0912, PLR0915
 
     def replace_log(match: re.Match[str], pattern: re.Pattern[str]) -> str:  # noqa: PLR0911
         key = _log_match_key(match)
+        if _yaml_block_marker(_unquote(match.group(2))):
+            return match.group(1) + match.group(2)
+        if _scheme_word(_unquote(match.group(2))) or _resolved_value_has_scheme(match):
+            return match.group(1) + match.group(2)
         if key.casefold().endswith("authorization") and _authorization_has_scheme(match):
             return match.group(1) + match.group(2)
         if pattern is _LOG_PATTERNS[-1] and not _authorization_scheme(match):
@@ -2272,6 +2372,17 @@ def _redact_embedded(  # noqa: PLR0912, PLR0915
     if "cookie:" in text.casefold() or "set-cookie:" in text.casefold():
 
         def redact_cookie(match: re.Match[str]) -> str:
+            if _yaml_block_marker(match.group(2).strip()):
+                return match.group(0)
+            value_start = match.start(2)
+            resolved = resolve_credential_token(text, value_start)
+            if resolved is not None and resolved[0] > value_start:
+                token_start, token_end = resolved
+                prefix = text[value_start:token_start]
+                if any(_scheme_word(part) for part in re.findall(r"[^\s]+", prefix)):
+                    if token_start < match.end(2):
+                        return match.group(1) + text[value_start:token_end]
+                    return match.group(0)
             value = match.group(2)
             if value.strip() and value.strip() != REDACTED:
                 counts["credential_pattern"] = counts.get("credential_pattern", 0) + 1
@@ -2413,6 +2524,11 @@ def has_unredacted_embedded_json(text: str) -> bool:  # noqa: PLR0911
     if any(
         match.group(3) != f"{REDACTED}@" and _userinfo_candidate(match)
         for match in _URL_USERINFO.finditer(text)
+    ):
+        return True
+    if any(
+        _unquote(text[start:end]) != REDACTED
+        for start, end, _literal, _ungated in _free_text_credential_spans(text)
     ):
         return True
     if _SENSITIVE_NAME_HINT.search(text) and any(

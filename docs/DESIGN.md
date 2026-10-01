@@ -108,21 +108,36 @@ diagnostic line. Maintain a versioned field/path rule list and fixtures taken fr
 synthetic OBS data; never commit Rin's real configuration or log samples.
 For cross-file literal scans, first redact every collected file and gather eligible
 credential literals, then scrub and verify every staged file before promotion. The
-redaction rules are versioned (currently version 20). Free-text assignments, URL query
-and fragment values, CLI arguments, and next-line credentials under labels other than
-Authorization are promoted only when they look like key material (at least eight
-characters and containing a digit or non-letter). Explicit JSON/INI credential fields,
-URL userinfo passwords, Authorization and Proxy-Authorization credentials, Cookie and
-Set-Cookie values, and recognized webhook/widget path tokens are promoted without
-that heuristic. Free-text values are still redacted in place even when they are not
-promoted for cross-file matching. Never promote known authorization scheme names,
-OBS hotkey enum names, resolution/quality tokens, placeholders, parenthesized values,
-or an exact redaction marker. Indented next-line credentials are redacted and harvested
-for every sensitive free-text label; Authorization credentials are promoted without
-the key-material heuristic. Scheme-prefixed values preserve the scheme and redact the
-following credential token. Cross-file values are matched with a single compiled
-alternation per file, with longest values first and the same provenance and boundary
-rules used by the verifier.
+redaction rules are versioned (currently version 21). Free-text assignments, URL query
+and fragment values, CLI arguments, and next-line credentials are promoted only when
+they look like key material (at least eight characters and containing a digit or
+non-letter). Authorization, Proxy-Authorization, and Cookie credential tokens after a
+recognized scheme, actual name=value pairs in Cookie and Set-Cookie headers, explicit
+JSON/INI credential fields, URL userinfo passwords, and recognized webhook/widget path
+tokens are promoted without that heuristic. Bare Authorization or Cookie values with
+no recognized scheme or cookie pair use the normal key-material gate. Free-text values
+are still redacted in place even when they are not promoted for cross-file matching.
+Never promote known authorization scheme names, OBS hotkey enum names,
+resolution/quality tokens, placeholders, parenthesized values, or an exact redaction
+marker.
+
+One credential-token resolver is shared by redaction, harvesting, and verification.
+After a sensitive label separator it skips spaces, tabs, newline and indentation
+continuations, including blank lines, then skips zero or more case-insensitive scheme
+words before selecting the next whitespace-free token as the credential. Scheme words
+may have a trailing colon, equals sign, or comma. An unindented continuation is
+accepted only when it contains one whitespace-free token; a timestamp-prefixed log
+line is not part of the value. YAML block markers `|`, `>`, `|-`, `>-`, `|+`, and `>+`
+(optionally followed by an indentation digit) count as empty same-line values, so an
+indented following line can hold the credential. For scheme-prefixed and continuation
+values, the label, scheme words, line breaks, and indentation are preserved while the
+credential token is replaced. Cookie pair headers keep their existing whole-value
+redaction. Authorization whole-line rewriting harvests the resolved token before
+removing the rest of that line. Verification requires the resolved credential token itself to equal
+`<REDACTED>` after stripping one matching surrounding quote or backtick; redacting only
+a neighboring scheme word is not sufficient. Cross-file values are matched with a
+single compiled alternation per file, with longest values first and the same
+provenance and boundary rules used by the verifier.
 
 Also inspect valid JSON objects and arrays embedded in INI values, log lines, and
 string-valued JSON fields. Redact credential fields within those fragments and scan
@@ -137,8 +152,9 @@ complete `OBS_HOTKEY` and `OBS_MOUSE_BUTTON` lists in `libobs/obs-hotkeys.h` are
 preserved, and a `settings` ancestor makes `key` sensitive.
 Unquoted URL query and fragment values end at whitespace, end of text, or a following
 named parameter. Quotes and angle brackets end a value only when they are closing
-delimiters. Authorization assignments accept quoted names and values, keep a known
-scheme, and redact the credential, including a token on the next indented line.
+delimiters. Authorization assignments accept quoted names and values, preserve known
+scheme words, and redact the resolved credential token, including credentials after
+multiple schemes and credentials on indented continuation lines.
 Cross-file scrubbing covers raw, percent-encoded, JSON `\\u`, and `\\x` escaped
 forms of known literals in every file. RTMP harvesting considers only the final
 path segment, excludes resolution and quality tokens, and accepts segments of at

@@ -21,6 +21,7 @@ from tempesttrace.redaction import (
     _is_sensitive_key,
     _json_fragments,
     _scrub_text,
+    _strong_embedded_secrets,
     has_unredacted_embedded_json,
     has_unredacted_fields,
     has_unredacted_ini_fields,
@@ -28,6 +29,23 @@ from tempesttrace.redaction import (
     redact_file,
     redact_file_with_secrets,
 )
+
+SCHEME_WORDS = ("Bearer", "Basic", "Digest", "Token", "Bot", "ApiKey", "AWS4-HMAC-SHA256")
+
+
+def _fuzz_scheme_value(rng: random.Random, form: str, secret: str) -> str:
+    scheme = rng.choice(SCHEME_WORDS)
+    if form == "scheme":
+        return f"{scheme} {secret}"
+    if form == "scheme_colon":
+        return f"{scheme}: {secret}"
+    if form == "double_scheme":
+        return f"{scheme} token {secret}"
+    if form == "scheme_nextline":
+        return f"\n    {scheme} {secret}"
+    if form == "scheme_newline_token":
+        return f"{scheme}\n    {secret}"
+    return f"|\n    {secret}"
 
 
 def test_free_text_span_results_are_reused_for_unchanged_input() -> None:
@@ -599,8 +617,150 @@ def backup_secret_scan(path: Path) -> bool:
     return _secret_scan(path)
 
 
-def test_rule_version_is_twenty() -> None:
-    assert RULE_VERSION == 20
+def test_rule_version_is_twenty_one() -> None:
+    assert RULE_VERSION == 21
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "token: Bearer: G8TOKEN123456",
+        "token: Bearer token G8TOKEN123456",
+        "password: Basic: G8PASSWORD123",
+        "token:\n    Bearer G8TOKEN123456",
+        "token: Bearer\n    G8TOKEN123456",
+        "token:\n\n    Bearer\n\n      G8TOKEN123456",
+        "token: |\n    G8TOKEN123456",
+    ],
+)
+def test_scheme_resolver_redacts_only_credential_and_verifies(
+    assignment: str, tmp_path: Path
+) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(assignment + "\nordinary line remains\n", encoding="utf-8")
+    original = path.read_text(encoding="utf-8")
+    assert has_unredacted_embedded_json(original)
+    assert g8_secret(assignment) in _embedded_secrets(original)
+    assert not ({"bearer", "basic", "token"} & _embedded_secrets(original))
+    redact_file_with_secrets(path)
+    cleaned = path.read_text(encoding="utf-8")
+    assert g8_secret(assignment) not in cleaned
+    assert "ordinary line remains" in cleaned
+    for scheme in ("Bearer", "Basic"):
+        if scheme in assignment:
+            assert scheme in cleaned
+    assert not has_unredacted_embedded_json(cleaned)
+    assert not _secret_scan(path)
+
+
+def g8_secret(assignment: str) -> str:
+    return assignment.rsplit(" ", 1)[-1]
+
+
+def test_authorization_cookie_free_text_promotion_requires_evidence(tmp_path: Path) -> None:
+    prose = (
+        "Authorization: failed to authenticate\n"
+        "Cookie: session\n"
+        "Failed to open encoder\n"
+        "Scene: Failed Overlay\n"
+        "connection failed\n"
+        "WebSocket session started\n"
+        "Input: jim_nvenc_h264\n"
+    )
+    assert not _embedded_secrets(prose)
+    assert not _strong_embedded_secrets(prose)
+    keyed = "Authorization: Qk7mN2pL9xR4\n"
+    assert "Qk7mN2pL9xR4" in _embedded_secrets(keyed)
+
+
+def test_cookie_pairs_and_scheme_credentials_are_harvested_ungated() -> None:
+    text = (
+        "Authorization: Bearer abc\n"
+        "Cookie: sid=abc; theme=dark\n"
+        "Authorization: failed to authenticate\n"
+    )
+    harvested = _embedded_secrets(text)
+    assert {"abc", "dark"} <= harvested
+    assert "failed" not in harvested
+
+
+def test_scheme_dense_redaction_and_verification_scale_linearly(tmp_path: Path) -> None:
+    line = "14:22:01.123: token: Bearer Qk7mN2pL9xR4\n"
+    timings: list[float] = []
+    for size in (512 * 1024, 1024 * 1024):
+        path = tmp_path / f"dense-{size}.txt"
+        path.write_text((line * (size // len(line) + 1))[:size], encoding="utf-8")
+        started = time.perf_counter()
+        redact_file_with_secrets(path)
+        assert not _secret_scan(path)
+        timings.append(time.perf_counter() - started)
+    assert timings[0] < 4.0
+    assert timings[1] < 8.0
+    assert timings[1] / timings[0] < 2.6
+
+
+@pytest.mark.parametrize(
+    "label",
+    ["token", "password", "key", "secret", "pwd", "Authorization", "Proxy-Authorization", "Cookie"],
+)
+@pytest.mark.parametrize(
+    "scheme", ["Bearer", "Basic", "Digest", "Token", "Bot", "ApiKey", "AWS4-HMAC-SHA256"]
+)
+@pytest.mark.parametrize(
+    "form",
+    [
+        "space",
+        "tab",
+        "quoted",
+        "trailing-colon",
+        "double-scheme",
+        "next-line",
+        "scheme-next-line",
+        "blank-lines",
+        "yaml-block",
+    ],
+)
+def test_scheme_credential_matrix_is_harvested_redacted_and_verified(
+    tmp_path: Path, label: str, scheme: str, form: str
+) -> None:
+    credential = "MATRIXSECRET123456"
+    if form == "space":
+        value = f"{scheme} {credential}"
+    elif form == "tab":
+        value = f"{scheme}\t{credential}"
+    elif form == "quoted":
+        value = f'"{scheme} {credential}"'
+    elif form == "trailing-colon":
+        value = f"{scheme}: {credential}"
+    elif form == "double-scheme":
+        value = f"{scheme} token {credential}"
+    elif form == "next-line":
+        value = f"\n    {scheme} {credential}"
+    elif form == "scheme-next-line":
+        value = f"{scheme}\n    {credential}"
+    elif form == "blank-lines":
+        value = f"{scheme}\n\n      {credential}"
+    else:
+        value = f"|\n    {credential}"
+    content = f"{label}: {value}\r\nordinary diagnostic line\r\n"
+    path = tmp_path / "matrix.txt"
+    path.write_text(content, encoding="utf-8", newline="")
+    assert has_unredacted_embedded_json(content)
+    assert _secret_scan(path)
+    harvested = _embedded_secrets(content)
+    assert credential in harvested
+    if label.casefold() in {"authorization", "proxy-authorization", "cookie"}:
+        assert credential in _strong_embedded_secrets(content)
+    redact_file_with_secrets(path)
+    cleaned = path.read_text(encoding="utf-8")
+    assert credential not in cleaned
+    assert "ordinary diagnostic line" in cleaned
+    if form != "yaml-block":
+        assert scheme in cleaned
+    else:
+        assert f"{label}: |\n    <REDACTED>" in cleaned
+    assert not has_unredacted_embedded_json(cleaned)
+    assert not _secret_scan(path)
 
 
 @pytest.mark.parametrize(
@@ -1508,7 +1668,33 @@ def test_seeded_multishape_fuzz_has_zero_shipped_leaks(tmp_path: Path) -> None:
         value = secret(index)
         kind = rng.choice(("log", "ini", "json"))
         if kind == "log":
-            return f"{prefix}{name}{separator}{quote}{value}{quote}\n", "current.txt", value
+            form = rng.choice(
+                (
+                    "plain",
+                    "scheme",
+                    "scheme-colon",
+                    "double-scheme",
+                    "scheme-nextline",
+                    "scheme-newline-token",
+                    "yaml-block",
+                )
+            )
+            if form != "plain":
+                quote = ""
+                scheme = rng.choice(SCHEME_WORDS)
+                if form == "scheme":
+                    value = f"{scheme} {value}"
+                elif form == "scheme-colon":
+                    value = f"{scheme}: {value}"
+                elif form == "double-scheme":
+                    value = f"{scheme} token {value}"
+                elif form == "scheme-nextline":
+                    value = f"\n    {scheme} {value}"
+                elif form == "scheme-newline-token":
+                    value = f"{scheme}\n    {value}"
+                else:
+                    value = f"|\n    {value}"
+            return f"{prefix}{name}{separator}{quote}{value}{quote}\n", "current.txt", secret(index)
         if kind == "ini":
             return f"[Sec]\n{name}={quote}{value}{quote}\nOther=1\n", "basic.ini", value
         shapes = (
@@ -1748,22 +1934,60 @@ def test_punctuation_seeded_fuzz_has_no_shipped_leaks(tmp_path: Path) -> None:  
             secret += chr(233)
         quote = rng.choice(["", "'", '"'])
         kind = rng.choice(["log", "ini", "json"])
-        form = rng.choice(["plain", "scheme", "nextline", "prose"]) if kind == "log" else "plain"
+        form = (
+            rng.choice(
+                [
+                    "plain",
+                    "scheme",
+                    "nextline",
+                    "prose",
+                    "scheme_colon",
+                    "double_scheme",
+                    "scheme_nextline",
+                    "scheme_newline_token",
+                    "yaml_block",
+                ]
+            )
+            if kind == "log"
+            else "plain"
+        )
         planted = form != "prose"
-        if form in {"scheme", "nextline"}:
+        if form not in {"plain", "prose"}:
+            quote = ""
+        if form in {
+            "scheme",
+            "nextline",
+            "scheme_colon",
+            "double_scheme",
+            "scheme_nextline",
+            "scheme_newline_token",
+            "yaml_block",
+        }:
             secret = "".join(character for character in secret if character.isalnum())
             if len(secret) < 8:
                 secret = "SafeSecret99"
-        if form == "scheme":
-            value = f"Bearer {secret}"
-        elif form == "nextline":
+        if form == "nextline":
             value = f"\n    {secret}"
         elif form == "prose":
             value = "server returned 401"
+        elif form in {
+            "scheme",
+            "scheme_colon",
+            "double_scheme",
+            "scheme_nextline",
+            "scheme_newline_token",
+            "yaml_block",
+        }:
+            value = _fuzz_scheme_value(rng, form, secret)
         else:
             value = f"{quote}{secret}{quote}"
         if kind == "log":
-            separator = ":" if form in {"nextline", "prose"} else " ="
+            separator = (
+                ":"
+                if form
+                in {"nextline", "prose", "scheme_nextline", "scheme_newline_token", "yaml_block"}
+                else " ="
+            )
             content, filename = f"info: {name}{separator} {value}\n", "current.txt"
         elif kind == "ini":
             content, filename = f"[General]\nNote={name}={value}\n", "global.ini"

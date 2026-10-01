@@ -55,6 +55,14 @@ def _assert_linear_pair(action, size: int, ceiling: float) -> tuple[float, float
 
 def _fuzz_scheme_value(rng: random.Random, form: str, secret: str) -> str:  # noqa: PLR0911
     scheme = rng.choice(SCHEME_WORDS)
+    if form == "wrapped_scheme":
+        return f"({scheme}) {secret}"
+    if form == "glued_amp":
+        return f"{scheme} {secret}&region=us"
+    if form == "glued_semicolon":
+        return f"{scheme} {secret};expires=123456"
+    if form == "glued_hash":
+        return f"{scheme} {secret}#note"
     if form == "scheme_suffix":
         scheme_suffix = rng.choice([".", ";", ")", "]", "}", "#", ":", ",", "="])
         credential_suffix = rng.choice([".", ",", ")", ";", "!", "?"])
@@ -643,8 +651,8 @@ def backup_secret_scan(path: Path) -> bool:
     return _secret_scan(path)
 
 
-def test_rule_version_is_twenty_two() -> None:
-    assert RULE_VERSION == 22
+def test_rule_version_is_twenty_three() -> None:
+    assert RULE_VERSION == 23
 
 
 @pytest.mark.parametrize(
@@ -701,15 +709,38 @@ def test_authorization_cookie_free_text_promotion_requires_evidence(tmp_path: Pa
     assert "Qk7mN2pL9xR4" in _embedded_secrets(keyed)
 
 
-def test_cookie_pairs_and_scheme_credentials_are_harvested_ungated() -> None:
+def test_cookie_pairs_promote_credentials_and_scheme_credentials_ungated() -> None:
     text = (
         "Authorization: Bearer abc\n"
         "Cookie: sid=abc; theme=dark\n"
         "Authorization: failed to authenticate\n"
     )
     harvested = _embedded_secrets(text)
-    assert {"abc", "dark"} <= harvested
+    assert "abc" in harvested
+    assert "dark" not in harvested
     assert "failed" not in harvested
+
+
+def test_cookie_attributes_are_redacted_but_not_promoted(tmp_path: Path) -> None:
+    text = "Cookie: session=SECRET1234; Domain=twitch.tv; theme=overlay\n"
+    spans = _free_text_credential_spans(text)
+    assert "SECRET1234" in _embedded_secrets(text)
+    assert "twitch.tv" not in _embedded_secrets(text)
+    assert "overlay" not in _embedded_secrets(text)
+    path = tmp_path / "cookie.txt"
+    path.write_text(text, encoding="utf-8")
+    redact_file(path)
+    cleaned = path.read_text(encoding="utf-8")
+    assert "Cookie: <REDACTED>" in cleaned
+    assert spans
+
+
+def test_quoted_redaction_marker_with_trailing_punctuation_verifies_clean(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "cookie.txt"
+    path.write_text("cookie=`<REDACTED>`)\n", encoding="utf-8")
+    assert not _secret_scan(path)
 
 
 def test_scheme_dense_redaction_and_verification_scale_linearly(tmp_path: Path) -> None:
@@ -726,7 +757,18 @@ def test_scheme_dense_redaction_and_verification_scale_linearly(tmp_path: Path) 
 
 @pytest.mark.parametrize(
     "label",
-    ["token", "password", "key", "secret", "pwd", "Authorization", "Proxy-Authorization", "Cookie"],
+    [
+        "token",
+        "password",
+        "key",
+        "secret",
+        "pwd",
+        "Authorization",
+        "Proxy-Authorization",
+        "Cookie",
+        "Set-Cookie",
+        "Cookie2",
+    ],
 )
 @pytest.mark.parametrize(
     "scheme", ["Bearer", "Basic", "Digest", "Token", "Bot", "ApiKey", "AWS4-HMAC-SHA256"]
@@ -758,6 +800,10 @@ def test_scheme_dense_redaction_and_verification_scale_linearly(tmp_path: Path) 
         "credential-semicolon",
         "credential-bang",
         "credential-question",
+        "wrapped-scheme",
+        "glued-amp",
+        "glued-semicolon",
+        "glued-hash",
     ],
 )
 def test_scheme_credential_matrix_is_harvested_redacted_and_verified(  # noqa: PLR0912
@@ -795,6 +841,15 @@ def test_scheme_credential_matrix_is_harvested_redacted_and_verified(  # noqa: P
             "scheme-equals": "=",
         }[form]
         value = f"{scheme}{suffix} {credential}"
+    elif form == "wrapped-scheme":
+        value = f"(Bearer) {credential}"
+    elif form.startswith("glued-"):
+        suffix = {
+            "glued-amp": "&region=us",
+            "glued-semicolon": ";expires=123456",
+            "glued-hash": "#note",
+        }[form]
+        value = f"Bearer {credential}{suffix}"
     else:
         suffix = {
             "credential-dot": ".",
@@ -812,18 +867,52 @@ def test_scheme_credential_matrix_is_harvested_redacted_and_verified(  # noqa: P
     assert _secret_scan(path)
     harvested = _embedded_secrets(content)
     assert credential in harvested
-    if label.casefold() in {"authorization", "proxy-authorization", "cookie"}:
+    if label.casefold() in {
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "set-cookie",
+        "cookie2",
+    }:
         assert credential in _strong_embedded_secrets(content)
     redact_file_with_secrets(path)
     cleaned = path.read_text(encoding="utf-8")
     assert credential not in cleaned
     assert "ordinary diagnostic line" in cleaned
     if form != "yaml-block":
-        assert scheme in cleaned
+        expected_scheme = "Bearer" if form.startswith(("wrapped-", "glued-")) else scheme
+        assert expected_scheme in cleaned
     else:
         assert f"{label}: |\n    <REDACTED>" in cleaned
     assert not has_unredacted_embedded_json(cleaned)
     assert not _secret_scan(path)
+
+
+@pytest.mark.parametrize("scheme", ["(Bearer)", "[Bearer]", "<Bearer>", "Bearer("])
+def test_wrapped_scheme_words_resolve_credential(scheme: str, tmp_path: Path) -> None:
+    text = f"password: {scheme} WrappedSecret991\n"
+    assert "WrappedSecret991" in _embedded_secrets(text)
+    path = tmp_path / "wrapped.txt"
+    path.write_text(text, encoding="utf-8")
+    redact_file(path)
+    assert "WrappedSecret991" not in path.read_text(encoding="utf-8")
+    assert not _secret_scan(path)
+
+
+def test_unindented_bare_token_lines_scale_linearly() -> None:
+    def scan(size: int) -> float:
+        text = ("token:\n" * (size // 7 + 1))[:size]
+        started = time.perf_counter()
+        assert _scrub_text(text, set()) == text
+        return time.perf_counter() - started
+
+    small = min(scan(256 * 1024), scan(256 * 1024))
+    large = min(scan(512 * 1024), scan(512 * 1024))
+    if large / max(small, 0.001) >= 3.2:
+        small = min(small, scan(256 * 1024))
+        large = min(large, scan(512 * 1024))
+    assert large / max(small, 0.001) < 3.2
+    assert large < max(10.0, 8 * small)
 
 
 @pytest.mark.parametrize("suffix", [".", ";", ")", "]", "}", "#", ":", ",", "="])
@@ -1828,6 +1917,10 @@ def test_seeded_multishape_fuzz_has_zero_shipped_leaks(tmp_path: Path) -> None: 
                     "yaml-block",
                     "scheme-suffix",
                     "trailing-suffix",
+                    "wrapped_scheme",
+                    "glued_amp",
+                    "glued_semicolon",
+                    "glued_hash",
                 )
             )
             if form != "plain":
@@ -2086,6 +2179,9 @@ def test_punctuation_seeded_fuzz_has_no_shipped_leaks(  # noqa: PLR0912, PLR0915
         "access_token",
         "dbpassword",
         "twitchtoken",
+        "Set-Cookie",
+        "Cookie",
+        "Authorization",
     ]
     alphabet = "abcXYZ123#&;\\`~!@$%^*(){}[]|/+.,-_="
     leaks = []
@@ -2112,6 +2208,10 @@ def test_punctuation_seeded_fuzz_has_no_shipped_leaks(  # noqa: PLR0912, PLR0915
                     "scheme_suffix",
                     "trailing_suffix",
                     "yaml_ordinary",
+                    "wrapped_scheme",
+                    "glued_amp",
+                    "glued_semicolon",
+                    "glued_hash",
                 ]
             )
             if kind == "log"
@@ -2130,6 +2230,10 @@ def test_punctuation_seeded_fuzz_has_no_shipped_leaks(  # noqa: PLR0912, PLR0915
             "yaml_block",
             "scheme_suffix",
             "trailing_suffix",
+            "wrapped_scheme",
+            "glued_amp",
+            "glued_semicolon",
+            "glued_hash",
         }:
             secret = "".join(character for character in secret if character.isalnum())
             if len(secret) < 8:
@@ -2149,25 +2253,39 @@ def test_punctuation_seeded_fuzz_has_no_shipped_leaks(  # noqa: PLR0912, PLR0915
             "yaml_block",
             "scheme_suffix",
             "trailing_suffix",
+            "wrapped_scheme",
+            "glued_amp",
+            "glued_semicolon",
+            "glued_hash",
         }:
             value = _fuzz_scheme_value(rng, form, secret)
         else:
             value = f"{quote}{secret}{quote}"
         if kind == "log":
-            separator = (
-                ":"
-                if form
-                in {
-                    "nextline",
-                    "prose",
-                    "yaml_ordinary",
-                    "scheme_nextline",
-                    "scheme_newline_token",
-                    "yaml_block",
-                }
-                else " ="
-            )
-            content, filename = f"info: {name}{separator} {value}\n", "current.txt"
+            if name.casefold() in {"cookie", "set-cookie"} and form != "yaml_ordinary":
+                content = (
+                    f"14:22:01.123: [obs-browser] {name}: "
+                    f"session={secret}; Domain=example.com; theme=dark\n"
+                )
+                filename = "current.txt"
+            elif name.casefold() == "authorization" and form != "yaml_ordinary":
+                content = f"14:22:01.123: Authorization: (Bearer) {secret}\n"
+                filename = "current.txt"
+            else:
+                separator = (
+                    ":"
+                    if form
+                    in {
+                        "nextline",
+                        "prose",
+                        "yaml_ordinary",
+                        "scheme_nextline",
+                        "scheme_newline_token",
+                        "yaml_block",
+                    }
+                    else " ="
+                )
+                content, filename = f"info: {name}{separator} {value}\n", "current.txt"
         elif kind == "ini":
             content, filename = f"[General]\nNote={name}={value}\n", "global.ini"
         else:

@@ -108,15 +108,19 @@ diagnostic line. Maintain a versioned field/path rule list and fixtures taken fr
 synthetic OBS data; never commit Rin's real configuration or log samples.
 For cross-file literal scans, first redact every collected file and gather eligible
 credential literals, then scrub and verify every staged file before promotion. The
-redaction rules are versioned (currently version 22). Free-text assignments, URL query
+redaction rules are versioned (currently version 23). Free-text assignments, URL query
 and fragment values, CLI arguments, and next-line credentials are promoted only when
 they look like key material (at least eight characters and containing a digit or
-non-letter). Authorization, Proxy-Authorization, and Cookie credential tokens after a
-recognized scheme, actual name=value pairs in Cookie and Set-Cookie headers, explicit
-JSON/INI credential fields, URL userinfo passwords, and recognized webhook/widget path
-tokens are promoted without that heuristic. Bare Authorization or Cookie values with
-no recognized scheme or cookie pair use the normal key-material gate. Free-text values
-are still redacted in place even when they are not promoted for cross-file matching.
+non-letter). Authorization and Proxy-Authorization credential tokens after a
+recognized scheme, explicit JSON/INI credential fields, URL userinfo passwords, and
+recognized webhook/widget path tokens are promoted without that heuristic. Cookie and
+Set-Cookie headers are redacted as a whole. Cookie pair values are promoted only when
+the pair name is credential-like or the value passes the key-material heuristic;
+standard cookie attributes such as Domain, Path, Expires, Max-Age, SameSite, Secure,
+HttpOnly, Priority, and Partitioned are never promoted. Bare Authorization or Cookie
+values with no recognized scheme or credential-like cookie pair use the normal
+key-material gate. Free-text values are still redacted in place even when they are not
+promoted for cross-file matching.
 Never promote known authorization scheme names, OBS hotkey enum names,
 resolution/quality tokens, placeholders, parenthesized values, or an exact redaction
 marker.
@@ -125,7 +129,8 @@ One credential-token resolver is shared by redaction, harvesting, and verificati
 After a sensitive label separator it skips spaces, tabs, newline and indentation
 continuations, including blank lines, then skips up to four case-insensitive scheme
 words before selecting the next whitespace-free token as the credential. Scheme words
-are unquoted and trailing punctuation runs are ignored for recognition. A following
+are unquoted, one wrapped leading opener is ignored, and trailing punctuation runs are
+ignored for recognition. A following
 sensitive label ending in a colon or equals sign starts a new assignment and is not
 consumed as a scheme or credential. An unindented continuation is
 accepted only when it contains one whitespace-free token; a timestamp-prefixed log
@@ -138,7 +143,10 @@ when the token is alone on its line, or follows only recognized scheme words the
 passes the key-material gate, and is not a timestamp, name=value assignment, URL, OBS
 enum, or resolution/quality token.
 Harvested literals remove only a leading or trailing run of credential punctuation;
-punctuation inside the literal is preserved. The source token span is redacted whole.
+punctuation inside the literal is preserved. A harvested token also contributes prefixes
+before a `#` or before an `&`/`;` followed by a named `key=value` parameter, provided
+each prefix is at least four characters and passes the source's promotion gate. The
+source token span is redacted whole.
 For scheme-prefixed and continuation
 values, the label, scheme words, line breaks, and indentation are preserved while the
 credential token is replaced. Cookie pair headers keep their existing whole-value

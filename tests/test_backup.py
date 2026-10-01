@@ -127,6 +127,102 @@ def test_archive_independent_oracle_checks_punctuated_secrets_and_empty_yaml_mar
     assert b"logs/2026-01-01.txt" in b"\n".join(name.encode("ascii") for name in members)
 
 
+@pytest.mark.parametrize(
+    "header",
+    [
+        "14:22:01.123: [obs-browser] Set-Cookie: session=HeaderSecret991; "
+        "Domain=example.com; Path=/",
+        "Set-Cookie: session=HeaderSecret991; Domain=example.com; Path=/",
+        "Set-Cookie2: session=HeaderSecret991; Domain=example.com; Path=/",
+        "14:22:01.123: [obs-browser] Cookie: session=HeaderSecret991",
+        "Cookie: session=HeaderSecret991",
+        "14:22:01.123: [obs-browser] Authorization: (Bearer) HeaderSecret991",
+    ],
+)
+def test_prefixed_sensitive_headers_scrub_all_zip_copies(tmp_path: Path, header: str) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    secret = "HeaderSecret991"
+    (source / "basic/profiles/default/service.json").write_text('{"key":""}', encoding="utf-8")
+    (source / "logs/2026-01-01.txt").write_text(header + "\n", encoding="utf-8")
+    (source / "logs/2026-01-02.txt").write_text("widget copied " + secret, encoding="utf-8")
+    (source / "basic/scenes/main.json").write_text(
+        json.dumps({"sources": [], "copied": secret}), encoding="utf-8"
+    )
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        all_bytes = b"\n".join(archive.read(name) for name in archive.namelist())
+    assert secret.encode("ascii") not in all_bytes
+
+
+@pytest.mark.parametrize(
+    ("line", "secret"),
+    [
+        ("token=s3cret99xxK&region=us", "s3cret99xxK"),
+        ("token=s3cret99xxK;expires=123456", "s3cret99xxK"),
+        ("password: s3cret99xxK#note", "s3cret99xxK"),
+        ("StreamKey=s3cret99xxK&region=us", "s3cret99xxK"),
+        ("password: ab#cd&ef;gh99", "ab#cd&ef;gh99"),
+    ],
+)
+def test_glued_credential_tails_scrub_second_file_copies(
+    tmp_path: Path, line: str, secret: str
+) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    (source / "basic/profiles/default/service.json").write_text('{"key":""}', encoding="utf-8")
+    if line.startswith("StreamKey="):
+        (source / "basic/profiles/default/basic.ini").write_text(
+            "[Output]\n" + line + "\n", encoding="utf-8"
+        )
+        (source / "logs/2026-01-01.txt").write_text("ordinary log\n", encoding="utf-8")
+    else:
+        (source / "logs/2026-01-01.txt").write_text(line + "\n", encoding="utf-8")
+    (source / "logs/2026-01-02.txt").write_text("widget copied " + secret, encoding="utf-8")
+    (source / "basic/scenes/main.json").write_text(
+        json.dumps({"sources": [], "copied": secret}), encoding="utf-8"
+    )
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        all_bytes = b"\n".join(archive.read(name) for name in archive.namelist())
+    assert secret.encode("ascii") not in all_bytes
+
+
+def test_cookie_attribute_values_do_not_overomit_backup(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    (source / "logs/2026-01-01.txt").write_text(
+        "Cookie: session=SessionSecret991; Domain=twitch.tv; theme=overlay\n",
+        encoding="utf-8",
+    )
+    (source / "basic/scenes/main.json").write_text(
+        json.dumps(
+            {
+                "sources": [],
+                "urls": ["rtmp://live.twitch.tv/app", "https://twitch.tv/rin/overlay"],
+                "text": "overlay https://example.com/overlay",
+                "copied": "SessionSecret991",
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        scene = archive.read("basic/scenes/main.json")
+        all_bytes = b"\n".join(archive.read(name) for name in archive.namelist())
+    assert b"SessionSecret991" not in all_bytes
+    for benign in (
+        b"rtmp://live.twitch.tv/app",
+        b"https://twitch.tv/rin/overlay",
+        b"overlay",
+        b"https://example.com/overlay",
+    ):
+        assert benign in scene
+
+
 def test_unpromoted_continuations_do_not_scrub_other_files(tmp_path: Path) -> None:
     source = fixture(tmp_path / "obs")
     destination = tmp_path / "out"

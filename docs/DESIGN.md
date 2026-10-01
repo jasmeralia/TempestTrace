@@ -125,10 +125,19 @@ Unquoted URL query and fragment values end at whitespace, end of text, or a foll
 named parameter. Quotes and angle brackets end a value only when they are closing
 delimiters. Authorization assignments accept quoted names and values, keep a known
 scheme, and redact the credential, including a token on the next indented line.
-Cross-file scrubbing covers raw and percent-encoded forms of known literals in every
-file. RTMP path segments are checked individually and common application names and
-ordinary words are excluded. Unlisted camelCase `*Key` values are redacted only when
-they look like key material.
+Cross-file scrubbing covers raw, percent-encoded, JSON `\\u`, and `\\x` escaped
+forms of known literals in every file. RTMP path segments are checked individually
+and common application names are excluded. In-place URL redaction accepts
+alphabetic stream-key segments of eight or more characters, or segments of at least
+four characters containing a non-letter; cross-file harvesting uses the narrower
+mixed-case, hex, long-segment, or digit/punctuation rules so ordinary log words are
+preserved. URL userinfo passwords are redacted through the last `@` in the token,
+while numeric host ports and path `@` values are preserved. Literal matching treats
+underscore as a separator, uses alphanumeric boundaries for ordinary values, and
+permits long high-entropy values containing digits inside longer identifiers. Exact
+OBS hotkey enum names are exempt only in valid hotkey binding contexts. Matching
+numeric credentials in staged JSON are replaced with the redaction marker string.
+Unlisted camelCase `*Key` values are redacted only when they look like key material.
 
 For serialized JSON, verification is structural: inspect sensitive keys and scan
 decoded string values. For INI, classify assignments by key and parse JSON-valued

@@ -24,6 +24,7 @@ from urllib.parse import quote, quote_plus
 
 from tempesttrace.redaction import (
     _SENSITIVE_FREE_NAME,
+    REDACTED,
     RULE_VERSION,
     _guard_json_depth,
     _has_sensitive_query_assignment,
@@ -665,25 +666,34 @@ def _private_literal_patterns(secret: str) -> set[str]:
             patterns.add(escaped)
     if secret.isascii() and secret:
         patterns.add("".join(f"%{ord(character):02X}" for character in secret))
+        unicode_escaped = "".join(chr(92) + f"u00{ord(character):02x}" for character in secret)
+        hex_escaped = "".join(chr(92) + f"x{ord(character):02x}" for character in secret)
+        patterns.add(re.escape(unicode_escaped))
+        patterns.add(re.escape(hex_escaped))
+    elif secret:
+        patterns.add(re.escape("".join(chr(92) + f"u{ord(character):04x}" for character in secret)))
     return patterns
 
 
 def _compile_private_literals(secrets: set[str]) -> re.Pattern[str] | None:
-    patterns = sorted(
-        {
-            pattern
-            for secret in secrets
-            if _is_searchable_secret(secret)
-            for pattern in _private_literal_patterns(secret)
-        },
-        key=len,
-        reverse=True,
-    )
-    return (
-        re.compile(r"(?<!\w)(?:" + "|".join(patterns) + r")(?!\w)", re.IGNORECASE)
-        if patterns
-        else None
-    )
+    embedded: set[str] = set()
+    bounded: set[str] = set()
+    for secret in secrets:
+        if not _is_searchable_secret(secret):
+            continue
+        is_long_key = len(secret) >= 12 and any(char.isdigit() for char in secret)
+        target = embedded if is_long_key else bounded
+        target.update(_private_literal_patterns(secret))
+    alternatives = []
+    if embedded:
+        alternatives.append("(?:" + "|".join(sorted(embedded, key=len, reverse=True)) + ")")
+    if bounded:
+        alternatives.append(
+            r"(?<![A-Za-z0-9])(?:"
+            + "|".join(sorted(bounded, key=len, reverse=True))
+            + r")(?![A-Za-z0-9])"
+        )
+    return re.compile("(?:" + "|".join(alternatives) + ")", re.IGNORECASE) if alternatives else None
 
 
 def _scrub_private_literals(path: Path, pattern: re.Pattern[str] | None) -> int:
@@ -710,6 +720,10 @@ def _scrub_private_literals(path: Path, pattern: re.Pattern[str] | None) -> int:
                 return [scrub_values(item) for item in value]
             if isinstance(value, dict):
                 return {key: scrub_values(child) for key, child in value.items()}
+            if isinstance(value, int) and not isinstance(value, bool):
+                return REDACTED if pattern.search(str(value)) else value
+            if isinstance(value, float):
+                return REDACTED if pattern.search(json.dumps(value)) else value
             return value
 
         cleaned_text = json.dumps(scrub_values(document), ensure_ascii=False, indent=2) + "\n"
@@ -880,6 +894,9 @@ def create_backup(  # noqa: PLR0912, PLR0915
                 warnings.append(f"Could not safely include {rel_text}.")
                 continue
             if cross_redaction_count:
+                redaction_counts["credential_pattern"] = (
+                    redaction_counts.get("credential_pattern", 0) + cross_redaction_count
+                )
                 categories["credential_pattern"] = (
                     categories.get("credential_pattern", 0) + cross_redaction_count
                 )

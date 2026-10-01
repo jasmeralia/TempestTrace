@@ -8,8 +8,10 @@ import pytest
 
 from tempesttrace.backup import _contains_private_secret, _secret_scan
 from tempesttrace.redaction import (
+    _OBS_KEY_NAMES,
     RULE_VERSION,
     _is_sensitive_key,
+    _json_fragments,
     has_unredacted_embedded_json,
     has_unredacted_fields,
     has_unredacted_ini_fields,
@@ -577,8 +579,112 @@ def backup_secret_scan(path: Path) -> bool:
     return _secret_scan(path)
 
 
-def test_rule_version_is_fifteen() -> None:
-    assert RULE_VERSION == 16
+def test_rule_version_is_seventeen() -> None:
+    assert RULE_VERSION == 17
+
+
+@pytest.mark.parametrize("segment", ["mystreamkey", "abcdefghijklmno", "MYSTREAMKEY"])
+@pytest.mark.parametrize("kind", ["log", "json", "ini"])
+@pytest.mark.parametrize("path_prefix", ["", "live/"])
+def test_rtmp_uniform_case_alpha_key_is_redacted_in_place(
+    segment: str, kind: str, path_prefix: str, tmp_path: Path
+) -> None:
+    suffix = {"log": ".txt", "json": ".json", "ini": ".ini"}[kind]
+    path = tmp_path / ("fixture" + suffix)
+    value = f"rtmp://ingest.example.com/{path_prefix}{segment}"
+    content = value if kind == "log" else json.dumps({"server": value, "FFURL": value})
+    if kind == "ini":
+        content = f"[Output]\nserver={value}\nFFURL={value}\n"
+    path.write_text(content, encoding="utf-8")
+    redact_file_with_secrets(path)
+    assert segment not in path.read_text(encoding="utf-8")
+
+
+def test_rtmp_harvesting_does_not_scrub_streaming_log_word(tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(
+        "rtmp://cdn.example/live/streaming\nstreaming production started\n", encoding="utf-8"
+    )
+    redact_file_with_secrets(path)
+    cleaned = path.read_text(encoding="utf-8")
+    assert "streaming production started" in cleaned
+    assert "live/<REDACTED>" in cleaned
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://user:abcd/EFGH12@ingest.example.com/live",
+        "https://user:ab+cd/ef==@example.com/x",
+        "redis://:p@ss/word@10.1.2.3:6379/0",
+    ],
+)
+def test_userinfo_password_redacts_slashes_through_last_at(url: str, tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(url, encoding="utf-8")
+    redact_file_with_secrets(path)
+    assert "<REDACTED>@" in path.read_text(encoding="utf-8")
+
+
+def test_real_obs_key_enum_names_are_exempt_and_spoofs_are_not(tmp_path: Path) -> None:
+    assert len(_OBS_KEY_NAMES) == 509
+    assert all(
+        not has_unredacted_fields({"hotkeys": {"bindings": {"key": name}}})
+        for name in _OBS_KEY_NAMES
+    )
+    ini_value = json.dumps(
+        {
+            "bindings": [{"key": name} for name in sorted(_OBS_KEY_NAMES)]
+            + [{"key": "OBS_KEY_NK8SQ7WL91"}]
+        }
+    )
+    ini = tmp_path / "OBSBasic.ini"
+    ini.write_text(f"OBSBasic.Hotkeys={ini_value}\n", encoding="utf-8")
+    redact_file(ini)
+    ini_clean = ini.read_text(encoding="utf-8")
+    assert all(name in ini_clean for name in _OBS_KEY_NAMES)
+    assert "OBS_KEY_NK8SQ7WL91" not in ini_clean
+    for name in ("OBS_KEY_NK8SQ7WL91", "OBS_KEY_A1B2C3D4E5F6", "obs_key_f9", "OBS_KEY_"):
+        assert has_unredacted_fields({"hotkeys": {"bindings": {"key": name}}})
+
+
+def test_json_fragments_scales_for_many_small_objects(tmp_path: Path) -> None:
+    sample = '{"name":"Mic","volume":1,"mute":false} '
+    for size, bound in ((256 * 1024, 3.0), (1024 * 1024, 8.0)):
+        text = (sample * (size // len(sample) + 1))[:size]
+        started = time.perf_counter()
+        _json_fragments.__wrapped__(text)
+        assert time.perf_counter() - started < bound
+        path = tmp_path / f"json-fragments-{size}.txt"
+        path.write_text(text, encoding="utf-8")
+        try:
+            started = time.perf_counter()
+            redact_file_with_secrets(path)
+            assert time.perf_counter() - started < bound
+        finally:
+            path.unlink(missing_ok=True)
+
+    for text in ('[{"a":1}] ' * 10000, "{ " * 10000):
+        started = time.perf_counter()
+        _json_fragments.__wrapped__(text)
+        assert time.perf_counter() - started < 8.0
+
+
+@pytest.mark.parametrize(
+    "url, expected",
+    [
+        ("http://host:8080/path@name", "http://host:8080/path@name"),
+        ("https://cdn.example.com/@creator/video", "https://cdn.example.com/@creator/video"),
+        ("user@example.com", "user@example.com"),
+        ("https://example.com?email=a:b@c.com", "https://example.com?email=a:b@c.com"),
+        ("https://host#frag:x@y", "https://host#frag:x@y"),
+    ],
+)
+def test_url_userinfo_password_guards(url: str, expected: str, tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(url, encoding="utf-8")
+    redact_file_with_secrets(path)
+    assert path.read_text(encoding="utf-8").strip() == expected
 
 
 @pytest.mark.parametrize(

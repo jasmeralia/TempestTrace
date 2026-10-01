@@ -316,6 +316,112 @@ def test_cross_file_secret_scrub_is_order_independent_and_covers_scenes(tmp_path
     assert "keyint: 250" in content and "74%" in content
 
 
+def test_cross_file_literals_match_underscore_and_long_embedded_identifiers(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    secret = "live_443322_a1b2c3d4"
+    (source / "basic/profiles/default/service.json").write_text(
+        json.dumps({"settings": {"key": secret}}), encoding="utf-8"
+    )
+    (source / "logs/2026-01-01.txt").write_text(
+        f"writing live_{secret}_2026.flv\n"
+        f"widget https://example.com/alert/{secret}_v2\n"
+        f"ident xx{secret}yy\n",
+        encoding="utf-8",
+    )
+    (source / "basic/scenes/main.json").write_text(
+        json.dumps({"sources": [{"name": f"cam_{secret}_main"}]}), encoding="utf-8"
+    )
+    destination = tmp_path / "out"
+    destination.mkdir()
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        content = b"\n".join(archive.read(name) for name in archive.namelist())
+    assert secret.encode() not in content
+
+
+def test_cross_file_literals_preserve_short_word_boundaries(tmp_path: Path) -> None:
+    assert backup._compile_private_literals({"test"}).search("testing") is None
+    assert backup._compile_private_literals({"abcd"}).search("xabcdY") is None
+
+
+@pytest.mark.parametrize("number", [123456, 123456.0])
+def test_numeric_cross_file_secret_is_redacted_without_omitting_scene(
+    number: int | float, tmp_path: Path
+) -> None:
+    source = fixture(tmp_path / "obs")
+    (source / "basic/profiles/default/service.json").write_text(
+        json.dumps({"settings": {"key": number}}), encoding="utf-8"
+    )
+    (source / "basic/scenes/main.json").write_text(
+        json.dumps({"bitrate": number, "nested": [number, {"note": f"x {number} y"}], "other": 42}),
+        encoding="utf-8",
+    )
+    destination = tmp_path / "out"
+    destination.mkdir()
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        scene = json.loads(archive.read("basic/scenes/main.json"))
+    assert scene["bitrate"] == "<REDACTED>"
+    assert scene["nested"][0] == "<REDACTED>"
+    assert scene["other"] == 42
+
+
+@pytest.mark.parametrize(
+    "escaped",
+    [
+        r"\u005a\u0039\u0078\u0051\u002d\u0037\u006b\u004c\u006d\u0032\u0070",
+        r"\x5a\x39\x78\x51\x2d\x37\x6b\x4c\x6d\x32\x70",
+    ],
+)
+def test_json_and_hex_escaped_private_literals_are_scrubbed(escaped: str, tmp_path: Path) -> None:
+    secret = "Z9xQ-7kLm2p"
+    source = fixture(tmp_path / "obs")
+    (source / "basic/profiles/default/service.json").write_text(
+        json.dumps({"settings": {"key": secret}}), encoding="utf-8"
+    )
+    (source / "logs/2026-01-01.txt").write_text(f"escaped {escaped}\n", encoding="utf-8")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        body = archive.read("logs/2026-01-01.txt").decode()
+    assert "REDACTED" in body
+
+
+def test_non_ascii_json_unicode_escaped_private_literal_is_scrubbed(tmp_path: Path) -> None:
+    secret = "cafe-credential-" + chr(228)
+    source = fixture(tmp_path / "obs")
+    (source / "basic/profiles/default/service.json").write_text(
+        json.dumps({"settings": {"key": secret}}, ensure_ascii=False), encoding="utf-8"
+    )
+    escaped = "\\u" + "\\u".join(f"{ord(char):04x}" for char in secret)
+    (source / "logs/2026-01-01.txt").write_text(escaped + "\n", encoding="utf-8")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        assert b"REDACTED" in archive.read("logs/2026-01-01.txt")
+
+
+def test_manifest_summary_counts_include_cross_file_redactions(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    secret = "G3_MULTIFILE_SECRET_999"
+    (source / "basic/profiles/default/service.json").write_text(
+        json.dumps({"settings": {"key": secret}}), encoding="utf-8"
+    )
+    (source / "logs/2026-01-01.txt").write_text(f"copy {secret}\n", encoding="utf-8")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+    summed: dict[str, int] = {}
+    for record in manifest["files"]:
+        for category, count in record["redactions"].items():
+            summed[category] = summed.get(category, 0) + count
+    assert manifest["redaction_counts"] == summed
+
+
 def test_backup_promotes_without_hard_links(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

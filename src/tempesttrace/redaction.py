@@ -9,7 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-RULE_VERSION = 19
+RULE_VERSION = 20
 REDACTED = "<REDACTED>"
 _QUOTE_DELIMITER = (
     r"(?:\\*['\"]|`|&(?:quot|apos|ldquo|rdquo|lsquo|rsquo);|"
@@ -145,6 +145,16 @@ _SCHEME_NAMES = frozenset(
         "api-key",
     ]
 )
+_FREE_TEXT_SCHEME_WORDS = "|".join(
+    re.escape(value) for value in sorted(_SCHEME_NAMES, key=len, reverse=True)
+)
+_FREE_TEXT_SPECIAL_HINT = re.compile(
+    rf"(?i)(?<![A-Za-z0-9_.-]){_SENSITIVE_FREE_NAME}[ \t]*[=:][ \t]*"
+    rf"[\"'`]?(?:{_FREE_TEXT_SCHEME_WORDS})[\"'`]?"
+    rf"(?:[ \t]+\S|[ \t]*\r?\n(?:[ \t]*\r?\n)*[ \t]*\S)|"
+    rf"(?<![A-Za-z0-9_.-]){_SENSITIVE_FREE_NAME}[ \t]*[=:][ \t]*"
+    r"(?:[ \t]*\r?\n)+[ \t]*\S"
+)
 
 
 def _userinfo_candidate(match: re.Match[str]) -> bool:
@@ -254,6 +264,28 @@ def _redact_rtmp_segments(text: str, counts: dict[str, int]) -> str:
 
 def _looks_like_key_material(value: str) -> bool:
     return len(value) >= 8 and any(not character.isalpha() for character in value)
+
+
+def _never_promote_literal(value: str) -> bool:
+    cleaned = _unquote(value)
+    folded = cleaned.casefold()
+    return (
+        not cleaned
+        or cleaned == REDACTED
+        or folded in {"null", "undefined", "none", "nil", "true", "false"}
+        or folded in _SCHEME_NAMES
+        or cleaned in _OBS_KEY_NAMES
+        or cleaned.startswith("(")
+        or cleaned.endswith(")")
+        or _is_rtmp_quality_or_resolution(cleaned)
+    )
+
+
+def _promotable_free_text(value: str, *, explicit_auth: bool = False) -> bool:
+    cleaned = _unquote(value)
+    return not _never_promote_literal(cleaned) and (
+        explicit_auth or _looks_like_key_material(cleaned)
+    )
 
 
 _RTMP_APPLICATION_NAMES = frozenset(
@@ -951,7 +983,7 @@ def _strong_credential_values(value: Any, context: tuple[str, ...] = ()) -> set[
             values.update(_strong_credential_values(child, context))
     elif isinstance(value, str):
         values.update(_strong_embedded_secrets(value))
-    return values
+    return {literal for literal in values if not _never_promote_literal(literal)}
 
 
 def _weak_credential_values(value: Any) -> set[str]:
@@ -1381,6 +1413,20 @@ def _authorization_scheme(match: re.Match[str]) -> bool:
     return scheme in _SCHEME_NAMES
 
 
+def _scheme_prefixed_value_is_redacted(match: re.Match[str]) -> bool:
+    """Recognize a preserved scheme followed by a redacted credential token."""
+    value = _unquote(match.group(2)).strip()
+    pieces = value.split(None, 1)
+    if not pieces or pieces[0].casefold().rstrip(":=") not in _SCHEME_NAMES:
+        return False
+    if len(pieces) > 1:
+        credential = pieces[1].split(None, 1)[0].rstrip(",;}")
+        return _unquote(credential) == REDACTED
+    tail = match.string[match.end(2) :].splitlines()[0]
+    next_token = re.match(r"[ \t]+([^\s,;]+)", tail)
+    return bool(next_token and _unquote(next_token.group(1).rstrip(",;}")) == REDACTED)
+
+
 def _redact_authorization_remainders(  # noqa: PLR0912, PLR0915
     text: str, counts: dict[str, int]
 ) -> str:
@@ -1593,7 +1639,100 @@ def _clean_log_key(token: str) -> str:
     return next((value for value in field.groups() if value), "") if field else ""
 
 
-def _embedded_secrets(text: str) -> set[str]:
+def _free_text_credential_spans(  # noqa: PLR0912, PLR0915
+    text: str,
+) -> list[tuple[int, int, str, bool]]:
+    """Return sensitive free-text credentials, including scheme and next-line forms."""
+    if not _FREE_TEXT_SPECIAL_HINT.search(text):
+        return []
+    found: list[tuple[int, int, str, bool]] = []
+    assignment = re.compile(
+        rf"(?i)(?<![A-Za-z0-9_.-])({_SENSITIVE_FREE_NAME})"
+        r"[ \t]*[=:][ \t]*([^\r\n]*)"
+    )
+    json_spans = [(start, end) for start, end, _value, _context in _json_fragments(text)]
+    json_starts = [start for start, _end in json_spans]
+    lines = list(re.finditer(r"[^\r\n]*(?:\r?\n|\r|$)", text))
+    for line_index, line in enumerate(lines):
+        body = line.group(0).rstrip("\r\n")
+        for match in assignment.finditer(body):
+            absolute_start = line.start() + match.start()
+            fragment_index = bisect_right(json_starts, absolute_start) - 1
+            if fragment_index >= 0 and absolute_start < json_spans[fragment_index][1]:
+                continue
+            key = _clean_log_key(match.group(1))
+            if not key or not _is_sensitive_key(key):
+                continue
+            raw_value = match.group(2)
+            value_offset = line.start() + match.start(2)
+            stripped = raw_value.strip()
+            auth = "authorization" in key.casefold() or "cookie" in key.casefold()
+            if auth and re.search(r"\\[\"'`]", raw_value):
+                continue
+            if stripped:
+                leading = len(raw_value) - len(raw_value.lstrip())
+                scheme_value = re.match(
+                    rf"(?i)[\"'`]?(?P<scheme>{_FREE_TEXT_SCHEME_WORDS})[\"'`]?[ \t]+"
+                    r"[\"'`]?(?P<credential>[^\s\"'`]+)",
+                    raw_value[leading:],
+                )
+                if scheme_value:
+                    token = scheme_value.group("credential")
+                    literal = _unquote(token.rstrip(",;}"))
+                    if literal and literal != REDACTED:
+                        start = value_offset + leading + scheme_value.start("credential")
+                        found.append((start, start + len(token), literal, auth))
+                    continue
+                pieces = list(re.finditer(r"[^\s]+", raw_value))
+                first = _unquote(pieces[0].group(0)).rstrip(",;}") if pieces else ""
+                if first.casefold() in _SCHEME_NAMES:
+                    if len(pieces) > 1:
+                        token = pieces[1]
+                        literal = _unquote(token.group(0).rstrip(",;}"))
+                        if literal and literal != REDACTED:
+                            found.append(
+                                (
+                                    value_offset + token.start(),
+                                    value_offset + token.end(),
+                                    literal,
+                                    auth,
+                                )
+                            )
+                        continue
+                    following_index = line_index + 1
+                else:
+                    continue
+            else:
+                following_index = line_index + 1
+            while following_index < len(lines):
+                following = lines[following_index]
+                next_body = following.group(0).rstrip("\r\n")
+                if next_body.strip():
+                    indent_length = len(next_body) - len(next_body.lstrip())
+                    next_value = next_body[indent_length:]
+                    if indent_length or not re.search(r"\s", next_value):
+                        token_match = re.search(r"\S+", next_value)
+                        if token_match:
+                            token_text = token_match.group(0)
+                            literal = _unquote(token_text.rstrip(",;}"))
+                            if literal and literal != REDACTED:
+                                start = following.start() + indent_length + token_match.start()
+                                found.append((start, start + len(token_text), literal, auth))
+                    break
+                following_index += 1
+    return list(dict.fromkeys(found))
+
+
+def _redact_free_text_credential_spans(text: str, counts: dict[str, int]) -> str:
+    spans = _free_text_credential_spans(text)
+    for start, end, _literal, _explicit_auth in reversed(spans):
+        if _unquote(text[start:end]) != REDACTED:
+            text = text[:start] + _quoted_redacted(text[start:end]) + text[end:]
+            counts["credential_pattern"] = counts.get("credential_pattern", 0) + 1
+    return text
+
+
+def _embedded_secrets(text: str) -> set[str]:  # noqa: PLR0912
     values: set[str] = set()
     if _BROKEN_BACKSLASH_ASSIGNMENT.fullmatch(text):
         return values
@@ -1612,8 +1751,7 @@ def _embedded_secrets(text: str) -> set[str]:
             _query_value_parts(match.group(3))[0]
             for match in _URL_QUERY_SECRET.finditer(text)
             if _is_sensitive_key(match.group(2), ("__url_query__",))
-            and _unquote(_query_value_parts(match.group(3))[0]).casefold()
-            not in {"null", "undefined", "none", "nil", "true", "false"}
+            and _promotable_free_text(_query_value_parts(match.group(3))[0])
         )
     if "://" in text:
         values.update(
@@ -1625,12 +1763,23 @@ def _embedded_secrets(text: str) -> set[str]:
     if "streamlabs.com/" in text.casefold():
         values.update(match.group(2) for match in _STREAMLABS_WIDGET_TOKEN.finditer(text))
     if _SENSITIVE_NAME_HINT.search(text):
+        for match in _CLI_ASSIGNMENT.finditer(_mask_urls(text)):
+            option = re.match(r"--?([A-Za-z0-9_.-]+)", match.group(1))
+            if option and _is_sensitive_key(option.group(1)):
+                value = _unquote(match.group(2))
+                if _promotable_free_text(value):
+                    values.add(value)
         values.update(
             literal
             for _name, value, _start, _end, noncredential in _comment_assignments(text)
             if not noncredential
             for literal in [_unquote(value)]
-            if literal.casefold() not in {"null", "undefined", "none", "nil", "true", "false"}
+            if _promotable_free_text(literal)
+        )
+        values.update(
+            literal
+            for _start, _end, literal, explicit_auth in _free_text_credential_spans(text)
+            if _promotable_free_text(literal, explicit_auth=explicit_auth)
         )
     for pattern in _LOG_PATTERNS if _SENSITIVE_NAME_HINT.search(text) else ():
         if pattern is _LOG_PATTERNS[-1] and "authorization" not in text.casefold():
@@ -1658,12 +1807,9 @@ def _embedded_secrets(text: str) -> set[str]:
                 if pattern is _LOG_PATTERNS[-1] and not _authorization_scheme(match):
                     return match.group(0)
                 literal = _unquote(match.group(2))
-                if (
-                    len(literal) >= 4
-                    and not literal.isdigit()
-                    and literal.casefold()
-                    not in {"null", "undefined", "none", "nil", "true", "false"}
-                ):
+                match_key = _log_match_key(match).casefold()
+                explicit_auth = "authorization" in match_key or "cookie" in match_key
+                if _promotable_free_text(literal, explicit_auth=explicit_auth):
                     key = _log_match_key(match)
                     if _is_weak_camel_key(key) and not _looks_like_key_material(literal):
                         return match.group(0)
@@ -1676,13 +1822,7 @@ def _embedded_secrets(text: str) -> set[str]:
                 collect(match)
     for _start, _end, value, context in _json_fragments(text):
         values.update(_credential_values(value, context))
-    return {
-        value
-        for value in values
-        if value
-        and value != REDACTED
-        and value.casefold() not in {"null", "undefined", "none", "nil", "true", "false"}
-    }
+    return {value for value in values if value and not _never_promote_literal(value)}
 
 
 def _strong_embedded_secrets(text: str) -> set[str]:
@@ -1699,7 +1839,12 @@ def _strong_embedded_secrets(text: str) -> set[str]:
                 _is_sensitive_key(key, value=literal)
                 and not _is_weak_camel_key(key)
                 and literal
-                and literal != REDACTED
+                and not _never_promote_literal(literal)
+                and (
+                    "authorization" in key.casefold()
+                    or "cookie" in key.casefold()
+                    or _looks_like_key_material(literal)
+                )
             ):
                 values.add(literal)
     if _has_sensitive_query_assignment(text):
@@ -1707,13 +1852,18 @@ def _strong_embedded_secrets(text: str) -> set[str]:
             _query_value_parts(match.group(3))[0]
             for match in _URL_QUERY_SECRET.finditer(text)
             if _is_sensitive_key(match.group(2), ("__url_query__",))
+            and _promotable_free_text(_query_value_parts(match.group(3))[0])
         )
     for match in _URL_USERINFO.finditer(text):
-        if _userinfo_candidate(match) and match.group(3) != f"{REDACTED}@":
+        if (
+            _userinfo_candidate(match)
+            and match.group(3) != f"{REDACTED}@"
+            and not _never_promote_literal(match.group(3)[:-1])
+        ):
             values.add(match.group(3)[:-1])
     for _start, _end, value, context in _json_fragments(text):
         values.update(_strong_credential_values(value, context))
-    return values
+    return {literal for literal in values if not _never_promote_literal(literal)}
 
 
 def _rtmp_key(value: str) -> str:
@@ -1863,10 +2013,7 @@ def _credential_values(value: Any, context: tuple[str, ...] = ()) -> set[str]:
                 if _is_weak_camel_key(key):
                     literals = {item for item in literals if _looks_like_key_material(item)}
                 values.update(
-                    literal
-                    for literal in literals
-                    if literal.casefold()
-                    not in {"null", "undefined", "none", "nil", "true", "false"}
+                    literal for literal in literals if not _never_promote_literal(literal)
                 )
             else:
                 values.update(_credential_values(child, child_context))
@@ -1875,7 +2022,77 @@ def _credential_values(value: Any, context: tuple[str, ...] = ()) -> set[str]:
             values.update(_credential_values(child, context))
     elif isinstance(value, str):
         values.update(_embedded_secrets(value))
-    return values
+    return {literal for literal in values if not _never_promote_literal(literal)}
+
+
+@lru_cache(maxsize=128)
+def _compiled_local_literals(
+    strong: tuple[str, ...], weak: tuple[str, ...]
+) -> re.Pattern[str] | None:
+    buckets: dict[str, set[str]] = {
+        "strong_embedded": set(),
+        "weak_embedded": set(),
+        "strong_bounded": set(),
+        "weak_bounded": set(),
+        "numeric": set(),
+    }
+    for literal in sorted(set(strong) | set(weak), key=len, reverse=True):
+        if (
+            _never_promote_literal(literal)
+            or len(literal) < 4
+            or (literal.isdigit() and len(literal) < 6)
+        ):
+            continue
+        is_weak = literal in weak and literal not in strong
+        numeric = bool(re.fullmatch(r"-?\d+(?:\.\d+)?", literal))
+        long_key = len(literal) >= 12 and any(char.isdigit() for char in literal)
+        if numeric:
+            bucket = "numeric"
+        elif long_key:
+            bucket = "weak_embedded" if is_weak else "strong_embedded"
+        else:
+            bucket = "weak_bounded" if is_weak else "strong_bounded"
+        buckets[bucket].add(literal)
+
+    def trie(values: set[str]) -> str:
+        root: dict[str, Any] = {}
+        for value in values:
+            node = root
+            for character in value:
+                node = node.setdefault(character, {})
+            node[""] = None
+
+        def render(node: dict[str, Any]) -> str:
+            choices = [
+                re.escape(character) + render(child)
+                for character, child in sorted(
+                    ((key, child) for key, child in node.items() if key),
+                    key=lambda pair: len(pair[1]),
+                    reverse=True,
+                )
+            ]
+            if "" in node:
+                choices.append("")
+            if len(choices) == 1:
+                return choices[0]
+            return "(?:" + "|".join(choices) + ")"
+
+        return render(root)
+
+    alternatives: list[str] = []
+    for bucket in ("strong_embedded", "weak_embedded", "strong_bounded", "weak_bounded", "numeric"):
+        values = buckets[bucket]
+        if not values:
+            continue
+        body = trie(values)
+        if bucket.startswith("strong_"):
+            body = "(?i:" + body + ")"
+        if bucket.endswith("bounded"):
+            body = r"(?<![A-Za-z0-9])" + body + r"(?![A-Za-z0-9])"
+        elif bucket == "numeric":
+            body = r"(?<![A-Za-z0-9.-])" + body + r"(?![A-Za-z0-9.-])"
+        alternatives.append(body)
+    return re.compile("(?:" + "|".join(alternatives) + ")") if alternatives else None
 
 
 def _scrub_text(text: str, secrets: set[str]) -> str:
@@ -1890,10 +2107,10 @@ def _scrub_text(text: str, secrets: set[str]) -> str:
         return match.group(0)
 
     text = _sub_outside_json(text, _ASSIGNMENT_VALUE, scrub)
-    for literal in sorted(secrets, key=len, reverse=True):
-        if len(literal) >= 4 and not literal.isdigit():
-            text = re.sub(rf"(?<!\w){re.escape(literal)}(?!\w)", REDACTED, text)
-    return text
+    strong = tuple(getattr(secrets, "strong", secrets))
+    weak = tuple(getattr(secrets, "weak", ()))
+    pattern = _compiled_local_literals(strong, weak)
+    return pattern.sub(REDACTED, text) if pattern else text
 
 
 def _redact_embedded(  # noqa: PLR0912, PLR0915
@@ -1925,6 +2142,8 @@ def _redact_embedded(  # noqa: PLR0912, PLR0915
             text,
         )
 
+    text = _redact_free_text_credential_spans(text, counts)
+
     def replace(match: re.Match[str], *, check_noncredential: bool = True) -> str:
         literal = _unquote(match.group(2))
         if literal == REDACTED or literal.casefold() in {
@@ -1935,6 +2154,8 @@ def _redact_embedded(  # noqa: PLR0912, PLR0915
             "true",
             "false",
         }:
+            return match.group(1) + match.group(2)
+        if literal.casefold() in _SCHEME_NAMES:
             return match.group(1) + match.group(2)
         if (
             check_noncredential
@@ -2217,6 +2438,7 @@ def has_unredacted_embedded_json(text: str) -> bool:  # noqa: PLR0911
                     and _log_match_key(match).casefold().endswith("authorization")
                     and _authorization_has_scheme(match)
                 )
+                and not _scheme_prefixed_value_is_redacted(match)
                 and (
                     pattern is _LOG_PATTERNS[-1]
                     or _is_sensitive_key(_log_match_key(match), value=_unquote(match.group(2)))

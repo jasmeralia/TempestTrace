@@ -16,8 +16,10 @@ from tempesttrace.backup import (
 from tempesttrace.redaction import (
     _OBS_KEY_NAMES,
     RULE_VERSION,
+    _embedded_secrets,
     _is_sensitive_key,
     _json_fragments,
+    _scrub_text,
     has_unredacted_embedded_json,
     has_unredacted_fields,
     has_unredacted_ini_fields,
@@ -585,8 +587,8 @@ def backup_secret_scan(path: Path) -> bool:
     return _secret_scan(path)
 
 
-def test_rule_version_is_nineteen() -> None:
-    assert RULE_VERSION == 19
+def test_rule_version_is_twenty() -> None:
+    assert RULE_VERSION == 20
 
 
 @pytest.mark.parametrize(
@@ -1708,7 +1710,7 @@ def test_url_query_delimiters_end_only_that_query_parameter(tmp_path: Path) -> N
     assert not _secret_scan(path)
 
 
-def test_punctuation_seeded_fuzz_has_no_shipped_leaks(tmp_path: Path) -> None:
+def test_punctuation_seeded_fuzz_has_no_shipped_leaks(tmp_path: Path) -> None:  # noqa: PLR0912
     rng = random.Random(9031)
     names = [
         "password",
@@ -1734,9 +1736,23 @@ def test_punctuation_seeded_fuzz_has_no_shipped_leaks(tmp_path: Path) -> None:
             secret += chr(233)
         quote = rng.choice(["", "'", '"'])
         kind = rng.choice(["log", "ini", "json"])
-        value = f"{quote}{secret}{quote}"
+        form = rng.choice(["plain", "scheme", "nextline", "prose"]) if kind == "log" else "plain"
+        planted = form != "prose"
+        if form in {"scheme", "nextline"}:
+            secret = "".join(character for character in secret if character.isalnum())
+            if len(secret) < 8:
+                secret = "SafeSecret99"
+        if form == "scheme":
+            value = f"Bearer {secret}"
+        elif form == "nextline":
+            value = f"\n    {secret}"
+        elif form == "prose":
+            value = "server returned 401"
+        else:
+            value = f"{quote}{secret}{quote}"
         if kind == "log":
-            content, filename = f"info: {name} = {value}\n", "current.txt"
+            separator = ":" if form in {"nextline", "prose"} else " ="
+            content, filename = f"info: {name}{separator} {value}\n", "current.txt"
         elif kind == "ini":
             content, filename = f"[General]\nNote={name}={value}\n", "global.ini"
         else:
@@ -1747,12 +1763,106 @@ def test_punctuation_seeded_fuzz_has_no_shipped_leaks(tmp_path: Path) -> None:
         _counts, _total, secrets = redact_file_with_secrets(path)
         output = read_text_safely(path)
         flagged = _contains_private_secret(path, secrets) or _secret_scan(path)
-        if secret in output and not flagged:
+        if planted and secret in output and not flagged:
             leaks.append(content)
-        elif secret not in output and flagged:
+        elif planted and secret not in output and flagged:
             overomissions.append(content)
+        if form == "prose":
+            assert "server" not in _embedded_secrets(content)
     assert leaks == []
     assert overomissions == []
+
+
+@pytest.mark.parametrize(
+    ("line", "credential", "expected"),
+    [
+        (
+            "token: Bearer eyJhbGciOiJIUzI1NiJ9.payloadDATA.sigPART99\n",
+            "eyJhbGciOiJIUzI1NiJ9.payloadDATA.sigPART99",
+            "token: Bearer <REDACTED>\n",
+        ),
+        (
+            "password: Basic dXNlcjpzM2NyZXQ=\n",
+            "dXNlcjpzM2NyZXQ=",
+            "password: Basic <REDACTED>\n",
+        ),
+    ],
+)
+def test_non_authorization_scheme_assignments_redact_and_harvest_credential(
+    tmp_path: Path, line: str, credential: str, expected: str
+) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(line, encoding="utf-8")
+    _counts, _total, secrets = redact_file_with_secrets(path)
+    assert path.read_text(encoding="utf-8") == expected
+    assert credential in secrets
+    assert "Bearer" not in secrets and "Basic" not in secrets
+
+
+@pytest.mark.parametrize(
+    ("label", "prefix", "credential"),
+    [
+        ("password", "", "NextLineSecret99xx"),
+        ("token", "Bearer", "eyJhbGciOiJIUzI1NiJ9.payloadDATA.sigPART99"),
+        ("Authorization", "Bearer", "eyJhbGciOiJIUzI1NiJ9.payloadDATA.sigPART99"),
+    ],
+)
+def test_indented_next_line_credentials_are_harvested(
+    tmp_path: Path, label: str, prefix: str, credential: str
+) -> None:
+    path = tmp_path / "current.txt"
+    same_line = f" {prefix}" if prefix else ""
+    path.write_text(f"{label}:{same_line}\n    {credential}\n", encoding="utf-8")
+    _counts, _total, secrets = redact_file_with_secrets(path)
+    assert credential in secrets
+    assert "<REDACTED>" in path.read_text(encoding="utf-8")
+
+
+def test_single_alternation_scrub_scales_with_many_literals() -> None:
+    secrets = {f"word{index:05d}xx" for index in range(4000)}
+    text = "\n".join(f"event {secret} tail" for secret in secrets)
+    started = time.perf_counter()
+    cleaned = _scrub_text(text, secrets)
+    elapsed = time.perf_counter() - started
+    assert "word00000xx" not in cleaned and "word03999xx" not in cleaned
+    assert elapsed < 3
+
+
+def test_free_text_harvest_promotion_requires_key_material(tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(
+        "token: server returned 401\npassword: required\nkey: expired\n"
+        "stream key: (not set)\nStream Key: Test\nkey: 1920x1080\n"
+        "key: bitrate\ntoken: nvenc\nkey: OBS_KEY_RETURN\n"
+        "token: Qk7mN2pL9xR4\n",
+        encoding="utf-8",
+    )
+    _counts, _total, secrets = redact_file_with_secrets(path)
+    assert "Qk7mN2pL9xR4" in secrets
+    assert not secrets.intersection(
+        {
+            "server",
+            "required",
+            "expired",
+            "(not",
+            "Test",
+            "1920x1080",
+            "bitrate",
+            "nvenc",
+            "OBS_KEY_RETURN",
+        }
+    )
+    cli = tmp_path / "cli.txt"
+    cli.write_text("obs --websocket_password Qk7mN2pL9xR4\n", encoding="utf-8")
+    _counts, _total, cli_secrets = redact_file_with_secrets(cli)
+    assert "Qk7mN2pL9xR4" in cli_secrets
+
+
+def test_explicit_credential_field_still_promotes_short_literal(tmp_path: Path) -> None:
+    path = tmp_path / "service.json"
+    path.write_text('{"key":"Test"}', encoding="utf-8")
+    _counts, _total, secrets = redact_file_with_secrets(path)
+    assert "Test" in secrets
 
 
 @pytest.mark.parametrize(

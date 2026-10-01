@@ -403,7 +403,8 @@ def test_private_literal_equal_to_json_property_name_is_not_overmatched(tmp_path
         assert "basic/scenes/main.json" in archive.namelist()
         cleaned = json.loads(archive.read("basic/scenes/main.json"))
     assert cleaned["server"] == "safe"
-    assert cleaned["note"] == "<REDACTED>"
+    # The free-text word "hotkeys" is prose, so it is no longer promoted as a literal.
+    assert cleaned["note"] == "hotkeys"
     assert cleaned["hotkeys"][0]["key"] == "OBS_KEY_F9"
     assert cleaned["hotkeys"][1]["key"] == "OBS_KEY_F10"
 
@@ -453,6 +454,105 @@ def test_redacting_progress_is_monotonic_and_ends_at_total(tmp_path: Path) -> No
         current for current, _total in redacting
     )
     assert redacting[-1][0] == redacting[-1][1]
+    fractions = [current / total for current, total in redacting if total]
+    assert fractions == sorted(fractions)
+    assert len({total for _current, total in redacting}) == 1
+
+
+def test_scheme_and_next_line_credentials_scrub_second_copies(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    jwt = "eyJhbGciOiJIUzI1NiJ9.payloadDATA.sigPART99"
+    quoted_jwt = "eyJhbGciOiJub25lIn0.quotedPayload.sigPART98"
+    log = source / "logs/2026-01-01.txt"
+    log.write_text(
+        f"token: Bearer {jwt}\nAuthorization: Bearer\n    {jwt}\n"
+        f'token: "Bearer {quoted_jwt}"\npassword:\n    NextLineSecret99xx\n',
+        encoding="utf-8",
+    )
+    (source / "basic/scenes/main.json").write_text(
+        json.dumps(
+            {
+                "url": f"https://example.com/hook?note={jwt}",
+                "text": f"copy {jwt} and {quoted_jwt}",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (source / "basic/profiles/default/basic.ini").write_text(
+        f"[General]\nnote={jwt}\n", encoding="utf-8"
+    )
+    destination = tmp_path / "out"
+    destination.mkdir()
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        content = b"\n".join(archive.read(name) for name in archive.namelist())
+    assert jwt.encode() not in content
+    assert quoted_jwt.encode() not in content
+    assert b"NextLineSecret99xx" not in content
+
+
+def test_prose_free_text_values_do_not_damage_other_backup_files(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    log = source / "logs/2026-01-01.txt"
+    log.write_text(
+        "token: server returned 401\npassword: required\nkey: expired\n"
+        "secret: none\ntoken: undefined\nstream key: (not set)\n"
+        "Stream Key: Test\nkey: 1920x1080\nkey: bitrate\ntoken: nvenc\n"
+        "key: OBS_KEY_RETURN\nWebSocket server listening\n",
+        encoding="utf-8",
+    )
+    (source / "basic/scenes/main.json").write_text(
+        json.dumps(
+            {
+                "names": ["Test", "Server Overlay", "required", "expired"],
+                "url": "https://server.example.com/overlay/alerts?region=us",
+                "path": "C:/Users/Rin/Videos/Test/server-recording.mkv",
+                "text": "password required on the door",
+                "encoder": "jim_nvenc_h264",
+                "resolution": "1920x1080",
+                "hotkey": "OBS_KEY_RETURN",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (source / "global.ini").write_text(
+        "[General]\nServer=https://server.example.com/overlay\n"
+        "Recording=C:/Users/Rin/Videos/Test\n",
+        encoding="utf-8",
+    )
+    destination = tmp_path / "out"
+    destination.mkdir()
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        scene = json.loads(archive.read("basic/scenes/main.json"))
+        ini = archive.read("global.ini").decode("utf-8")
+        cleaned_log = archive.read("logs/2026-01-01.txt").decode("utf-8")
+    assert scene["names"] == ["Test", "Server Overlay", "required", "expired"]
+    assert scene["url"] == "https://server.example.com/overlay/alerts?region=us"
+    assert scene["path"] == "C:/Users/Rin/Videos/Test/server-recording.mkv"
+    assert scene["text"] == "password required on the door"
+    assert scene["encoder"] == "jim_nvenc_h264"
+    assert scene["resolution"] == "1920x1080"
+    assert scene["hotkey"] == "OBS_KEY_RETURN"
+    assert "Server=https://server.example.com/overlay" in ini
+    assert "Recording=C:/Users/Rin/Videos/Test" in ini
+    assert "WebSocket server listening" in cleaned_log
+    # The assignment values themselves remain fail-safe redactions.
+    assert "password: <REDACTED>" in cleaned_log
+
+
+def test_explicit_short_credential_still_scrubs_other_files(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    (source / "basic/profiles/default/service.json").write_text(
+        '{"settings":{"key":"Test"}}', encoding="utf-8"
+    )
+    (source / "basic/scenes/main.json").write_text('{"name":"Test"}', encoding="utf-8")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        scene = json.loads(archive.read("basic/scenes/main.json"))
+    assert scene["name"] == "<REDACTED>"
 
 
 @pytest.mark.parametrize("number", [123456, 123456.0])

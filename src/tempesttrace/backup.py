@@ -23,6 +23,7 @@ from pathlib import Path
 from urllib.parse import quote, quote_plus
 
 from tempesttrace.redaction import (
+    _SCHEME_NAMES,
     _SENSITIVE_FREE_NAME,
     REDACTED,
     RULE_VERSION,
@@ -39,6 +40,7 @@ from tempesttrace.redaction import (
     _query_value_is_redacted,
     _query_value_parts,
     _redact_authorization_remainders,
+    _redact_free_text_credential_spans,
     has_unredacted_embedded_json,
     has_unredacted_fields,
     has_unredacted_ini_fields,
@@ -454,6 +456,8 @@ def _independent_secret_scan(text: str) -> bool:  # noqa: PLR0912
         return False
     if _redact_authorization_remainders(text, {}) != text:
         return True
+    if _redact_free_text_credential_spans(text, {}) != text:
+        return True
     folded_text = text.casefold()
     possible_hotkeys = any(
         token in folded_text
@@ -496,34 +500,16 @@ def _independent_secret_scan(text: str) -> bool:  # noqa: PLR0912
             continue
         if _is_weak_camel_key(name) and not _looks_like_key_material(unquoted):
             continue
-        if normalized == "authorization":
+        if normalized == "authorization" or _is_sensitive_signature_name(name):
             parts = unquoted.split(None, 1)
-            schemes = {
-                "bearer",
-                "basic",
-                "digest",
-                "token",
-                "bot",
-                "oauth",
-                "oauth2",
-                "negotiate",
-                "ntlm",
-                "kerberos",
-                "mac",
-                "hawk",
-                "aws4-hmac-sha256",
-                "splunk",
-                "key",
-                "apikey",
-                "sharedaccesssignature",
-                "client-id",
-            }
-            if parts and parts[0].casefold() in schemes:
+            if parts and parts[0].casefold() in _SCHEME_NAMES:
                 if len(parts) == 1:
                     continue
                 tail = text[match.end("value") :]
                 next_value = re.match(r"[ \t]+([^\s,;]+)", tail)
                 if next_value and _unwrap_signature_value(next_value.group(1)) == "<REDACTED>":
+                    continue
+                if _unwrap_signature_value(parts[1].split(None, 1)[0]) == "<REDACTED>":
                     continue
         return True
     if _has_sensitive_query_assignment(text):
@@ -655,7 +641,10 @@ def _private_literal_patterns(secret: str) -> set[str]:
             mixed.append(rf"(?:{re.escape(char)}|%{hex_pattern}|%25{hex_pattern})")
         else:
             mixed.append(re.escape(char))
-    patterns.add("".join(mixed))
+    # Fully encoded forms below cover alphanumeric literals. Avoid a costly
+    # per-character mixed-encoding expression for large harvested token sets.
+    if any(not character.isalnum() for character in secret):
+        patterns.add("".join(mixed))
     for candidate in (secret, quote(secret, safe=""), quote_plus(secret)):
         if candidate:
             escaped = re.escape(candidate)
@@ -939,6 +928,7 @@ def create_backup(  # noqa: PLR0912, PLR0915
         weak_secrets: set[str] = set()
         strong_secrets: set[str] = set()
         pending: list[tuple[Path, Path, Path, dict[str, int], bool, str]] = []
+        redacting_total = 2 * len(files)
         for index, source_file in enumerate(files, 1):
             if cancelled is not None and cancelled():
                 raise BackupCancelled("Collection cancelled.")
@@ -973,7 +963,7 @@ def create_backup(  # noqa: PLR0912, PLR0915
                     if re.search(r"\[{201,}", log_text):
                         raise ValueError("Log contains excessive nested brackets.")
                 if progress:
-                    progress("redacting", index - 1, len(files))
+                    progress("redacting", index - 1, redacting_total)
                 categories, _redaction_count, secrets = redact_file_with_secrets(private_staged)
                 discovered_secrets.update(secrets)
                 weak_secrets.update(getattr(secrets, "weak", set()))
@@ -1032,7 +1022,7 @@ def create_backup(  # noqa: PLR0912, PLR0915
             if cancelled is not None and cancelled():
                 raise BackupCancelled("Collection cancelled.")
             if progress:
-                progress("redacting", len(files) + index - 1, len(files) + len(pending))
+                progress("redacting", len(files) + index - 1, redacting_total)
             try:
                 cross_redaction_count = _scrub_private_literals(
                     private_staged, private_patterns, numeric_secrets
@@ -1083,7 +1073,7 @@ def create_backup(  # noqa: PLR0912, PLR0915
             )
 
         if progress:
-            progress("redacting", len(files) + len(pending), len(files) + len(pending))
+            progress("redacting", redacting_total, redacting_total)
         if not records:
             raise ValueError("No supported OBS files could be safely included.")
         if cancelled is not None and cancelled():

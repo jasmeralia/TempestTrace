@@ -345,6 +345,112 @@ def test_rename_noreplace_preserves_renameat2_eexist(
     assert destination.read_bytes() == b"old"
 
 
+def test_rename_noreplace_posix_last_resort_uses_exclusive_placeholder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_bytes(b"new content")
+
+    def unsupported(*_args: object, **_kwargs: object) -> None:
+        raise OSError(backup.errno.ENOTSUP, "unsupported")
+
+    monkeypatch.setattr(backup, "_renameat2_call", unsupported)
+    monkeypatch.setattr(backup.os, "link", unsupported)
+    monkeypatch.setattr(backup.sys, "platform", "darwin")
+
+    backup._rename_noreplace(source, destination)
+
+    assert destination.read_bytes() == b"new content"
+    assert not source.exists()
+
+
+def test_rename_noreplace_posix_removes_its_placeholder_when_replace_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_bytes(b"new content")
+
+    def unsupported(*_args: object, **_kwargs: object) -> None:
+        raise OSError(backup.errno.ENOTSUP, "unsupported")
+
+    def failed_replace(*_args: object, **_kwargs: object) -> None:
+        raise OSError(backup.errno.EIO, "replace failed")
+
+    monkeypatch.setattr(backup, "_renameat2_call", unsupported)
+    monkeypatch.setattr(backup.os, "link", unsupported)
+    monkeypatch.setattr(backup.os, "replace", failed_replace)
+    monkeypatch.setattr(backup.sys, "platform", "darwin")
+
+    with pytest.raises(OSError, match="replace failed"):
+        backup._rename_noreplace(source, destination)
+
+    assert source.read_bytes() == b"new content"
+    assert not destination.exists()
+
+
+def test_rename_noreplace_posix_exclusive_create_preserves_racing_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_bytes(b"new")
+
+    def unsupported(*_args: object, **_kwargs: object) -> None:
+        raise OSError(backup.errno.ENOTSUP, "unsupported")
+
+    original_open = backup.os.open
+
+    def create_racing_destination(path: object, flags: int, mode: int = 0o777) -> int:
+        if Path(path) == destination:
+            destination.write_bytes(b"created by another party")
+        return original_open(path, flags, mode)
+
+    monkeypatch.setattr(backup, "_renameat2_call", unsupported)
+    monkeypatch.setattr(backup.os, "link", unsupported)
+    monkeypatch.setattr(backup.os, "open", create_racing_destination)
+    monkeypatch.setattr(backup.sys, "platform", "darwin")
+
+    with pytest.raises(FileExistsError):
+        backup._rename_noreplace(source, destination)
+
+    assert source.read_bytes() == b"new"
+    assert destination.read_bytes() == b"created by another party"
+
+
+def test_rename_noreplace_windows_last_resort_uses_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.write_bytes(b"new")
+    destination.write_bytes(b"old")
+
+    def unsupported(*_args: object, **_kwargs: object) -> None:
+        raise OSError(backup.errno.ENOTSUP, "unsupported")
+
+    called = False
+
+    def refusing_rename(source_path: Path, destination_path: Path) -> None:
+        nonlocal called
+        called = True
+        assert source_path == source and destination_path == destination
+        raise FileExistsError(backup.errno.EEXIST, "exists", destination)
+
+    monkeypatch.setattr(backup, "_renameat2_call", unsupported)
+    monkeypatch.setattr(backup.os, "link", unsupported)
+    monkeypatch.setattr(backup.os, "rename", refusing_rename)
+    monkeypatch.setattr(backup.sys, "platform", "win32")
+
+    with pytest.raises(FileExistsError):
+        backup._rename_noreplace(source, destination)
+
+    assert called
+    assert destination.read_bytes() == b"old"
+    assert source.exists()
+
+
 def test_backup_redacts_rtmp_and_srt_secrets_everywhere_without_source_writes(
     tmp_path: Path,
 ) -> None:
@@ -599,6 +705,63 @@ def test_short_numeric_secret_does_not_omit_log_but_long_duplicate_is_caught(
     private = tmp_path / "duplicate.txt"
     private.write_text("password=LONGSECRET123\ncopy LONGSECRET123\n", encoding="utf-8")
     assert backup._contains_private_secret(private, {"LONGSECRET123"})
+
+
+def test_cross_file_redaction_searches_long_numeric_credentials(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    service = source / "basic/profiles/default/service.json"
+    service.write_text('{"password":"12345678"}', encoding="utf-8")
+    log = source / "logs/2026-01-01.txt"
+    log.write_text("connected using 12345678 ok\n", encoding="utf-8")
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    result = create_backup(source, destination)
+
+    with zipfile.ZipFile(result.archive) as archive:
+        names = archive.namelist()
+        log_body = archive.read("logs/2026-01-01.txt").decode("utf-8")
+        all_content = b"".join(archive.read(name) for name in names)
+        manifest = json.loads(archive.read("manifest.json"))
+    assert "logs/2026-01-01.txt" in names
+    assert not any(item["path"] == "logs/2026-01-01.txt" for item in manifest["skipped"])
+    assert "connected using <REDACTED> ok" in log_body
+    assert b"12345678" not in all_content
+
+
+def test_cross_file_redaction_exempts_short_and_five_digit_literals(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    service = source / "basic/profiles/default/service.json"
+    service.write_text(
+        '{"password":"12345","token":"abc","bearer_token":"4096"}',
+        encoding="utf-8",
+    )
+    log = source / "logs/2026-01-01.txt"
+    log.write_text("secrets 12345 abc; benign 1 0 4096\n", encoding="utf-8")
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    result = create_backup(source, destination)
+
+    with zipfile.ZipFile(result.archive) as archive:
+        log_body = archive.read("logs/2026-01-01.txt").decode("utf-8")
+        service_body = json.loads(
+            archive.read("basic/profiles/default/service.json").decode("utf-8")
+        )
+    assert log_body == "secrets 12345 abc; benign 1 0 4096\n"
+    assert service_body == {
+        "password": "<REDACTED>",
+        "token": "<REDACTED>",
+        "bearer_token": "<REDACTED>",
+    }
+
+
+def test_private_verifier_flags_long_numeric_secret(tmp_path: Path) -> None:
+    private = tmp_path / "duplicate.txt"
+    private.write_text("connected using 12345678\n", encoding="utf-8")
+
+    assert backup._contains_private_secret(private, {"12345678"})
+    assert not backup._contains_private_secret(private, {"12345", "abc"})
 
 
 @pytest.mark.parametrize(

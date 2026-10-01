@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import configparser
+import contextlib
 import ctypes
 import errno
 import hashlib
@@ -193,11 +194,45 @@ def _rename_noreplace(source: Path, destination: Path) -> None:
     except OSError as error:
         if error.errno not in unsupported_link:
             raise
-        if os.path.lexists(destination):
-            raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), destination) from error
-        os.rename(source, destination)
+        _rename_noreplace_last_resort(source, destination)
     else:
         os.unlink(source)
+
+
+def _rename_noreplace_last_resort(source: Path, destination: Path) -> None:
+    if os.name == "nt" or sys.platform == "win32":
+        os.rename(source, destination)
+        return
+
+    descriptor = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    descriptor_open = True
+    placeholder: os.stat_result | None = None
+    try:
+        placeholder = os.fstat(descriptor)
+        os.close(descriptor)
+        descriptor_open = False
+        # Exclusive creation proves nobody else owns the name, so replace only
+        # ever replaces our placeholder. A crash between these steps can leave
+        # a zero-byte final-named file; it cannot be mistaken for a valid ZIP.
+        os.replace(source, destination)
+    except BaseException:
+        if descriptor_open:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+        if placeholder is not None:
+            try:
+                current = destination.lstat()
+            except OSError:
+                pass
+            else:
+                if (
+                    current.st_dev == placeholder.st_dev
+                    and current.st_ino == placeholder.st_ino
+                    and current.st_size == 0
+                ):
+                    with contextlib.suppress(OSError):
+                        destination.unlink(missing_ok=True)
+        raise
 
 
 def _renameat2_call(source: Path, destination: Path) -> None:
@@ -601,6 +636,11 @@ def _unwrap_signature_value(value: str) -> str:
     return value
 
 
+def _is_searchable_secret(secret: str) -> bool:
+    """Return whether a collected credential literal is safe to scan elsewhere."""
+    return len(secret) >= 4 and not (secret.isdigit() and len(secret) < 6)
+
+
 def _contains_private_secret(path: Path, secrets: set[str]) -> bool:
     """Check that redacted credential literals did not survive in the staged file."""
     if not secrets:
@@ -610,9 +650,7 @@ def _contains_private_secret(path: Path, secrets: set[str]) -> bool:
     except OSError, ValueError:
         return True
     return any(
-        len(secret) >= 4
-        and not secret.isdigit()
-        and re.search(rf"(?<!\w){re.escape(secret)}(?!\w)", text)
+        _is_searchable_secret(secret) and re.search(rf"(?<!\w){re.escape(secret)}(?!\w)", text)
         for secret in secrets
     )
 
@@ -696,7 +734,7 @@ def create_backup(  # noqa: PLR0912, PLR0915
                         raise ValueError("Log contains excessive nested brackets.")
                     if discovered_secrets:
                         for literal in sorted(discovered_secrets, key=len, reverse=True):
-                            if len(literal) < 4 or literal.isdigit():
+                            if not _is_searchable_secret(literal):
                                 continue
                             log_text, replacements = re.subn(
                                 rf"(?<!\w){re.escape(literal)}(?!\w)", "<REDACTED>", log_text

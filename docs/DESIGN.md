@@ -106,6 +106,9 @@ path segments of RTMP-family URLs and SRT `passphrase`/`streamid` values. Scan l
 known credential patterns and redact matching values while keeping the surrounding
 diagnostic line. Maintain a versioned field/path rule list and fixtures taken from
 synthetic OBS data; never commit Rin's real configuration or log samples.
+For cross-file literal scans, search collected values of at least four characters,
+except numeric values of four or five digits; the credential field itself is always
+redacted, and this limit avoids rewriting benign short tokens.
 
 Also inspect valid JSON objects and arrays embedded in INI values, log lines, and
 string-valued JSON fields. Redact credential fields within those fragments and scan

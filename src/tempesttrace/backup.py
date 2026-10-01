@@ -23,9 +23,11 @@ from pathlib import Path
 from urllib.parse import quote, quote_plus
 
 from tempesttrace.redaction import (
+    _SCHEME_NAMES,
     _SENSITIVE_FREE_NAME,
     REDACTED,
     RULE_VERSION,
+    _clean_credential_literal,
     _guard_json_depth,
     _has_sensitive_query_assignment,
     _hotkey_key_exempt,
@@ -36,6 +38,7 @@ from tempesttrace.redaction import (
     _json_fragments,
     _looks_like_key_material,
     _mask_urls,
+    _normalize_scheme_candidate,
     _query_value_is_redacted,
     _query_value_parts,
     _redact_authorization_remainders,
@@ -500,11 +503,21 @@ def _independent_secret_scan(text: str) -> bool:  # noqa: PLR0912
             continue
         if _is_weak_camel_key(name) and not _looks_like_key_material(unquoted):
             continue
+        marker = re.fullmatch(r"[|>][+-]?[0-9]?", unquoted)
+        if marker and resolve_credential_token(text, match.end("value")) is None:
+            continue
         if normalized == "authorization" or _is_sensitive_signature_name(name):
             resolved = resolve_credential_token(text, match.start("value"))
             if resolved is not None and resolved[0] > match.start("value"):
                 resolved_value = _unwrap_signature_value(text[resolved[0] : resolved[1]])
-                if resolved_value == "<REDACTED>":
+                prefix = re.findall(r"[^\s]+", text[match.start("value") : resolved[0]])
+                recognized_scheme = any(
+                    _normalize_scheme_candidate(part) in _SCHEME_NAMES for part in prefix
+                )
+                if resolved_value == "<REDACTED>" or (
+                    recognized_scheme
+                    and _clean_credential_literal(text[resolved[0] : resolved[1]]) == REDACTED
+                ):
                     continue
         return True
     if _has_sensitive_query_assignment(text):

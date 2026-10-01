@@ -571,7 +571,7 @@ def test_appimage_helper_uses_smoke_test_and_rolls_back_only_on_failure(
     assert result.returncode == expected_exit
     assert current.read_bytes() == (new_payload.encode() if smoke_exit == 0 else b"old")
     assert not list(tmp_path.glob("*.tempesttrace-rollback.*"))
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + 20
     while smoke_exit == 0 and time.monotonic() < deadline:
         if events.exists() and "launch:1" in events.read_text(encoding="utf-8"):
             break

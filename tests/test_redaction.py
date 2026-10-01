@@ -14,8 +14,10 @@ from tempesttrace.backup import (
     create_backup,
 )
 from tempesttrace.redaction import (
+    _COOKIE_HEADER,
     _OBS_KEY_NAMES,
     RULE_VERSION,
+    _credential_literal_candidates,
     _embedded_secrets,
     _free_text_credential_spans,
     _is_sensitive_key,
@@ -651,8 +653,119 @@ def backup_secret_scan(path: Path) -> bool:
     return _secret_scan(path)
 
 
-def test_rule_version_is_twenty_three() -> None:
-    assert RULE_VERSION == 23
+def test_rule_version_is_twenty_four() -> None:
+    assert RULE_VERSION == 24
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "s3cret99xxK,extra=1",
+        "s3cret99xxK/live",
+        "s3cret99xxK|note=1",
+        "s3cret99xxK:extra",
+        "s3cret99xxK=extra",
+        "s3cret99xxK?x=1",
+        "s3cret99xxK%26region=us",
+        "s3cret99xxK&region",
+        "s3cret99xxK& region=us",
+    ],
+)
+def test_separator_segments_harvest_only_key_like_secret(value: str) -> None:
+    candidates = _credential_literal_candidates(value)
+    assert value in candidates
+    assert "s3cret99xxK" in candidates
+    assert "extra=1" not in candidates
+    assert "live" not in candidates
+    assert "region=us" not in candidates
+    assert "note=1" not in candidates
+
+
+def test_credential_literal_candidates_keep_separator_secret_whole() -> None:
+    assert "ab#cd&ef;gh99" in _credential_literal_candidates("ab#cd&ef;gh99")
+
+
+@pytest.mark.parametrize("header", ["WWW-Authenticate", "Proxy-Authenticate", "Authentication"])
+def test_challenge_authentication_headers_harvest_token_and_keep_realm(header: str) -> None:
+    text = f'{header}: Bearer s3cret99xxK\n{header}: Bearer realm="api"\n'
+    assert "s3cret99xxK" in _embedded_secrets(text)
+    if header in {"WWW-Authenticate", "Proxy-Authenticate"}:
+        assert 'realm="api"' not in _embedded_secrets(text)
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "auth_token=twitch",
+        "user_session=overlay",
+        "PHPSESSID=overlay",
+        "XSRF-TOKEN=overlay",
+        "connect.sid=live",
+    ],
+)
+def test_cookie_credential_names_do_not_promote_plain_words(header: str) -> None:
+    assert not (
+        {"twitch", "overlay", "live"} & _embedded_secrets(f"Cookie: {header}; theme=dark\n")
+    )
+    assert "s3cret99xxK" in _embedded_secrets("Cookie: session=s3cret99xxK; theme=dark\n")
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "(cookie : \u201cLKY9-|9,3]dd.,=~`QZZ\u201d,",
+        '(cookie : "LKY9-|9,3]dd.,=~`QZZ",',
+        "(cookie : 'LKY9-|9,3]dd.,=~`QZZ',",
+    ],
+)
+def test_cookie_curly_and_ascii_quoted_opener_verifier_agrees(line: str, tmp_path: Path) -> None:
+    assert _COOKIE_HEADER.search(line)
+    path = tmp_path / "cookie.txt"
+    path.write_text(line, encoding="utf-8")
+    redact_file(path)
+    cleaned = path.read_text(encoding="utf-8")
+    assert "LKY9-|9,3]dd.,=~`QZZ" not in cleaned
+    assert not has_unredacted_embedded_json(cleaned)
+
+
+@pytest.mark.parametrize("value", ["twitch.tv#note", "jim_nvenc_h264#note", "live#1"])
+def test_derived_candidates_reject_hosts_modules_and_short_words(value: str) -> None:
+    candidates = _credential_literal_candidates(value)
+    if value.startswith("twitch"):
+        assert "twitch.tv" not in candidates
+    elif value.startswith("jim"):
+        assert "jim_nvenc_h264" not in _embedded_secrets(f"password: {value}\n")
+    else:
+        assert "live" not in candidates
+    assert "s3cret99xxK" in _credential_literal_candidates("s3cret99xxK&region=us")
+    assert "twitch.tv" not in _embedded_secrets("password: twitch.tv#note\n")
+    assert "jim_nvenc_h264" in _embedded_secrets('{"password":"jim_nvenc_h264"}')
+
+
+def test_lf_continuation_scanner_has_bounded_scaling(tmp_path: Path) -> None:
+    def elapsed(size: int) -> float:
+        path = tmp_path / f"continuation-{size}.txt"
+        line = "token:\nordinary\n"
+        path.write_text((line * (size // len(line) + 1))[:size], encoding="ascii")
+        start = time.perf_counter()
+        redact_file(path)
+        return time.perf_counter() - start
+
+    def min_two(size: int) -> float:
+        return min(elapsed(size), elapsed(size))
+
+    sizes = [64 * 1024, 128 * 1024, 256 * 1024]
+    samples = {size: min_two(size) for size in sizes}
+    for low, high in ((sizes[0], sizes[1]), (sizes[1], sizes[2])):
+        if samples[high] / max(samples[low], 0.001) >= 3.2:
+            samples[low] = min(samples[low], elapsed(low))
+            samples[high] = min(samples[high], elapsed(high))
+        assert samples[high] / max(samples[low], 0.001) < 3.2
+    if samples[256 * 1024] / max(samples[64 * 1024], 0.001) >= 5.0:
+        samples[64 * 1024] = min(samples[64 * 1024], elapsed(64 * 1024))
+        samples[256 * 1024] = min(samples[256 * 1024], elapsed(256 * 1024))
+    assert samples[256 * 1024] / max(samples[64 * 1024], 0.001) < 5.0
+    assert samples[256 * 1024] < max(samples[64 * 1024] * 8, 10.0)
 
 
 @pytest.mark.parametrize(

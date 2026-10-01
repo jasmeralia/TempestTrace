@@ -108,15 +108,17 @@ diagnostic line. Maintain a versioned field/path rule list and fixtures taken fr
 synthetic OBS data; never commit Rin's real configuration or log samples.
 For cross-file literal scans, first redact every collected file and gather eligible
 credential literals, then scrub and verify every staged file before promotion. The
-redaction rules are versioned (currently version 23). Free-text assignments, URL query
+redaction rules are versioned (currently version 24). Free-text assignments, URL query
 and fragment values, CLI arguments, and next-line credentials are promoted only when
 they look like key material (at least eight characters and containing a digit or
 non-letter). Authorization and Proxy-Authorization credential tokens after a
 recognized scheme, explicit JSON/INI credential fields, URL userinfo passwords, and
 recognized webhook/widget path tokens are promoted without that heuristic. Cookie and
-Set-Cookie headers are redacted as a whole. Cookie pair values are promoted only when
-the pair name is credential-like or the value passes the key-material heuristic;
-standard cookie attributes such as Domain, Path, Expires, Max-Age, SameSite, Secure,
+Set-Cookie headers are redacted as a whole, including quoted headers preceded by an
+opening parenthesis or bracket. Cookie pair values are promoted only when
+the value passes the key-material heuristic or is not a plain word; credential-like
+cookie names do not bypass that gate.
+Standard cookie attributes such as Domain, Path, Expires, Max-Age, SameSite, Secure,
 HttpOnly, Priority, and Partitioned are never promoted. Bare Authorization or Cookie
 values with no recognized scheme or credential-like cookie pair use the normal
 key-material gate. Free-text values are still redacted in place even when they are not
@@ -143,10 +145,22 @@ when the token is alone on its line, or follows only recognized scheme words the
 passes the key-material gate, and is not a timestamp, name=value assignment, URL, OBS
 enum, or resolution/quality token.
 Harvested literals remove only a leading or trailing run of credential punctuation;
-punctuation inside the literal is preserved. A harvested token also contributes prefixes
-before a `#` or before an `&`/`;` followed by a named `key=value` parameter, provided
-each prefix is at least four characters and passes the source's promotion gate. The
-source token span is redacted whole.
+punctuation inside the literal is preserved. Each harvested token contributes its full
+cleaned literal and up to seven separator-delimited candidates. Separators include
+commas, semicolons, pipes, ampersands, hashes, query punctuation, colons, slashes,
+quotes, brackets, braces, angle brackets, backticks, whitespace, and selected encoded
+forms (`%26`, `%2C`, `%3B`, `%7C`, `%23`, `%3F`). Candidate components and values from
+`name=value` components must pass the source promotion gate. Hostname-shaped values,
+encoder/module names in derived candidates, and short plain words are rejected. The
+full token remains available so real secrets containing separators still match exactly.
+Candidate search is bounded to eight values per token. The source token span is redacted
+whole.
+Sensitive JSON strings beginning with a recognized authentication scheme also contribute
+the resolved token. Header arrays represented as name/value objects redact and harvest
+the sibling value when the name is sensitive; unrelated pairs remain untouched.
+`WWW-Authenticate`, `Proxy-Authenticate`, and `Authentication` are recognized sensitive
+headers. Challenge text such as `Bearer realm="api"` remains when its resolved value
+does not pass the credential gate.
 For scheme-prefixed and continuation
 values, the label, scheme words, line breaks, and indentation are preserved while the
 credential token is replaced. Cookie pair headers keep their existing whole-value

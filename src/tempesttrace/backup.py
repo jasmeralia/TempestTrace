@@ -416,10 +416,37 @@ def _secret_scan(path: Path) -> bool:  # noqa: PLR0911
     return has_unredacted_embedded_json(text) or _independent_secret_scan(text)
 
 
-def _independent_json_secret(value: object, context: tuple[str, ...] = ()) -> bool:  # noqa: PLR0911
+def _independent_json_secret(value: object, context: tuple[str, ...] = ()) -> bool:  # noqa: PLR0911, PLR0912
     """Check parsed JSON independently, with a narrow hotkey-key exemption."""
     if isinstance(value, dict):
+        value_key = next(
+            (
+                candidate
+                for candidate in ("value", "val", "content", "data")
+                if isinstance(value.get(candidate), str)
+            ),
+            None,
+        )
+        if value_key is not None:
+            for name_key in ("name", "header", "key", "field", "label"):
+                name = value.get(name_key)
+                if not isinstance(name, str):
+                    continue
+                if name_key == "key" and not re.fullmatch(
+                    r"(?i)(?:[A-Za-z][A-Za-z0-9-]*-)?(?:authorization|authentication|www-authenticate|proxy-authenticate|cookie|set-cookie|[A-Za-z0-9_.-]*(?:token|password|secret|key))",
+                    name,
+                ):
+                    continue
+                if _is_sensitive_signature_name(name) and value[value_key] != "<REDACTED>":
+                    return True
         for key, child in value.items():
+            if (
+                value_key is not None
+                and key in ("name", "header", "key", "field", "label")
+                and isinstance(child, str)
+                and _is_sensitive_signature_name(child)
+            ):
+                continue
             if isinstance(key, str):
                 is_hotkey_key = _hotkey_key_exempt(key, context, child)
                 weak_key_is_benign = _is_weak_camel_key(key) and not _looks_like_key_material(
@@ -492,6 +519,13 @@ def _independent_secret_scan(text: str) -> bool:  # noqa: PLR0912
                 continue
         value = match.group("value").strip()
         unquoted = _unwrap_signature_value(value)
+        if normalized in {"wwwauthenticate", "proxyauthenticate"}:
+            line_end = text.find("\n", match.end("value"))
+            if re.search(
+                r"(?i)\brealm\s*=",
+                text[match.end("value") : line_end if line_end >= 0 else len(text)],
+            ):
+                continue
         if unquoted in {"", "<REDACTED>"} or unquoted.casefold() in {
             "true",
             "false",
@@ -544,6 +578,9 @@ def _is_sensitive_signature_name(name: str) -> bool:
         normalized
         in {
             "authorization",
+            "authentication",
+            "wwwauthenticate",
+            "proxyauthenticate",
             "passphrase",
             "pwd",
             "cookie",

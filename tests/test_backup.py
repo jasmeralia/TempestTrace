@@ -2408,6 +2408,182 @@ def test_round8_scheme_credentials_scrub_scene_and_second_log_copies(tmp_path: P
     assert not result.warnings
 
 
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "https://example.com/cb?token=s3cret99xxK,extra=1",
+        "X-Api-Key: s3cret99xxK,extra=1",
+        "token=s3cret99xxK/live",
+        "token=s3cret99xxK|note=1",
+        "StreamKey=s3cret99xxK,region=us",
+    ],
+)
+def test_round11_separator_secret_copies_are_scrubbed_without_tail_promotion(
+    tmp_path: Path, assignment: str
+) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    (source / "basic/profiles/default/service.json").write_text('{"key":""}', encoding="ascii")
+    (source / "basic/profiles/default/basic.ini").write_text(
+        "[Output]\n" + assignment + "\n", encoding="ascii"
+    )
+    (source / "logs/2026-01-01.txt").write_text(assignment + "\n", encoding="ascii")
+    (source / "logs/2026-01-02.txt").write_text("widget copied s3cret99xxK\n", encoding="ascii")
+    (source / "basic/scenes/main.json").write_text(
+        json.dumps(
+            {"sources": [], "copied": "s3cret99xxK", "benign": "extra=1 live region=us note=1"}
+        ),
+        encoding="ascii",
+    )
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+    assert b"s3cret99xxK" not in b"\n".join(members.values())
+    scene = json.loads(members["basic/scenes/main.json"])
+    assert scene["benign"] == "extra=1 live region=us note=1"
+    assert json.loads(members["basic/profiles/default/service.json"])["key"] == ""
+
+
+@pytest.mark.parametrize("header", ["Authorization", "Proxy-Authorization"])
+def test_round11_json_bearer_value_scrubs_bare_cross_file_copy(tmp_path: Path, header: str) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    (source / "basic/profiles/default/service.json").write_text('{"key":""}', encoding="ascii")
+    (source / "basic/scenes/main.json").write_text(
+        json.dumps({"headers": {header: "Bearer s3cret99xxK"}, "copied": "s3cret99xxK"}),
+        encoding="ascii",
+    )
+    (source / "logs/2026-01-01.txt").write_text(
+        '14:22:01.123: {"headers":{"' + header + '":"Bearer s3cret99xxK"}}\n',
+        encoding="ascii",
+    )
+    (source / "logs/2026-01-02.txt").write_text("copy=s3cret99xxK\n", encoding="ascii")
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+    assert b"s3cret99xxK" not in b"\n".join(members.values())
+    assert json.loads(members["basic/profiles/default/service.json"])["key"] == ""
+
+
+def test_round11_header_name_value_pairs_scrub_scene_and_log_but_keep_other_pair(
+    tmp_path: Path,
+) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    (source / "basic/profiles/default/service.json").write_text('{"key":""}', encoding="ascii")
+    pairs = [
+        {"name": "Authorization", "value": "Bearer s3cret99xxK"},
+        {"name": "X-Api-Key", "value": "s3cret99xxK"},
+        {"key": "Authorization", "val": "Bearer s3cret99xxK"},
+        {"name": "Content-Type", "value": "application/json"},
+    ]
+    (source / "basic/scenes/main.json").write_text(
+        json.dumps({"sources": [], "headers": pairs}), encoding="ascii"
+    )
+    (source / "logs/2026-01-01.txt").write_text(
+        '14:22:01.123: {"headers":' + json.dumps(pairs) + "}\n", encoding="ascii"
+    )
+    (source / "logs/2026-01-02.txt").write_text("copied s3cret99xxK\n", encoding="ascii")
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+    assert b"s3cret99xxK" not in b"\n".join(members.values())
+    scene = json.loads(members["basic/scenes/main.json"])
+    assert scene["headers"][0]["value"] == "<REDACTED>"
+    assert scene["headers"][1]["value"] == "<REDACTED>"
+    assert scene["headers"][2]["key"] == "Authorization"
+    assert scene["headers"][2]["val"] == "<REDACTED>"
+    assert scene["headers"][3]["value"] == "application/json"
+
+
+@pytest.mark.parametrize("header", ["WWW-Authenticate", "Proxy-Authenticate", "Authentication"])
+def test_round11_challenge_headers_scrub_tokens_but_preserve_realm(
+    tmp_path: Path, header: str
+) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    (source / "basic/profiles/default/service.json").write_text('{"key":""}', encoding="ascii")
+    (source / "logs/2026-01-01.txt").write_text(
+        f'{header}: Bearer s3cret99xxK\n{header}: Bearer realm="api"\n', encoding="ascii"
+    )
+    (source / "logs/2026-01-02.txt").write_text("copied s3cret99xxK\n", encoding="ascii")
+    (source / "basic/scenes/main.json").write_text(
+        json.dumps({"sources": [], "url": "rtmp://live.twitch.tv/app", "note": "s3cret99xxK"}),
+        encoding="ascii",
+    )
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+    assert b"s3cret99xxK" not in b"\n".join(members.values())
+    if header in {"WWW-Authenticate", "Proxy-Authenticate"}:
+        assert b'realm="api"' in members["logs/2026-01-01.txt"]
+    else:
+        assert b'realm="api"' not in members["logs/2026-01-01.txt"]
+
+
+@pytest.mark.parametrize(
+    "cookie",
+    [
+        "auth_token=twitch",
+        "user_session=overlay",
+        "PHPSESSID=overlay",
+        "XSRF-TOKEN=overlay",
+        "connect.sid=live",
+    ],
+)
+def test_round11_plain_cookie_words_do_not_scrub_scene_urls(tmp_path: Path, cookie: str) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    (source / "basic/profiles/default/service.json").write_text('{"key":""}', encoding="ascii")
+    (source / "logs/2026-01-01.txt").write_text("Cookie: " + cookie + "\n", encoding="ascii")
+    (source / "basic/scenes/main.json").write_text(
+        json.dumps(
+            {
+                "sources": [],
+                "urls": [
+                    "rtmp://live.twitch.tv/app",
+                    "https://site.tv/overlay",
+                    "https://site/live",
+                ],
+            }
+        ),
+        encoding="ascii",
+    )
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        scene = json.loads(archive.read("basic/scenes/main.json"))
+    assert scene["urls"] == [
+        "rtmp://live.twitch.tv/app",
+        "https://site.tv/overlay",
+        "https://site/live",
+    ]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "rtmp://live.twitch.tv/app/s3cret99xxK/live",
+        "rtmp://live.twitch.tv/app/s3cret99xxK/live2",
+    ],
+)
+def test_round11_rtmp_nonfinal_path_secret_scrubs_duplicate(tmp_path: Path, url: str) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    (source / "basic/profiles/default/service.json").write_text('{"key":""}', encoding="ascii")
+    (source / "logs/2026-01-01.txt").write_text(url + "\n", encoding="ascii")
+    (source / "logs/2026-01-02.txt").write_text("copied s3cret99xxK\n", encoding="ascii")
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        all_bytes = b"\n".join(archive.read(name) for name in archive.namelist())
+    assert b"s3cret99xxK" not in all_bytes
+
+
 def test_authorization_and_cookie_promotion_preserves_prose_and_scrubs_real_values(
     tmp_path: Path,
 ) -> None:

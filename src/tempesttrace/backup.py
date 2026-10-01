@@ -20,17 +20,20 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote, quote_plus
 
 from tempesttrace.redaction import (
     _SENSITIVE_FREE_NAME,
     RULE_VERSION,
     _guard_json_depth,
     _has_sensitive_query_assignment,
+    _hotkey_key_exempt,
     _is_repeated_redacted_key_log,
     _is_repeated_redacted_quoted_key_log,
     _is_url_query_assignment,
     _json_fragments,
     _mask_urls,
+    _redact_authorization_remainders,
     has_unredacted_embedded_json,
     has_unredacted_fields,
     has_unredacted_ini_fields,
@@ -399,31 +402,7 @@ def _independent_json_secret(value: object, context: tuple[str, ...] = ()) -> bo
     if isinstance(value, dict):
         for key, child in value.items():
             if isinstance(key, str):
-                normalized = re.sub(r"[^a-z0-9]", "", key.casefold())
-                hotkey_positions = [
-                    index
-                    for index, part in enumerate(context)
-                    if re.sub(r"[^a-z0-9]", "", part.casefold())
-                    in {
-                        "hotkey",
-                        "hotkeys",
-                        "binding",
-                        "bindings",
-                        "keybinding",
-                        "keybindings",
-                        "obsbasichotkeybinding",
-                    }
-                ]
-                settings_positions = [
-                    index
-                    for index, part in enumerate(context)
-                    if re.sub(r"[^a-z0-9]", "", part.casefold()) == "settings"
-                ]
-                is_hotkey_key = (
-                    normalized == "key"
-                    and bool(hotkey_positions)
-                    and (not settings_positions or max(hotkey_positions) > max(settings_positions))
-                )
+                is_hotkey_key = _hotkey_key_exempt(key, context, child)
                 if (
                     _is_sensitive_signature_name(key)
                     and not is_hotkey_key
@@ -455,6 +434,8 @@ def _independent_secret_scan(text: str) -> bool:  # noqa: PLR0912
     """Fail closed on credential assignments with a scanner independent of redactor patterns."""
     if _is_repeated_redacted_key_log(text) or _is_repeated_redacted_quoted_key_log(text):
         return False
+    if _redact_authorization_remainders(text, {}) != text:
+        return True
     folded_text = text.casefold()
     possible_hotkeys = any(
         token in folded_text
@@ -465,6 +446,8 @@ def _independent_secret_scan(text: str) -> bool:  # noqa: PLR0912
         name = match.group("name").strip("\\\"'")
         normalized = re.sub(r"[^a-z0-9]", "", name.casefold())
         if not _is_sensitive_signature_name(name):
+            continue
+        if normalized.endswith("authorization"):
             continue
         if _is_url_query_assignment(assignment_text, match.start("name")):
             continue
@@ -641,6 +624,26 @@ def _is_searchable_secret(secret: str) -> bool:
     return len(secret) >= 4 and not (secret.isdigit() and len(secret) < 6)
 
 
+def _private_literal_patterns(secret: str) -> set[str]:
+    patterns: set[str] = set()
+    for candidate in (secret, quote(secret, safe=""), quote_plus(secret)):
+        if candidate:
+            escaped = re.escape(candidate)
+            escaped = re.sub(
+                r"%[0-9A-Fa-f]{2}",
+                lambda match: (
+                    "%"
+                    + "".join(
+                        "[" + character.lower() + character.upper() + "]"
+                        for character in match.group(0)[1:]
+                    )
+                ),
+                escaped,
+            )
+            patterns.add(escaped)
+    return patterns
+
+
 def _contains_private_secret(path: Path, secrets: set[str]) -> bool:
     """Check that redacted credential literals did not survive in the staged file."""
     if not secrets:
@@ -649,10 +652,13 @@ def _contains_private_secret(path: Path, secrets: set[str]) -> bool:
         text = read_text_safely(path)
     except OSError, ValueError:
         return True
-    return any(
-        _is_searchable_secret(secret) and re.search(rf"(?<!\w){re.escape(secret)}(?!\w)", text)
-        for secret in secrets
-    )
+    for secret in secrets:
+        if not _is_searchable_secret(secret):
+            continue
+        for escaped in _private_literal_patterns(secret):
+            if re.search(rf"(?<!\w){escaped}(?!\w)", text):
+                return True
+    return False
 
 
 def create_backup(  # noqa: PLR0912, PLR0915
@@ -736,10 +742,11 @@ def create_backup(  # noqa: PLR0912, PLR0915
                         for literal in sorted(discovered_secrets, key=len, reverse=True):
                             if not _is_searchable_secret(literal):
                                 continue
-                            log_text, replacements = re.subn(
-                                rf"(?<!\w){re.escape(literal)}(?!\w)", "<REDACTED>", log_text
-                            )
-                            cross_redaction_count += replacements
+                            for escaped in _private_literal_patterns(literal):
+                                log_text, replacements = re.subn(
+                                    rf"(?<!\w){escaped}(?!\w)", "<REDACTED>", log_text
+                                )
+                                cross_redaction_count += replacements
                         private_staged.write_text(log_text, encoding="utf-8", newline="")
                 if progress:
                     progress("redacting", index - 1, len(files))

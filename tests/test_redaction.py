@@ -83,7 +83,7 @@ def test_credentials_inside_json_encoded_strings_are_redacted(tmp_path: Path) ->
         json.dumps(
             {
                 "payload": '{"key": "ENCODED_KEY_SECRET", "token": "ENCODED_TOKEN_SECRET"}',
-                "hotkeys": {"libobs.mute": {"key": "F9"}},
+                "hotkeys": {"libobs.mute": {"key": "OBS_KEY_F9"}},
             }
         ),
         encoding="utf-8",
@@ -93,7 +93,7 @@ def test_credentials_inside_json_encoded_strings_are_redacted(tmp_path: Path) ->
 
     value = json.loads(path.read_text(encoding="utf-8"))
     assert json.loads(value["payload"]) == {"key": "<REDACTED>", "token": "<REDACTED>"}
-    assert value["hotkeys"]["libobs.mute"]["key"] == "F9"
+    assert value["hotkeys"]["libobs.mute"]["key"] == "OBS_KEY_F9"
 
 
 def test_quoted_json_credentials_in_ini_and_logs_are_redacted(tmp_path: Path) -> None:
@@ -329,12 +329,12 @@ def test_key_context_and_case_variants_preserve_hotkey_bindings(tmp_path: Path) 
 
     hotkeys = tmp_path / "hotkeys.json"
     hotkeys.write_text(
-        json.dumps({"bindings": [{"key": "F9", "key_modifier": "SHIFT"}]}),
+        json.dumps({"bindings": [{"key": "OBS_KEY_F9", "key_modifier": "SHIFT"}]}),
         encoding="utf-8",
     )
     redact_file(hotkeys)
-    assert json.loads(hotkeys.read_text(encoding="utf-8"))["bindings"][0]["key"] == "F9"
-    assert not has_unredacted_fields({"bindings": [{"key": "F9"}]}, ("hotkeys.json",))
+    assert json.loads(hotkeys.read_text(encoding="utf-8"))["bindings"][0]["key"] == "OBS_KEY_F9"
+    assert not has_unredacted_fields({"bindings": [{"key": "OBS_KEY_F9"}]}, ("hotkeys.json",))
 
 
 def test_bare_key_is_redacted_in_backup_and_scene_files_but_not_hotkeys(tmp_path: Path) -> None:
@@ -344,7 +344,7 @@ def test_bare_key_is_redacted_in_backup_and_scene_files_but_not_hotkeys(tmp_path
             json.dumps(
                 {
                     "settings": {"key": "STREAM_KEY_SECRET"},
-                    "hotkeys": [{"key": "F9"}],
+                    "hotkeys": [{"key": "OBS_KEY_F9"}],
                 }
             ),
             encoding="utf-8",
@@ -354,7 +354,7 @@ def test_bare_key_is_redacted_in_backup_and_scene_files_but_not_hotkeys(tmp_path
 
         value = json.loads(path.read_text(encoding="utf-8"))
         assert value["settings"]["key"] == "<REDACTED>"
-        assert value["hotkeys"][0]["key"] == "F9"
+        assert value["hotkeys"][0]["key"] == "OBS_KEY_F9"
         assert not has_unredacted_fields(value, (path.name,))
 
 
@@ -507,7 +507,7 @@ def test_false_positive_fields_and_single_segment_url_are_preserved(tmp_path: Pa
         "key_color": "#00ff00",
         "key_color_type": 1,
         "keyint_sec": 2,
-        "hotkeys": [{"key": "F9"}],
+        "hotkeys": [{"key": "OBS_KEY_F9"}],
         "server": "rtmp://live.twitch.tv/app",
     }
     path = tmp_path / "scene.json"
@@ -539,7 +539,7 @@ def test_nonsecret_obs_ini_values_and_obsbasic_hotkey_survive(tmp_path: Path) ->
     path = tmp_path / "basic.ini"
     original = (
         "use_auth=true\nauth_type=basic\nkey_color=#00ff00\nkey_color_type=1\n"
-        'keyint_sec=2\nOBSBasic.StartStreaming={"key":"F9"}\n'
+        'keyint_sec=2\nOBSBasic.StartStreaming={"key":"OBS_KEY_F9"}\n'
     )
     path.write_text(original, encoding="utf-8")
     redact_file(path)
@@ -576,8 +576,148 @@ def backup_secret_scan(path: Path) -> bool:
     return _secret_scan(path)
 
 
-def test_rule_version_is_thirteen() -> None:
-    assert RULE_VERSION == 13
+def test_rule_version_is_fourteen() -> None:
+    assert RULE_VERSION == 14
+
+
+@pytest.mark.parametrize(
+    "value,preserved",
+    [
+        (
+            {
+                "sources": [
+                    {
+                        "hotkeys": {
+                            "libobs.mute": [
+                                {"key": "OBS_KEY_M", "settings": {"key": "NESTED_STREAM_KEY_9988"}}
+                            ]
+                        }
+                    }
+                ]
+            },
+            "OBS_KEY_M",
+        ),
+        ({"hotkeys": {"key": "live_actual_stream_key_zzzz"}}, "live_actual_stream_key_zzzz"),
+        (
+            {"bindings": {"settings": {"key": "BINDINGS_SETTINGS_KEY_42"}}},
+            "BINDINGS_SETTINGS_KEY_42",
+        ),
+    ],
+)
+def test_hotkey_key_exemption_is_value_and_settings_ancestor_based(
+    value, preserved, tmp_path: Path
+) -> None:
+    path = tmp_path / "scene.json"
+    path.write_text(json.dumps(value), encoding="utf-8")
+    redact_file_with_secrets(path)
+    output = path.read_text(encoding="utf-8")
+    if preserved == "OBS_KEY_M":
+        assert preserved in output
+    else:
+        assert "<REDACTED>" in output
+    assert "NESTED_STREAM_KEY_9988" not in output
+    if preserved != "OBS_KEY_M":
+        assert preserved not in output
+    assert not _secret_scan(path)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/cb#access_token=FRAGMENTLOG99&foo=1",
+        "https://example.com/cb?region=us#access_token=X",
+        "https://example.com/app#/token=FRAGMENTSECRET99",
+    ],
+)
+def test_url_fragment_credentials_are_redacted_and_verified(url: str, tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(f"source {url}\n", encoding="utf-8")
+    redact_file_with_secrets(path)
+    output = path.read_text(encoding="utf-8")
+    assert "FRAGMENTLOG99" not in output and "FRAGMENTSECRET99" not in output
+    assert "#section-2" not in output or "section-2" in output
+    if "region=us" in url:
+        assert "region=us" in output
+    assert not _secret_scan(path)
+
+
+@pytest.mark.parametrize(
+    "line,secret",
+    [
+        (
+            "10:00:00.000: note Authorization: Api-Key SUPERAUTHSECRET99 later\n",
+            "SUPERAUTHSECRET99",
+        ),
+        (
+            '10:00:03.000: Authorization: Digest username="b", '
+            'response="DIGESTRESPONSESECRET", qop=auth\n',
+            "DIGESTRESPONSESECRET",
+        ),
+        ("10:00:02.000: saw authorization: SECRETNOSCHEME1 later\n", "SECRETNOSCHEME1"),
+    ],
+)
+def test_authorization_remainder_is_redacted_to_line_end(
+    line: str, secret: str, tmp_path: Path
+) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(line, encoding="utf-8")
+    redact_file_with_secrets(path)
+    output = path.read_text(encoding="utf-8")
+    assert secret not in output
+    assert not _secret_scan(path)
+
+
+def test_fragment_and_benign_authorization_text_survive(tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text("authorization is enabled #section-2 and /#/settings/audio\n", encoding="utf-8")
+    redact_file_with_secrets(path)
+    assert (
+        path.read_text(encoding="utf-8")
+        == "authorization is enabled #section-2 and /#/settings/audio\n"
+    )
+    assert not _secret_scan(path)
+
+
+def test_browser_source_json_fragment_credentials_are_redacted(tmp_path: Path) -> None:
+    path = tmp_path / "scene.json"
+    path.write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "id": "browser_source",
+                        "settings": {
+                            "url": "https://example.com/cb?region=us#access_token=BROWSERFRAGMENT99",
+                            "width": 800,
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    redact_file_with_secrets(path)
+    cleaned = json.loads(path.read_text(encoding="utf-8"))
+    settings = cleaned["sources"][0]["settings"]
+    assert "BROWSERFRAGMENT99" not in settings["url"]
+    assert "region=us" in settings["url"] and settings["width"] == 800
+    assert not _secret_scan(path)
+
+
+def test_ini_sensitive_continuations_are_redacted_and_benign_indentation_kept(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "basic.ini"
+    path.write_text(
+        "[Output]\npassword = \\\n  CONT_SECRET_LINE\n"
+        "password = first\n    INDENT_SECRET_LINE\nName=plain\n    description text\n",
+        encoding="utf-8",
+    )
+    redact_file_with_secrets(path)
+    output = path.read_text(encoding="utf-8")
+    assert "CONT_SECRET_LINE" not in output and "INDENT_SECRET_LINE" not in output
+    assert "description text" in output
+    assert not _secret_scan(path)
 
 
 @pytest.mark.parametrize(
@@ -901,12 +1041,12 @@ def test_authorization_without_scheme_is_redacted(text: str, tmp_path: Path) -> 
         (
             "x Authorization: Basic LEAKB64 y",
             "LEAKB64",
-            "x Authorization: Basic <REDACTED> y\n",
+            "x Authorization: Basic <REDACTED>\n",
         ),
         (
             "debug: aUtHoRiZaTiOn : dIgEsT DIGEST_SECRET trailing",
             "DIGEST_SECRET",
-            "debug: aUtHoRiZaTiOn : dIgEsT <REDACTED> trailing\n",
+            "debug: aUtHoRiZaTiOn : dIgEsT <REDACTED>\n",
         ),
         ("Authorization=Bearer LEAKBE", "LEAKBE", "Authorization=Bearer <REDACTED>\n"),
         ("authorization=LEAKAUTH", "LEAKAUTH", "authorization=<REDACTED>\n"),
@@ -1145,14 +1285,19 @@ def test_sensitive_word_literals_are_not_credentials(tmp_path: Path, literal: st
     assert not _secret_scan(path)
 
 
-@pytest.mark.parametrize("name", ["SortKey", "audio_key"])
-def test_short_numeric_values_do_not_drop_log(name: str, tmp_path: Path) -> None:
+@pytest.mark.parametrize("name,value", [("SortKey", "Name"), ("audio_key", "1")])
+def test_short_or_weak_key_values_do_not_drop_log(name: str, value: str, tmp_path: Path) -> None:
     path = tmp_path / "current.txt"
-    path.write_text(f"{name}: 1\nvalue=1 and 0\n", encoding="utf-8")
+    path.write_text(
+        f"14:00:00.000: CPU Name: Test CPU\n{name}: {value}\nvalue=1 and 0\n", encoding="utf-8"
+    )
     redact_file_with_secrets(path)
     expected = "<REDACTED>"
-    assert path.read_text(encoding="utf-8") == f"{name}: {expected}\nvalue=1 and 0\n"
-    assert not _contains_private_secret(path, {"1", "0"})
+    assert path.read_text(encoding="utf-8") == (
+        f"14:00:00.000: CPU Name: Test CPU\n{name}: {expected}\nvalue=1 and 0\n"
+    )
+    if value != "Name":
+        assert not _contains_private_secret(path, {value})
     assert not _secret_scan(path)
 
 

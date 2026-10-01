@@ -105,7 +105,7 @@ def test_backup_redacts_bare_keys_and_keeps_ini_words_and_hotkeys(tmp_path: Path
         json.dumps(
             {
                 "sources": [{"name": "Camera", "settings": {"key": "SCENE_STREAM_SECRET"}}],
-                "hotkeys": [{"key": "F9"}],
+                "hotkeys": [{"key": "OBS_KEY_F9"}],
             }
         ),
         encoding="utf-8",
@@ -141,7 +141,7 @@ def test_backup_redacts_bare_keys_and_keeps_ini_words_and_hotkeys(tmp_path: Path
     assert json.loads(service_text)["settings"]["key"] == "<REDACTED>"
     scene = json.loads(scene_text)
     assert scene["sources"][0]["settings"]["key"] == "<REDACTED>"
-    assert scene["hotkeys"][0]["key"] == "F9"
+    assert scene["hotkeys"][0]["key"] == "OBS_KEY_F9"
     assert ini_text == (
         "[Video]\nmonkey=keep-me\nhotkey=F9\n"
         "[Hotkeys]\nkey=<REDACTED>\n"
@@ -171,7 +171,7 @@ def test_backup_redacts_credentials_nested_in_json_text_containers(tmp_path: Pat
                         },
                     }
                 ],
-                "hotkeys": {"libobs.mute": {"key": "F9"}},
+                "hotkeys": {"libobs.mute": {"key": "OBS_KEY_F9"}},
             }
         ),
         encoding="utf-8",
@@ -200,7 +200,7 @@ def test_backup_redacts_credentials_nested_in_json_text_containers(tmp_path: Pat
         "key": "<REDACTED>",
         "token": "<REDACTED>",
     }
-    assert scene["hotkeys"]["libobs.mute"]["key"] == "F9"
+    assert scene["hotkeys"]["libobs.mute"]["key"] == "OBS_KEY_F9"
 
 
 def test_backup_promotes_without_hard_links(
@@ -727,6 +727,130 @@ def test_cross_file_redaction_searches_long_numeric_credentials(tmp_path: Path) 
     assert not any(item["path"] == "logs/2026-01-01.txt" for item in manifest["skipped"])
     assert "connected using <REDACTED> ok" in log_body
     assert b"12345678" not in all_content
+
+
+def test_numeric_json_credentials_are_harvested_for_log_scrubbing(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    service = source / "basic/profiles/default/service.json"
+    service.write_text('{"settings":{"password":123456789,"token":1.25}}', encoding="utf-8")
+    log = source / "logs/2026-01-01.txt"
+    log.write_text("server accepted 123456789 and 1.25; ordinary 12345\n", encoding="utf-8")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        body = archive.read("logs/2026-01-01.txt").decode("utf-8")
+    assert "123456789" not in body and "1.25" not in body
+    assert "12345" in body
+
+
+def test_weak_rtmp_and_generic_key_literals_do_not_rewrite_benign_logs_or_names(
+    tmp_path: Path,
+) -> None:
+    source = fixture(tmp_path / "obs")
+    service = source / "basic/profiles/default/service.json"
+    service.write_text(
+        '{"settings":{"server":"rtmp://ingest.example.com/app/live",'
+        '"key":"uniqueKeyZZZ999","SortKey":"Name","streamKey":"STREAMKEYSECRET999",'
+        '"apiKey":"APIKEYSECRET999"},"sources":[{"name":"Name"}]}',
+        encoding="utf-8",
+    )
+    log = source / "logs/2026-01-01.txt"
+    log.write_text(
+        "Connecting to rtmp://live.twitch.tv/app\n[rtmp stream: 'adv_stream'] go live now\n"
+        "14:00:00.000: CPU Name: Test CPU\nSortKey=Name\n"
+        "keys STREAMKEYSECRET999 APIKEYSECRET999\n",
+        encoding="utf-8",
+    )
+    destination = tmp_path / "out"
+    destination.mkdir()
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        names = archive.namelist()
+        scene = json.loads(archive.read("basic/profiles/default/service.json"))
+        assert "logs/2026-01-01.txt" in names
+        body = archive.read("logs/2026-01-01.txt").decode("utf-8")
+    assert scene["sources"][0]["name"] == "Name"
+    assert "live.twitch.tv" in body and "go live now" in body and "CPU Name: Test CPU" in body
+    assert "SortKey=<REDACTED>" in body
+    assert "STREAMKEYSECRET999" not in body and "APIKEYSECRET999" not in body
+
+
+def test_percent_encoded_known_credentials_are_scrubbed_case_insensitively(
+    tmp_path: Path,
+) -> None:
+    source = fixture(tmp_path / "obs")
+    (source / "basic/profiles/default/service.json").write_text(
+        '{"settings":{"key":"abc/def+ghi="}}', encoding="utf-8"
+    )
+    (source / "logs/2026-01-01.txt").write_text(
+        "seen abc/def+ghi= and abc%2Fdef%2Bghi%3D and abc%2fdef%2bghi%3d; benign %2F\n",
+        encoding="utf-8",
+    )
+    destination = tmp_path / "out"
+    destination.mkdir()
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        body = archive.read("logs/2026-01-01.txt").decode("utf-8")
+    assert "abc/def+ghi=" not in body and "%2Fdef%2Bghi%3D" not in body
+    assert "benign %2F" in body
+
+
+@pytest.mark.parametrize(
+    "files,secrets",
+    [
+        (
+            {
+                "basic/scenes/S.json": (
+                    '{"sources":[{"hotkeys":{"libobs.mute":[{"key":"OBS_KEY_M",'
+                    '"settings":{"key":"NESTED_STREAM_KEY_9988"}}]}}]}'
+                )
+            },
+            ["NESTED_STREAM_KEY_9988"],
+        ),
+        (
+            {"basic/scenes/S.json": '{"hotkeys":{"key":"live_actual_stream_key_zzzz"}}'},
+            ["live_actual_stream_key_zzzz"],
+        ),
+        (
+            {"basic/scenes/S.json": '{"bindings":{"settings":{"key":"BINDINGS_SETTINGS_KEY_42"}}}'},
+            ["BINDINGS_SETTINGS_KEY_42"],
+        ),
+        (
+            {"logs/a.txt": "source https://example.com/cb#access_token=FRAGMENTLOG99&foo=1\n"},
+            ["FRAGMENTLOG99"],
+        ),
+        (
+            {"logs/a.txt": "10:00:00.000: note Authorization: Api-Key SUPERAUTHSECRET99 later\n"},
+            ["SUPERAUTHSECRET99"],
+        ),
+        (
+            {
+                "basic/profiles/P/service.json": '{"settings":{"password":123456789}}',
+                "logs/a.txt": "server accepted 123456789\n",
+            },
+            ["123456789"],
+        ),
+        (
+            {"basic/profiles/P/basic.ini": "[Output]\npassword = \\\n  CONT_SECRET_LINE\n"},
+            ["CONT_SECRET_LINE"],
+        ),
+    ],
+)
+def test_g1_findings_do_not_ship_synthetic_secrets(tmp_path: Path, files, secrets) -> None:
+    source = fixture(tmp_path / "obs")
+    for relative, content in files.items():
+        path = source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        all_content = b"\n".join(archive.read(name) for name in archive.namelist())
+    for secret in secrets:
+        assert secret.encode() not in all_content
+    assert not result.warnings
 
 
 def test_cross_file_redaction_exempts_short_and_five_digit_literals(tmp_path: Path) -> None:

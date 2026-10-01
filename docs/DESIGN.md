@@ -118,6 +118,15 @@ the binding field in `OBSBasic.*` JSON-valued INI assignments, including multili
 values; nested settings named `key` remain sensitive. Leave credential-free embedded
 JSON text byte-for-byte intact.
 
+The hotkey `key` exemption is value-based: only empty values and `OBS_KEY_*` binding
+names are preserved, and a `settings` ancestor makes `key` sensitive. URL fragments
+use the same credential-name rules as query parameters. Authorization headers keep
+their name and an optional known scheme while redacting the remainder through the
+line end. Cross-file checks include percent-encoded forms of known literals. Weak
+source literals from RTMP path segments and unlisted camelCase `*Key` fields are
+collected only when they resemble key material; explicit credential fields retain
+the normal search eligibility.
+
 For serialized JSON, verification is structural: inspect sensitive keys and scan
 decoded string values. For INI, classify assignments by key and parse JSON-valued
 assignments before checking decoded strings. Keep independent raw-text verification

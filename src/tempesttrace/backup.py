@@ -33,6 +33,8 @@ from tempesttrace.redaction import (
     _is_url_query_assignment,
     _json_fragments,
     _mask_urls,
+    _query_value_is_redacted,
+    _query_value_parts,
     _redact_authorization_remainders,
     has_unredacted_embedded_json,
     has_unredacted_fields,
@@ -53,7 +55,9 @@ _INDEPENDENT_SECRET_ASSIGNMENT = re.compile(
     r"[^\s](?:(?![;&,|/?(][A-Za-z0-9_.-]++[ \t]*[=:])[^\s])*))"
 )
 _INDEPENDENT_QUERY_ASSIGNMENT = re.compile(
-    r"(?i)[?&;]([A-Za-z0-9_.-]+)=((?:[^&;\s]|[&;](?![A-Za-z0-9_.-]+=))+)"
+    r"(?i)[?&;]([A-Za-z0-9_.-]+)=((?:\"[^\"\r\n]*\"|'[^'\r\n]*'|`[^`\r\n]*`|"
+    r"(?:&quot;[^\r\n]*?&quot;|&apos;[^\r\n]*?&apos;|%22[^\r\n]*?%22|%27[^\r\n]*?%27)|"
+    r"(?:(?![&;][A-Za-z0-9_.-]+=)[^\s])+))"
 )
 
 
@@ -447,7 +451,7 @@ def _independent_secret_scan(text: str) -> bool:  # noqa: PLR0912
         normalized = re.sub(r"[^a-z0-9]", "", name.casefold())
         if not _is_sensitive_signature_name(name):
             continue
-        if normalized.endswith("authorization"):
+        if normalized == "authorization" or ("-" in name and normalized.endswith("authorization")):
             continue
         if _is_url_query_assignment(assignment_text, match.start("name")):
             continue
@@ -510,14 +514,11 @@ def _independent_secret_scan(text: str) -> bool:  # noqa: PLR0912
         query_matches = iter(())
     for match in query_matches:
         normalized = re.sub(r"[^a-z0-9]", "", match.group(1).casefold())
-        value = match.group(2)
-        following = re.search(r"[&;](?=[A-Za-z0-9_.-]+=)", value)
-        if following:
-            value = value[: following.start()]
+        value = _query_value_parts(match.group(2))[0]
         value = _unwrap_signature_value(value)
         if (
             (normalized in {"auth", "sig"} or _is_sensitive_signature_name(match.group(1)))
-            and value != "<REDACTED>"
+            and not _query_value_is_redacted(match.group(2) + text[match.end(2) :])
             and value.casefold() not in {"null", "undefined", "none", "nil", "true", "false"}
         ):
             return True
@@ -541,8 +542,8 @@ def _is_sensitive_signature_name(name: str) -> bool:
             "credentials",
             "streamid",
         }
-        or normalized == "key"
-        or normalized.endswith("authorization")
+        or normalized in {"key", "authorization"}
+        or ("-" in name and normalized.endswith("authorization"))
         or normalized.endswith(("password", "passwd", "secret", "token"))
         or normalized
         in {
@@ -626,6 +627,17 @@ def _is_searchable_secret(secret: str) -> bool:
 
 def _private_literal_patterns(secret: str) -> set[str]:
     patterns: set[str] = set()
+    mixed: list[str] = []
+    for char in secret:
+        if char == " ":
+            mixed.append(r"(?:\ |\+|%20|%2520)")
+        elif ord(char) < 128:
+            code = f"{ord(char):02X}"
+            hex_pattern = "".join(f"[{c.lower()}{c.upper()}]" if c.isalpha() else c for c in code)
+            mixed.append(rf"(?:{re.escape(char)}|%{hex_pattern}|%25{hex_pattern})")
+        else:
+            mixed.append(re.escape(char))
+    patterns.add("".join(mixed))
     for candidate in (secret, quote(secret, safe=""), quote_plus(secret)):
         if candidate:
             escaped = re.escape(candidate)

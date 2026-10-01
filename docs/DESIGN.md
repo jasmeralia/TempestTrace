@@ -119,13 +119,16 @@ values; nested settings named `key` remain sensitive. Leave credential-free embe
 JSON text byte-for-byte intact.
 
 The hotkey `key` exemption is value-based: only empty values and `OBS_KEY_*` binding
-names are preserved, and a `settings` ancestor makes `key` sensitive. URL fragments
-use the same credential-name rules as query parameters. Authorization headers keep
-their name and an optional known scheme while redacting the remainder through the
-line end. Cross-file checks include percent-encoded forms of known literals. Weak
-source literals from RTMP path segments and unlisted camelCase `*Key` fields are
-collected only when they resemble key material; explicit credential fields retain
-the normal search eligibility.
+names are preserved, and a `settings` ancestor makes `key` sensitive. Unquoted URL
+query and fragment values continue through slashes and punctuation. They stop before
+a following named parameter or whitespace; a bare separator remains part of the
+credential. Values that start with a quote end at its matching closer. Authorization
+assignments accept quoted names and values and keep a known scheme while redacting
+the credential. Cross-file log checks include partially and multiply percent-encoded
+forms of known literals.
+RTMP path segments are harvested by length and character rules, excluding common
+application names; unlisted camelCase `*Key` fields keep the stricter key-material
+check.
 
 For serialized JSON, verification is structural: inspect sensitive keys and scan
 decoded string values. For INI, classify assignments by key and parse JSON-valued

@@ -8,7 +8,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-RULE_VERSION = 14
+RULE_VERSION = 15
 REDACTED = "<REDACTED>"
 _QUOTE_DELIMITER = (
     r"(?:\\*['\"]|`|&(?:quot|apos|ldquo|rdquo|lsquo|rsquo);|"
@@ -58,8 +58,9 @@ _FREE_NAME = (
     r"%22[A-Za-z0-9_.-]++%22|%27[A-Za-z0-9_.-]++%27)"
 )
 _SENSITIVE_NAME_CORE = (
-    r"(?:[A-Za-z0-9_.-]*?(?:password|passwd|pwd|secret|token|passphrase|authorization|cookies?|"
+    r"(?:[A-Za-z0-9_.-]*?(?:password|passwd|pwd|secret|token|passphrase|cookies?|"
     r"session[_-]?id|jwt|credentials?|streamid)|[A-Za-z0-9_.-]*?[_\-.]key|"
+    r"(?:[A-Za-z0-9_.]+-)*authorization|"
     r"(?-i:[A-Za-z0-9_.-]*[Kk][Ee][Yy])|"
     r"(?:apikey|streamkey|privatekey|secretkey|authkey|signingkey|encryptionkey|masterkey|"
     r"sharedkey|sessionkey|accesskey)|key)"
@@ -97,7 +98,9 @@ _LOG_PATTERNS = (
 )
 _URL_QUERY_SECRET = re.compile(
     rf"(?i)([?&;]({_SENSITIVE_QUERY_NAME})[ \t]*[=:][ \t]*)"
-    r"((?:[^&\s]|&(?![A-Za-z0-9_.-]+[ \t]*[=:]))+)"
+    r'((?:"[^"\r\n]*"|\x27[^\x27\r\n]*\x27|`[^`\r\n]*`|'
+    r"(?:&quot;[^\r\n]*?&quot;|&apos;[^\r\n]*?&apos;|%22[^\r\n]*?%22|%27[^\r\n]*?%27)|"
+    r"(?:(?![&;][A-Za-z0-9_.-]+=)[^\s])+))"
 )
 _URL_USERINFO = re.compile(
     r"(?i)(\b[A-Za-z][A-Za-z0-9+.-]*://)([^:/?#@\s]*):([^/?#\s]*)@([^/?#\s]*)"
@@ -172,10 +175,14 @@ def _fragment_secret_spans(text: str) -> list[tuple[int, int]]:
             continue
         end = url_match.end()
         body = text[fragment + 1 : end]
-        for match in re.finditer(r"(?:^|[&;/])([A-Za-z0-9_.-]+)[ \t]*=[ \t]*([^&;/\s]*)", body):
+        for match in re.finditer(
+            r"(?:^|[&;]|/(?=[A-Za-z0-9_.-]+=))([A-Za-z0-9_.-]+)[ \t]*=[ \t]*([^\s<>]*)",
+            body,
+        ):
             if _is_sensitive_key(match.group(1), ("__url_query__",)):
                 start = fragment + 1 + match.start(2)
-                stop = fragment + 1 + match.end(2)
+                value, _following = _query_value_parts(match.group(2))
+                stop = start + len(value)
                 if start == stop:
                     continue
                 found.append((start, stop))
@@ -185,15 +192,41 @@ def _fragment_secret_spans(text: str) -> list[tuple[int, int]]:
 def _redact_url_fragments(text: str, counts: dict[str, int]) -> str:
     spans = _fragment_secret_spans(text)
     for start, end in reversed(spans):
-        if text[start:end] == REDACTED:
+        if _unquote(text[start:end]) == REDACTED:
             continue
-        text = text[:start] + REDACTED + text[end:]
+        text = text[:start] + _quoted_redacted(text[start:end]) + text[end:]
         counts["credential_pattern"] = counts.get("credential_pattern", 0) + 1
     return text
 
 
 def _looks_like_key_material(value: str) -> bool:
     return len(value) >= 8 and any(not character.isalpha() for character in value)
+
+
+_RTMP_APPLICATION_NAMES = frozenset(
+    {
+        "live",
+        "live2",
+        "app",
+        "stream",
+        "streams",
+        "rtmp",
+        "ingest",
+        "publish",
+        "broadcast",
+        "hls",
+        "vod",
+        "origin",
+        "edge",
+        "input",
+    }
+)
+
+
+def _looks_like_rtmp_key(value: str) -> bool:
+    return value.casefold() not in _RTMP_APPLICATION_NAMES and (
+        len(value) >= 8 or (len(value) >= 4 and any(not char.isalpha() for char in value))
+    )
 
 
 def _is_explicit_camel_key(key: str) -> bool:
@@ -287,7 +320,7 @@ def _is_sensitive_key(key: str, context: tuple[str, ...] = (), value: Any = None
         return not _hotkey_key_exempt(key, context, value)
     if normalized in _CREDENTIAL_NAMES:
         return True
-    if normalized.endswith("authorization"):
+    if normalized == "authorization" or ("-" in key and normalized.endswith("authorization")):
         return True
     if context and context[-1] == "__url_query__" and normalized in {"auth", "sig"}:
         return True
@@ -404,6 +437,17 @@ def _sub_overlapping_assignments(text: str, replace: Any) -> str:
     """Replace credential assignments even when they start inside another value."""
     pattern = _LOG_PATTERNS[0]
     fragments = _json_fragments(text)
+    full_scan = _mask_urls(text)
+    covered = [
+        (match.start(1), match.end(2))
+        for match in pattern.finditer(full_scan)
+        if _is_sensitive_key(_log_match_key(match))
+    ]
+    fragments = [
+        fragment
+        for fragment in fragments
+        if not any(start < fragment[0] and end > fragment[1] for start, end in covered)
+    ]
     pieces: list[str] = []
     fragment_cursor = 0
     spans = [(0, len(text))]
@@ -492,14 +536,59 @@ def _is_url_query_assignment(text: str, start: int) -> bool:
 
 def _query_value_parts(value: str) -> tuple[str, str]:
     """Keep a following named parameter intact while absorbing token punctuation."""
+    if value.startswith(REDACTED):
+        next_parameter = re.search(r"[&;](?=[A-Za-z0-9_.-]+=)", value)
+        if next_parameter:
+            return REDACTED, value[next_parameter.start() :]
+        return REDACTED, value[len(REDACTED) :]
+    quoted_pairs = (
+        ('"', '"'),
+        ("'", "'"),
+        ("`", "`"),
+        ("&quot;", "&quot;"),
+        ("&apos;", "&apos;"),
+        ("%22", "%22"),
+        ("%27", "%27"),
+        ("&#34;", "&#34;"),
+        ("&#39;", "&#39;"),
+        ("&#x22;", "&#x22;"),
+        ("&#x27;", "&#x27;"),
+        ("&ldquo;", "&rdquo;"),
+        ("&lsquo;", "&rsquo;"),
+        ("\u201c", "\u201d"),
+        ("\u2018", "\u2019"),
+    )
+    folded = value.casefold()
+    for opening, closing in quoted_pairs:
+        if folded.startswith(opening.casefold()):
+            close = folded.find(closing.casefold(), len(opening))
+            if close >= 0:
+                end = close + len(closing)
+                return value[:end], value[end:]
     next_parameter = re.search(r"[&;](?=[A-Za-z0-9_.-]+=)", value)
     if next_parameter:
         value, following = value[: next_parameter.start()], value[next_parameter.start() :]
     else:
         following = ""
-    if value.endswith(('"', "'")) and not value.startswith(value[-1]):
-        value, following = value[:-1], value[-1] + following
+    boundary = re.search(r"\s", value)
+    if boundary:
+        following = value[boundary.start() :] + following
+        value = value[: boundary.start()]
     return value, following
+
+
+def _query_value_is_redacted(value: str) -> bool:
+    """Accept a redaction marker only when no unquoted value tail remains."""
+    clean, following = _query_value_parts(value)
+    if _unquote(clean) != REDACTED:
+        return False
+    if clean != REDACTED:
+        return True
+    return (
+        not following
+        or following[0].isspace()
+        or bool(re.match(r"[&;][A-Za-z0-9_.-]+=", following))
+    )
 
 
 def _has_sensitive_query_assignment(text: str) -> bool:
@@ -538,9 +627,25 @@ def _is_repeated_redacted_quoted_key_log(text: str) -> bool:
 
 def _authorization_has_scheme(match: re.Match[str]) -> bool:
     if match.re is _LOG_PATTERNS[-1]:
-        return _authorization_scheme(match) and _unquote(match.group(2)) == REDACTED
-    value = _unquote(match.group(2)).split(None, 1)
-    return bool(value and value[0].casefold() in _SCHEME_NAMES)
+        cleaned = match.group(2).rstrip("'\"` ,;}")
+        return _authorization_scheme(match) and _unquote(cleaned) == REDACTED
+    tail = match.string[match.end(1) :]
+    tail = tail.splitlines()[0]
+    tail = re.sub(r"^[ \t'\"`,;}]+|[ \t'\"`,;}]+$", "", tail)
+    value = tail.split(None, 1)
+    if value and value[0].strip('"').casefold().rstrip(":=") in _SCHEME_NAMES and len(value) > 1:
+        return bool(re.match(r"(?i)^[\"'`]?<REDACTED>[\"'`]?(?=[,;}\s]|$)", value[1]))
+    prefix = match.group(1).rstrip()
+    scheme_match = re.search(r"(?i)([A-Za-z][A-Za-z0-9_-]*)[ \t]*$", prefix)
+    if scheme_match and scheme_match.group(1).casefold() in _SCHEME_NAMES:
+        value_text = _unquote(match.group(2).rstrip("'\"` ,;}"))
+        return value_text == REDACTED
+    return bool(
+        value
+        and value[0].casefold().rstrip(":=") in _SCHEME_NAMES
+        and len(value) > 1
+        and _unquote(value[1].rstrip(",;} ")).strip("'\"`") == REDACTED
+    )
 
 
 def _authorization_scheme(match: re.Match[str]) -> bool:
@@ -553,7 +658,9 @@ def _authorization_scheme(match: re.Match[str]) -> bool:
 
 
 def _redact_authorization_remainders(text: str, counts: dict[str, int]) -> str:  # noqa: PLR0912
-    header = re.compile(r"(?i)(?<![A-Za-z0-9_.-])(?:[A-Za-z0-9_.-]*authorization)[ \t]*[=:][ \t]*")
+    header = re.compile(
+        r"(?i)(?<![\w.-])(?:[A-Za-z0-9_.]+-)*authorization[\"']?[ \t]*[=:][ \t]*([\"'`]?)"
+    )
     replacements: list[tuple[int, int, str]] = []
     for match in header.finditer(text):
         line_start = max(text.rfind("\n", 0, match.start()), text.rfind("\r", 0, match.start())) + 1
@@ -573,6 +680,8 @@ def _redact_authorization_remainders(text: str, counts: dict[str, int]) -> str: 
                 quote_char = ""
             elif not quote_char and char in "\"'`":
                 quote_char = char
+        if match.group(1):
+            quote_char = match.group(1)
         if quote_char:
             cursor = match.end()
             escaped = False
@@ -586,7 +695,8 @@ def _redact_authorization_remainders(text: str, counts: dict[str, int]) -> str: 
                     line_end = cursor
                     break
                 cursor += 1
-        value = text[match.end() : line_end]
+        value_start = match.end()
+        value = text[value_start:line_end]
         if not value.strip() or value.strip() == REDACTED:
             continue
         stripped = value.strip()
@@ -598,7 +708,7 @@ def _redact_authorization_remainders(text: str, counts: dict[str, int]) -> str: 
             replacement = value[: len(value) - len(value.lstrip())] + first + " " + REDACTED
         else:
             replacement = REDACTED
-        replacements.append((match.end(), line_end, replacement))
+        replacements.append((value_start, line_end, replacement))
     for start, end, replacement in reversed(replacements):
         text = text[:start] + replacement + text[end:]
         counts["credential_pattern"] = counts.get("credential_pattern", 0) + 1
@@ -722,7 +832,7 @@ def _embedded_secrets(text: str) -> set[str]:
         values.update(
             _rtmp_key(match.group(2))
             for match in _RTMP_STREAM_KEY.finditer(text)
-            if _looks_like_key_material(_rtmp_key(match.group(2)))
+            if _looks_like_rtmp_key(_rtmp_key(match.group(2)))
         )
     if "streamlabs.com/" in text.casefold():
         values.update(match.group(2) for match in _STREAMLABS_WIDGET_TOKEN.finditer(text))
@@ -751,7 +861,7 @@ def _embedded_secrets(text: str) -> set[str]:
                 if (
                     pattern is _LOG_PATTERNS[0]
                     and _log_match_key(match).casefold().endswith("authorization")
-                    and _authorization_has_scheme(match)
+                    and _authorization_scheme(match)
                 ):
                     return match.group(0)
                 if pattern is _LOG_PATTERNS[-1] and not _authorization_scheme(match):
@@ -794,6 +904,25 @@ def _json_fragments(text: str) -> list[tuple[int, int, Any, tuple[str, ...]]]:  
     """Find valid JSON object/array fragments in otherwise free-form text."""
     decoder = json.JSONDecoder()
     fragments: list[tuple[int, int, Any, tuple[str, ...]]] = []
+    quoted_positions = bytearray(len(text))
+    quote_char = ""
+    escaped = False
+    for position, char in enumerate(text):
+        if char in "\r\n":
+            quote_char = ""
+            escaped = False
+            continue
+        if quote_char:
+            quoted_positions[position] = 1
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote_char:
+                quote_char = ""
+        elif char in "\"'`":
+            quote_char = char
+            quoted_positions[position] = 1
     index = 0
     while index < len(text):
         starts = [
@@ -802,6 +931,9 @@ def _json_fragments(text: str) -> list[tuple[int, int, Any, tuple[str, ...]]]:  
         if not starts:
             break
         start = min(starts)
+        if quoted_positions[start]:
+            index = start + 1
+            continue
         opening = text[start]
         following = start + 1
         while following < len(text) and text[following].isspace():
@@ -818,9 +950,11 @@ def _json_fragments(text: str) -> list[tuple[int, int, Any, tuple[str, ...]]]:  
             index = start + 1
             continue
         if opening == "{" and first == '"' and text.find("}", following) < 0:
-            break
+            index = start + 1
+            continue
         if opening == "[" and first in '[{"-0123456789tfn' and text.find("]", following) < 0:
-            break
+            index = start + 1
+            continue
         try:
             value, length = decoder.raw_decode(text, start)
         except (json.JSONDecodeError, RecursionError, MemoryError) as error:
@@ -828,10 +962,10 @@ def _json_fragments(text: str) -> list[tuple[int, int, Any, tuple[str, ...]]]:  
             index = max(start + 1, min(error_position, len(text)))
             continue
         end = length
-        before_ok = start == 0 or text[start - 1] in " \t\r\n=:([{"
+        before_ok = start == 0 or text[start - 1] in " \t\r\n=:([{'\",>"
         after_ok = end == len(text) or text[end] in " \t\r\n,;)]}\"'"
         if not before_ok or not after_ok:
-            index = end
+            index = start + 1
             continue
         assignment_end = start
         while assignment_end > 0:
@@ -934,7 +1068,11 @@ def _scrub_text(text: str, secrets: set[str]) -> str:
             return f"{match.group('prefix')}{REDACTED}"
         return match.group(0)
 
-    return _sub_outside_json(text, _ASSIGNMENT_VALUE, scrub)
+    text = _sub_outside_json(text, _ASSIGNMENT_VALUE, scrub)
+    for literal in sorted(secrets, key=len, reverse=True):
+        if len(literal) >= 4 and not literal.isdigit():
+            text = re.sub(rf"(?<!\w){re.escape(literal)}(?!\w)", REDACTED, text)
+    return text
 
 
 def _redact_embedded(  # noqa: PLR0912, PLR0915
@@ -988,7 +1126,7 @@ def _redact_embedded(  # noqa: PLR0912, PLR0915
 
     def replace_log(match: re.Match[str], pattern: re.Pattern[str]) -> str:  # noqa: PLR0911
         key = _log_match_key(match)
-        if key.casefold().endswith("authorization"):
+        if key.casefold().endswith("authorization") and _authorization_has_scheme(match):
             return match.group(1) + match.group(2)
         if pattern is _LOG_PATTERNS[-1] and not _authorization_scheme(match):
             return match.group(0)
@@ -1007,7 +1145,7 @@ def _redact_embedded(  # noqa: PLR0912, PLR0915
             and key.casefold() == "authorization"
             and _authorization_has_scheme(match)
         ):
-            return match.group(1) + match.group(2)
+            return match.group(0)
         return replace(match, check_noncredential=False)
 
     fragments = _json_fragments(text)
@@ -1028,7 +1166,7 @@ def _redact_embedded(  # noqa: PLR0912, PLR0915
 
     def redact_rtmp(match: re.Match[str]) -> str:
         key = _rtmp_key(match.group(2))
-        if not key or key == REDACTED:
+        if not key or key == REDACTED or not _looks_like_rtmp_key(key):
             return match.group(0)
         trailing = match.group(2)[len(key) :]
         counts["credential_pattern"] = counts.get("credential_pattern", 0) + 1
@@ -1199,15 +1337,18 @@ def has_unredacted_embedded_json(text: str) -> bool:  # noqa: PLR0911
         return False
     if any(has_unredacted_fields(value, context) for _, _, value, context in _json_fragments(text)):
         return True
-    if any(_rtmp_key(match.group(2)) != REDACTED for match in _RTMP_STREAM_KEY.finditer(text)):
+    if any(
+        _rtmp_key(match.group(2)) != REDACTED and _looks_like_rtmp_key(_rtmp_key(match.group(2)))
+        for match in _RTMP_STREAM_KEY.finditer(text)
+    ):
         return True
-    if any(text[start:end] != REDACTED for start, end in _fragment_secret_spans(text)):
+    if any(_unquote(text[start:end]) != REDACTED for start, end in _fragment_secret_spans(text)):
         return True
     if _has_sensitive_query_assignment(text) and any(
         _is_sensitive_key(match.group(2), ("__url_query__",))
         and _unquote(_query_value_parts(match.group(3))[0]).casefold()
         not in {"null", "undefined", "none", "nil", "true", "false"}
-        and _unquote(_query_value_parts(match.group(3))[0]) != REDACTED
+        and not _query_value_is_redacted(match.group(3) + text[match.end(3) :])
         for match in _URL_QUERY_SECRET.finditer(text)
     ):
         return True
@@ -1235,7 +1376,7 @@ def has_unredacted_embedded_json(text: str) -> bool:  # noqa: PLR0911
                     or not is_noncredential_log_match(segment, match)
                 )
                 and not (
-                    pattern is _LOG_PATTERNS[0]
+                    pattern in (_LOG_PATTERNS[0], _LOG_PATTERNS[-1])
                     and _log_match_key(match).casefold().endswith("authorization")
                     and _authorization_has_scheme(match)
                 )
@@ -1310,7 +1451,11 @@ def _ini_continuation_end(lines: list[str], index: int, value: str) -> int:
             r"^\s*[A-Za-z0-9_.-][^=:#\s]*\s*[=:]", candidate
         ):
             break
-        if pending or candidate[:1].isspace():
+        if pending or (
+            candidate[:1].isspace()
+            and len(candidate.split()) == 1
+            and not re.match(r"^\s*[A-Za-z0-9_.-][^=:#\s]*\s*[=:]", candidate)
+        ):
             pending = (len(candidate) - len(candidate.rstrip("\\"))) % 2 == 1
             end += 1
             continue
@@ -1356,14 +1501,23 @@ def _redact_ini(text: str, filename: str, counts: dict[str, int], secrets: set[s
         if (
             match
             and _is_sensitive_key(match.group(2), (filename,), match.group(4))
-            and match.group(4).strip()
+            and (
+                match.group(4).strip()
+                or _ini_continuation_end(
+                    [line.rstrip("\r\n") for line in original_lines], index, match.group(4)
+                )
+                > index + 1
+            )
             and _unquote(match.group(4)).casefold()
             not in {"null", "undefined", "none", "nil", "true", "false"}
         ):
+            replacement_value = REDACTED if match.group(4).strip() else match.group(4)
             cleaned = (
-                f"{match.group(1)}{match.group(2)}{match.group(3)}{REDACTED}{match.group(5) or ''}"
+                f"{match.group(1)}{match.group(2)}{match.group(3)}"
+                f"{replacement_value}{match.group(5) or ''}"
             )
-            counts["credential_field"] = counts.get("credential_field", 0) + 1
+            if match.group(4).strip():
+                counts["credential_field"] = counts.get("credential_field", 0) + 1
             output.append(cleaned)
             plain_lines = [line.rstrip("\r\n") for line in original_lines]
             end = _ini_continuation_end(plain_lines, index, match.group(4))

@@ -576,8 +576,163 @@ def backup_secret_scan(path: Path) -> bool:
     return _secret_scan(path)
 
 
-def test_rule_version_is_fourteen() -> None:
-    assert RULE_VERSION == 14
+def test_rule_version_is_fifteen() -> None:
+    assert RULE_VERSION == 15
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'info: {"authorization": "Bearer SUPERAUTHSECRET99",}',
+        'info: response \'{"authorization": "Bearer SUPERAUTHSECRET99", '
+        '"password": "OTHERSECRET99"}\'',
+        '\' {"authorization": "Bearer SUPERAUTHSECRET99"}',
+        '" {"authorization": "Bearer SUPERAUTHSECRET99"}',
+        ', {"authorization": "Bearer SUPERAUTHSECRET99"}',
+        '> {"authorization": "Bearer SUPERAUTHSECRET99"}',
+        '[{ {"authorization": "Bearer SUPERAUTHSECRET99"}',
+    ],
+)
+def test_quoted_json_authorization_assignment_is_redacted_and_verified(
+    text: str, tmp_path: Path
+) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(text, encoding="utf-8")
+    _categories, _count, _secrets = redact_file_with_secrets(path)
+    cleaned = path.read_text(encoding="utf-8")
+    assert "SUPERAUTHSECRET99" not in cleaned
+    assert not has_unredacted_embedded_json(cleaned)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        'info: {"authorization": "Bearer SUPERAUTHSECRET99",}',
+        'info: response \'{"authorization": "Bearer SUPERAUTHSECRET99", '
+        '"password": "OTHERSECRET99"}\'',
+        '\' {"authorization": "Bearer SUPERAUTHSECRET99"}',
+    ],
+)
+@pytest.mark.parametrize("shape", ["log", "ini", "scene"])
+def test_authorization_fragment_payload_is_redacted_in_every_file_shape(
+    payload: str, shape: str, tmp_path: Path
+) -> None:
+    suffix = {"log": ".txt", "ini": ".ini", "scene": ".json"}[shape]
+    path = tmp_path / f"payload{suffix}"
+    if shape == "log":
+        content = payload
+    elif shape == "ini":
+        content = f"[General]\nNote={payload}\n"
+    else:
+        content = json.dumps({"sources": [{"settings": {"text": payload}}]})
+    path.write_text(content, encoding="utf-8")
+    redact_file(path)
+    cleaned = path.read_text(encoding="utf-8")
+    assert "SUPERAUTHSECRET99" not in cleaned
+    assert "OTHERSECRET99" not in cleaned
+    assert not has_unredacted_embedded_json(cleaned)
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["+/8gc3RyZWFtLWtleSD/Lw==", "ab/cd+EF==", "tok;enTAIL99"],
+)
+@pytest.mark.parametrize("marker", ["?access_token=", "#access_token="])
+def test_url_secret_value_extent_does_not_truncate_token(
+    token: str, marker: str, tmp_path: Path
+) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(f"https://host/{marker}{token}&state=ok\n", encoding="utf-8")
+    redact_file(path)
+    cleaned = path.read_text(encoding="utf-8")
+    assert token not in cleaned
+    assert "&state=ok" in cleaned
+    assert not has_unredacted_embedded_json(cleaned)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "msg='authorization: Bearer AUTHQUOTEDSECRET'",
+        'msg="authorization: Bearer AUTHQUOTEDSECRET"',
+        "msg=`authorization: Bearer AUTHQUOTEDSECRET`",
+        r"\"password\":\"ESCAPEDQUOTEDSECRET\"",
+    ],
+)
+def test_fully_redacted_quoted_values_are_not_over_omitted(text: str, tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(text, encoding="utf-8")
+    redact_file(path)
+    cleaned = path.read_text(encoding="utf-8")
+    assert "AUTHQUOTEDSECRET" not in cleaned
+    assert "ESCAPEDQUOTEDSECRET" not in cleaned
+    assert not has_unredacted_embedded_json(cleaned)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "a=b&cookie=&quot;LK4=]03b\\9Z;Q7ZZ&quot;;c=d",
+        "a=b&cookie=%22LK4=]03b\\9Z;Q7ZZ%22;c=d",
+        "a=b&cookie=\u201cLK4=]03b\\9Z;Q7ZZ\u201d;c=d",
+    ],
+)
+def test_entity_quoted_query_values_end_at_matching_quote(value: str, tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(value, encoding="utf-8")
+    redact_file(path)
+    cleaned = path.read_text(encoding="utf-8")
+    assert "LK4=]03b" not in cleaned and "Q7ZZ" not in cleaned
+    assert cleaned.endswith(";c=d")
+    assert not has_unredacted_embedded_json(cleaned)
+
+
+def test_sensitive_ini_continuations_keep_indented_prose_and_assignments(tmp_path: Path) -> None:
+    path = tmp_path / "basic.ini"
+    path.write_text(
+        "[Stream]\npassword=CorrectHorse99\n    Bitrate note stays\nBitrate=6000\n"
+        "token=\n    SINGLE_TOKEN\n    Multi word note\n",
+        encoding="utf-8",
+    )
+    redact_file(path)
+    cleaned = path.read_text(encoding="utf-8")
+    assert "password=<REDACTED>\n    Bitrate note stays\nBitrate=6000" in cleaned
+    assert "token=\n    <REDACTED>\n    Multi word note" in cleaned
+    assert not has_unredacted_ini_fields(cleaned, path.name)
+
+
+def test_reauthorization_is_not_a_sensitive_header_name(tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text("reauthorization: completed for module audio\n", encoding="utf-8")
+    redact_file(path)
+    assert path.read_text(encoding="utf-8") == "reauthorization: completed for module audio\n"
+
+
+@pytest.mark.parametrize("header", ["Authorization", "Proxy-Authorization", "X-Amz-Authorization"])
+def test_hyphenated_authorization_header_names_are_supported(header: str, tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(f"{header}: Bearer HEADERSECRET99\n", encoding="utf-8")
+    redact_file(path)
+    assert path.read_text(encoding="utf-8") == f"{header}: Bearer <REDACTED>\n"
+
+
+@pytest.mark.parametrize(
+    "url,suffix",
+    [
+        ("https://host/?key=VALUESECRET99&region=us", "&region=us"),
+        ("https://host/?key=VALUESECRET99;region=us", ";region=us"),
+        ("https://host/?key=VALUESECRET99&bare", ""),
+    ],
+)
+def test_query_extent_preserves_only_named_following_parameters(
+    url: str, suffix: str, tmp_path: Path
+) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(url, encoding="utf-8")
+    redact_file(path)
+    cleaned = path.read_text(encoding="utf-8")
+    assert "VALUESECRET99" not in cleaned
+    assert suffix in cleaned
 
 
 @pytest.mark.parametrize(

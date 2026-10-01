@@ -79,6 +79,76 @@ def test_backup_refuses_destination_inside_source(tmp_path: Path) -> None:
         create_backup(source, source / "basic")
 
 
+def test_backup_scrubs_authorization_fragments_and_rtmp_duplicate_keys(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "Dropbox/out"
+    destination.mkdir(parents=True)
+    (source / "basic/profiles/default/service.json").write_text(
+        '{"key":"deadbeefcafe","server":"rtmp://live.example.com/app/deadbeefcafe"}',
+        encoding="utf-8",
+    )
+    (source / "logs/2026-01-01.txt").write_text(
+        'info: {"authorization": "Bearer SUPERAUTHSECRET99",}\n'
+        "publish failed for deadbeefcafe and test123\n"
+        "rtmp://live.example.com/app/test123\n",
+        encoding="utf-8",
+    )
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        payload = b"".join(archive.read(name) for name in archive.namelist())
+    assert b"SUPERAUTHSECRET99" not in payload
+    assert b"deadbeefcafe" not in payload
+    assert b"test123" not in payload
+
+
+def test_percent_and_plus_encoded_private_literals_are_scrubbed_in_logs(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "Dropbox/out"
+    destination.mkdir(parents=True)
+    (source / "basic/profiles/default/service.json").write_text(
+        '{"password":"p@ss w0rd!"}', encoding="utf-8"
+    )
+    (source / "logs/2026-01-01.txt").write_text(
+        "seen p%40ss%20w0rd%21 and p@ss+w0rd! and p%40ss w0rd! "
+        "and p%2540ss%2520w0rd%2521; unrelated=%2F and path=%20\n",
+        encoding="utf-8",
+    )
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        cleaned = archive.read("logs/2026-01-01.txt").decode("utf-8")
+    assert "p%40ss" not in cleaned and "p@ss" not in cleaned
+    assert "p%2540ss" not in cleaned and "unrelated=%2F" in cleaned and "path=%20" in cleaned
+
+
+@pytest.mark.parametrize("secret", ["deadbeefcafe", "test123"])
+def test_rtmp_weak_key_literals_are_scrubbed_in_same_log(secret: str, tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "Dropbox/out"
+    destination.mkdir(parents=True)
+    (source / "logs/2026-01-01.txt").write_text(
+        f"url rtmp://live.example.com/app/{secret} publish failed for {secret}\n",
+        encoding="utf-8",
+    )
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        cleaned = archive.read("logs/2026-01-01.txt").decode("utf-8")
+    assert secret not in cleaned
+
+
+def test_rtmp_application_names_are_not_harvested(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "Dropbox/out"
+    destination.mkdir(parents=True)
+    (source / "logs/2026-01-01.txt").write_text(
+        "rtmp://ingest.example.com/app/live go live now live.twitch.tv live2\n",
+        encoding="utf-8",
+    )
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        cleaned = archive.read("logs/2026-01-01.txt").decode("utf-8")
+    assert cleaned == "rtmp://ingest.example.com/app/live go live now live.twitch.tv live2\n"
+
+
 def test_raw_source_bytes_never_enter_destination_staging(tmp_path: Path) -> None:
     source = fixture(tmp_path / "obs")
     destination = tmp_path / "Dropbox/out"

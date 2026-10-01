@@ -1,5 +1,6 @@
 import json
 import random
+import re
 import time
 from pathlib import Path
 
@@ -577,7 +578,198 @@ def backup_secret_scan(path: Path) -> bool:
 
 
 def test_rule_version_is_fifteen() -> None:
-    assert RULE_VERSION == 15
+    assert RULE_VERSION == 16
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "rtmp://host.example/Nk8sQ7wL91",
+        "rtmp://host.example/Nk8sQ7wL91/live",
+        "rtmps://[2001:db8::1]:443/Nk8sQ7wL91?x=1",
+        "rtmp://host.example/live/Nk8sQ7wL91&next=ok",
+    ],
+)
+def test_rtmp_key_segments_are_redacted(url: str, tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(url, encoding="utf-8")
+    redact_file_with_secrets(path)
+    cleaned = path.read_text(encoding="utf-8")
+    assert "Nk8sQ7wL91" not in cleaned
+    assert not _secret_scan(path)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "rtmp://live.twitch.tv/app",
+        "rtmps://a.rtmps.youtube.com:443/live2",
+        "rtmp://cdn.example/live/streaming",
+        "rtmp://cdn.example/live/production",
+    ],
+)
+def test_rtmp_application_words_are_preserved(url: str, tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    content = f"{url}\n09:00:00.000: streaming production started\n"
+    path.write_text(content, encoding="utf-8")
+    redact_file_with_secrets(path)
+    assert "streaming production started" in path.read_text(encoding="utf-8")
+    assert not _secret_scan(path)
+
+
+def test_rtmp_key_segments_are_redacted_in_scene_source_input(tmp_path: Path) -> None:
+    path = tmp_path / "scene.json"
+    path.write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "id": "ffmpeg_source",
+                        "settings": {"input": "rtmp://ingest.example/Nk8sQ7wL91/live"},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    redact_file_with_secrets(path)
+    cleaned = path.read_text(encoding="utf-8")
+    assert "Nk8sQ7wL91" not in cleaned
+    assert not _secret_scan(path)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/cb?region=us#access_token=SE<CRET99",
+        "https://example.com/cb#access_token=SE>CRET77",
+        'https://example.com/cb#access_token=SE"CRET88 tail',
+        "https://example.com/cb#access_token=SE`CRET66 tail",
+        'href="https://e/x#t=ABC">',
+        "url='https://e/x#access_token=ABC'",
+    ],
+)
+def test_url_fragment_value_handles_angle_and_quote_characters(url: str, tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(url, encoding="utf-8")
+    redact_file_with_secrets(path)
+    cleaned = path.read_text(encoding="utf-8")
+    assert not any(secret in cleaned for secret in ("SE<CRET99", "SE>CRET77", 'SE"CRET88'))
+    assert not _secret_scan(path)
+
+
+def test_duplicate_authorization_headers_and_idempotence(tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(
+        "Authorization: Bearer Nk8sQ7wL91 Authorization: Basic PARTTWO99\n"
+        "Authorization: Bearer ONESECRET99 Authorization: Basic TWOSECRET99 "
+        "Authorization: Bearer THREESECRET99\n"
+        'Authorization: "Bearer" FOURSECRET99\n',
+        encoding="utf-8",
+    )
+    redact_file_with_secrets(path)
+    cleaned = path.read_text(encoding="utf-8")
+    assert all(
+        secret not in cleaned
+        for secret in (
+            "Nk8sQ7wL91",
+            "PARTTWO99",
+            "ONESECRET99",
+            "TWOSECRET99",
+            "THREESECRET99",
+            "FOURSECRET99",
+        )
+    )
+    assert "Authorization: Bearer <REDACTED>" in cleaned
+    assert not _secret_scan(path)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'authorization: "Bearer" TOKENSECRETX99',
+        "authorization: 'Basic' TOKENSECRETX99",
+        'authorization: "Bearer TOKENSECRETX99"',
+        r'authorization: "Bearer \"quoted\" TOKENSECRETX99"',
+    ],
+)
+def test_quoted_authorization_scheme_keeps_token_redacted(line: str, tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(line, encoding="utf-8")
+    redact_file_with_secrets(path)
+    assert "TOKENSECRETX99" not in path.read_text(encoding="utf-8")
+    assert not _secret_scan(path)
+
+
+def test_authorization_next_line_token_is_redacted(tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(
+        "Authorization: Bearer\n    NEXTLINESECRET99\nAuthorization:\nEMPTYVALUESECRET99\n"
+        "Authorization: Basic\n\n  SECONDSECRET99\n",
+        encoding="utf-8",
+    )
+    redact_file_with_secrets(path)
+    cleaned = path.read_text(encoding="utf-8")
+    assert all(
+        secret not in cleaned
+        for secret in ("NEXTLINESECRET99", "EMPTYVALUESECRET99", "SECONDSECRET99")
+    )
+    assert not _secret_scan(path)
+    benign = tmp_path / "benign.txt"
+    benign.write_text("Authorization: Bearer\nordinary diagnostic text follows\n", encoding="utf-8")
+    redact_file_with_secrets(benign)
+    assert benign.read_text(encoding="utf-8") == (
+        "Authorization: Bearer\nordinary diagnostic text follows\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user:p#assword@host/room",
+        "https://user:sec?ret@host/path",
+        "redis://user:p#assword@host:6379/0",
+        "mongodb://user:sec?ret@host/db",
+        "ftp://user:p#assword@host/file",
+        "ws://user:sec?ret@host/path",
+    ],
+)
+def test_userinfo_password_may_contain_url_punctuation(url: str, tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(url, encoding="utf-8")
+    redact_file_with_secrets(path)
+    cleaned = path.read_text(encoding="utf-8")
+    assert "p#assword" not in cleaned and "sec?ret" not in cleaned
+    assert not _secret_scan(path)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com?email=a:b@c.com",
+        "https://host#frag:x@y",
+    ],
+)
+def test_url_colon_after_query_or_fragment_is_not_userinfo(url: str, tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(url, encoding="utf-8")
+    redact_file_with_secrets(path)
+    assert path.read_text(encoding="utf-8").strip() == url
+    assert not _secret_scan(path)
+
+
+def test_weak_camel_key_only_redacts_key_material(tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text("userKey=hunter22\nlayoutKey=default\n", encoding="utf-8")
+    redact_file_with_secrets(path)
+    cleaned = path.read_text(encoding="utf-8")
+    assert "userKey=<REDACTED>" in cleaned
+    assert "layoutKey=default" in cleaned
+    assert not _secret_scan(path)
+
+
+def test_hotkey_exemption_rejects_secret_looking_obs_key_name() -> None:
+    assert has_unredacted_fields({"hotkeys": {"bindings": {"key": "OBS_KEY_NK8SQ7WL91"}}})
 
 
 @pytest.mark.parametrize(
@@ -1329,9 +1521,8 @@ def test_hotkey_structures_and_browser_url_survive_verification(
     path = tmp_path / filename
     path.write_text(content, encoding="utf-8")
     redact_file_with_secrets(path)
-    assert "OBS_KEY_F9" in path.read_text(encoding="utf-8") or "OBS_KEY_M" in path.read_text(
-        encoding="utf-8"
-    )
+    for binding in re.findall(r"OBS_KEY_[A-Z0-9_]+", content):
+        assert binding in path.read_text(encoding="utf-8")
     assert "URLSECRET" not in path.read_text(encoding="utf-8")
     assert not _secret_scan(path)
 
@@ -1447,7 +1638,7 @@ def test_short_or_weak_key_values_do_not_drop_log(name: str, value: str, tmp_pat
         f"14:00:00.000: CPU Name: Test CPU\n{name}: {value}\nvalue=1 and 0\n", encoding="utf-8"
     )
     redact_file_with_secrets(path)
-    expected = "<REDACTED>"
+    expected = value if name == "SortKey" and value == "Name" else "<REDACTED>"
     assert path.read_text(encoding="utf-8") == (
         f"14:00:00.000: CPU Name: Test CPU\n{name}: {expected}\nvalue=1 and 0\n"
     )

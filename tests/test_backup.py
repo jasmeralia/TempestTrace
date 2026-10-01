@@ -273,6 +273,49 @@ def test_backup_redacts_credentials_nested_in_json_text_containers(tmp_path: Pat
     assert scene["hotkeys"]["libobs.mute"]["key"] == "OBS_KEY_F9"
 
 
+def test_cross_file_secret_scrub_is_order_independent_and_covers_scenes(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    secret = "Nk8sQ7wL91"
+    (source / "basic/profiles/default/basic.ini").write_text(
+        f"[General]\nNote=remember {secret}\n", encoding="utf-8"
+    )
+    (source / "basic/profiles/default/service.json").write_text(
+        json.dumps({"settings": {"key": secret}}), encoding="utf-8"
+    )
+    (source / "basic/scenes/main.json").write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {
+                        "settings": {
+                            "note": f"paste {secret} here",
+                            "url": f"https://x/cb?code={secret}&x=1",
+                            "encoded": "?code=%4E%6B%38%73%51%37%77%4C%39%31",
+                        }
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (source / "logs/2026-01-01.txt").write_text(
+        f"password={secret} https://example.com/cb?code=%4E%6B%38%73%51%37%77%4C%39%31 "
+        "keyint: 250 74% %PATH% %APPDATA% printf %s\n",
+        encoding="utf-8",
+    )
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    result = create_backup(source, destination)
+
+    assert not result.warnings
+    with zipfile.ZipFile(result.archive) as archive:
+        content = "\n".join(archive.read(name).decode() for name in archive.namelist())
+    assert secret not in content
+    assert "%PATH%" in content and "%APPDATA%" in content and "printf %s" in content
+    assert "keyint: 250" in content and "74%" in content
+
+
 def test_backup_promotes_without_hard_links(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -769,7 +812,7 @@ def test_short_numeric_secret_does_not_omit_log_but_long_duplicate_is_caught(
     with zipfile.ZipFile(result.archive) as archive:
         assert "logs/2026-01-01.txt" in archive.namelist()
         log_body = archive.read("logs/2026-01-01.txt")
-        assert b"SortKey: <REDACTED>" in log_body
+        assert b"SortKey: 1" in log_body
         assert b"other=1 0" in log_body
 
     private = tmp_path / "duplicate.txt"
@@ -842,7 +885,7 @@ def test_weak_rtmp_and_generic_key_literals_do_not_rewrite_benign_logs_or_names(
         body = archive.read("logs/2026-01-01.txt").decode("utf-8")
     assert scene["sources"][0]["name"] == "Name"
     assert "live.twitch.tv" in body and "go live now" in body and "CPU Name: Test CPU" in body
-    assert "SortKey=<REDACTED>" in body
+    assert "SortKey=Name" in body
     assert "STREAMKEYSECRET999" not in body and "APIKEYSECRET999" not in body
 
 

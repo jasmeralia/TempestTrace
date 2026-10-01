@@ -8,7 +8,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-RULE_VERSION = 15
+RULE_VERSION = 16
 REDACTED = "<REDACTED>"
 _QUOTE_DELIMITER = (
     r"(?:\\*['\"]|`|&(?:quot|apos|ldquo|rdquo|lsquo|rsquo);|"
@@ -102,13 +102,8 @@ _URL_QUERY_SECRET = re.compile(
     r"(?:&quot;[^\r\n]*?&quot;|&apos;[^\r\n]*?&apos;|%22[^\r\n]*?%22|%27[^\r\n]*?%27)|"
     r"(?:(?![&;][A-Za-z0-9_.-]+=)[^\s])+))"
 )
-_URL_USERINFO = re.compile(
-    r"(?i)(\b[A-Za-z][A-Za-z0-9+.-]*://)([^:/?#@\s]*):([^/?#\s]*)@([^/?#\s]*)"
-)
-_RTMP_STREAM_KEY = re.compile(
-    r"(?i)\b((?:rtmp|rtmps|rtmpe|rtmpt|rtmpte|rtmfp)://[^/?#\s\"'<>]+/"
-    r"(?:[^/?#\s\"'<>]+/)+)([^/?#\s\"'<>]+)"
-)
+_URL_USERINFO = re.compile(r"(?i)(\b[A-Za-z][A-Za-z0-9+.-]*://)([^:/?#@\s]*):([^/\s]*@)([^\s]*)")
+_RTMP_URL = re.compile(r"(?i)\b(?:rtmp|rtmps|rtmpe|rtmpt|rtmpte|rtmfp)://[^\s]+")
 _STREAMLABS_WIDGET_TOKEN = re.compile(
     r"(?i)(https?://(?:www\.)?streamlabs\.com/(?:widgets/)?[^/?#\s]+/v\d+/)"
     r"([^/?#\s\"'<>]+)"
@@ -147,7 +142,7 @@ _COOKIE_HEADER = re.compile(r"(?im)^([ \t]*(?:set-cookie|cookie)[ \t]*:[ \t]*)([
 _AUTH_HEADER = re.compile(
     r"(?im)^([ \t]*[A-Za-z0-9_.-]*authorization[ \t]*[=:][ \t]*)([^\s,;]+)(?:[ \t]+([^\s,;]+))?"
 )
-_URL_TEXT = re.compile(r"(?i)\b[A-Za-z][A-Za-z0-9+.-]*://[^\s<>\"'`]+")
+_URL_TEXT = re.compile(r"(?i)\b[A-Za-z][A-Za-z0-9+.-]*://[^\s]+")
 _ASSIGNMENT_VALUE = re.compile(
     r"(?im)(?P<prefix>(?:^|[\s,;])[^=\s,;]+[=:]\s*)"
     r'(?P<value>"[^"\r\n]*"|\'[^\'\r\n]*\'|[^\s,;]+)'
@@ -176,7 +171,7 @@ def _fragment_secret_spans(text: str) -> list[tuple[int, int]]:
         end = url_match.end()
         body = text[fragment + 1 : end]
         for match in re.finditer(
-            r"(?:^|[&;]|/(?=[A-Za-z0-9_.-]+=))([A-Za-z0-9_.-]+)[ \t]*=[ \t]*([^\s<>]*)",
+            r"(?:^|[&;]|/(?=[A-Za-z0-9_.-]+=))([A-Za-z0-9_.-]+)[ \t]*=[ \t]*([^\s]*)",
             body,
         ):
             if _is_sensitive_key(match.group(1), ("__url_query__",)):
@@ -196,6 +191,42 @@ def _redact_url_fragments(text: str, counts: dict[str, int]) -> str:
             continue
         text = text[:start] + _quoted_redacted(text[start:end]) + text[end:]
         counts["credential_pattern"] = counts.get("credential_pattern", 0) + 1
+    return text
+
+
+def _rtmp_segment_spans(text: str) -> list[tuple[int, int]]:
+    """Find key-like RTMP path segments, including a key used as the app path."""
+    spans: list[tuple[int, int]] = []
+    for url in _RTMP_URL.finditer(text):
+        scheme_end = url.start() + url.group(0).find("://") + 3
+        slash = text.find("/", scheme_end, url.end())
+        if slash < 0:
+            continue
+        path_end = url.end()
+        for marker in ("?", "#"):
+            found = text.find(marker, slash, path_end)
+            if found >= 0:
+                path_end = min(path_end, found)
+        cursor = slash + 1
+        for segment in text[cursor:path_end].split("/"):
+            end = cursor + len(segment)
+            clean = "" if segment.startswith(REDACTED) else _rtmp_key(segment)
+            clean_end = cursor + len(clean)
+            delimiter = re.search(r"&(?=[A-Za-z0-9_.-]{2,}=)", segment)
+            if delimiter:
+                clean = segment[: delimiter.start()].rstrip(".,;:!?)]}")
+                clean_end = cursor + len(clean)
+            if clean and clean != REDACTED and _looks_like_rtmp_key(clean):
+                spans.append((cursor, clean_end))
+            cursor = end + 1
+    return spans
+
+
+def _redact_rtmp_segments(text: str, counts: dict[str, int]) -> str:
+    for start, end in reversed(_rtmp_segment_spans(text)):
+        if text[start:end] != REDACTED:
+            text = text[:start] + REDACTED + text[end:]
+            counts["credential_pattern"] = counts.get("credential_pattern", 0) + 1
     return text
 
 
@@ -224,8 +255,14 @@ _RTMP_APPLICATION_NAMES = frozenset(
 
 
 def _looks_like_rtmp_key(value: str) -> bool:
-    return value.casefold() not in _RTMP_APPLICATION_NAMES and (
-        len(value) >= 8 or (len(value) >= 4 and any(not char.isalpha() for char in value))
+    if value.casefold() in _RTMP_APPLICATION_NAMES:
+        return False
+    if len(value) >= 4 and any(not char.isalpha() for char in value):
+        return True
+    return value.isalpha() and (
+        (value.lower() != value and value.upper() != value)
+        or bool(re.fullmatch(r"(?i)[a-f]{8,}", value))
+        or len(value) >= 16
     )
 
 
@@ -251,10 +288,16 @@ def _is_explicit_camel_key(key: str) -> bool:
 
 
 def _is_weak_camel_key(key: str) -> bool:
-    return key.endswith("Key") and not _is_explicit_camel_key(key)
+    return (
+        key.endswith("Key")
+        and re.sub(r"[^a-z0-9]", "", key.casefold()) != "key"
+        and not _is_explicit_camel_key(key)
+    )
 
 
-def _hotkey_key_exempt(key: str, context: tuple[str, ...], value: Any) -> bool:
+def _hotkey_key_exempt(  # noqa: PLR0911
+    key: str, context: tuple[str, ...], value: Any
+) -> bool:
     normalized = re.sub(r"[^a-z0-9]", "", key.casefold())
     if normalized != "key":
         return False
@@ -270,8 +313,17 @@ def _hotkey_key_exempt(key: str, context: tuple[str, ...], value: Any) -> bool:
     closest = positions[-1]
     if "settings" in parts[closest + 1 :]:
         return False
-    return value == "" or (
-        isinstance(value, str) and bool(re.fullmatch(r"OBS_KEY_[A-Z0-9_]+", value))
+    if value == "":
+        return True
+    if not isinstance(value, str):
+        return False
+    binding = re.fullmatch(r"OBS_KEY_(.+)", value)
+    if not binding:
+        return False
+    name = binding.group(1)
+    return bool(
+        re.fullmatch(r"[A-Z0-9]|F[0-9]{1,2}|NUM(?:[0-9]|[A-Z]{2,12})|MOUSE[0-9]{1,2}", name)
+        or re.fullmatch(r"[A-Z]{2,16}(?:_[A-Z]{2,10})?", name)
     )
 
 
@@ -314,6 +366,10 @@ _CREDENTIAL_NAMES = frozenset(
 def _is_sensitive_key(key: str, context: tuple[str, ...] = (), value: Any = None) -> bool:  # noqa: PLR0911
     """Recognize credential names, treating the ambiguous `key` contextually."""
     normalized = re.sub(r"[^a-z0-9]", "", key.casefold())
+    if _is_weak_camel_key(key) and not _looks_like_key_material(
+        value if isinstance(value, str) else ""
+    ):
+        return False
     if normalized == "key":
         if context and context[-1] == "__obsbasic_hotkey_binding__":
             return not _hotkey_key_exempt(key, context, value)
@@ -441,7 +497,7 @@ def _sub_overlapping_assignments(text: str, replace: Any) -> str:
     covered = [
         (match.start(1), match.end(2))
         for match in pattern.finditer(full_scan)
-        if _is_sensitive_key(_log_match_key(match))
+        if _is_sensitive_key(_log_match_key(match), value=_unquote(match.group(2)))
     ]
     fragments = [
         fragment
@@ -537,10 +593,13 @@ def _is_url_query_assignment(text: str, start: int) -> bool:
 def _query_value_parts(value: str) -> tuple[str, str]:
     """Keep a following named parameter intact while absorbing token punctuation."""
     if value.startswith(REDACTED):
-        next_parameter = re.search(r"[&;](?=[A-Za-z0-9_.-]+=)", value)
+        tail = value[len(REDACTED) :]
+        if re.fullmatch(r"[<>\"'`.,;:!?)]}]*", tail):
+            return REDACTED, tail
+        next_parameter = re.search(r"[&;](?=[A-Za-z0-9_.-]+=)", tail)
         if next_parameter:
-            return REDACTED, value[next_parameter.start() :]
-        return REDACTED, value[len(REDACTED) :]
+            return REDACTED, tail[next_parameter.start() :]
+        return REDACTED, tail
     quoted_pairs = (
         ('"', '"'),
         ("'", "'"),
@@ -574,6 +633,15 @@ def _query_value_parts(value: str) -> tuple[str, str]:
     if boundary:
         following = value[boundary.start() :] + following
         value = value[: boundary.start()]
+    delimiter = re.search(r"[<>\"'`]", value)
+    if delimiter:
+        cursor = delimiter.start()
+        while cursor < len(value):
+            if value[cursor] in "<>\"'`" and re.fullmatch(r"[<>\"'`.,;:!?)]}]*", value[cursor:]):
+                following = value[cursor:] + following
+                value = value[:cursor]
+                break
+            cursor += 1
     return value, following
 
 
@@ -588,6 +656,7 @@ def _query_value_is_redacted(value: str) -> bool:
         not following
         or following[0].isspace()
         or bool(re.match(r"[&;][A-Za-z0-9_.-]+=", following))
+        or bool(re.fullmatch(r"[<>\"'`.,;:!?)]}]*", following))
     )
 
 
@@ -633,8 +702,10 @@ def _authorization_has_scheme(match: re.Match[str]) -> bool:
     tail = tail.splitlines()[0]
     tail = re.sub(r"^[ \t'\"`,;}]+|[ \t'\"`,;}]+$", "", tail)
     value = tail.split(None, 1)
-    if value and value[0].strip('"').casefold().rstrip(":=") in _SCHEME_NAMES and len(value) > 1:
-        return bool(re.match(r"(?i)^[\"'`]?<REDACTED>[\"'`]?(?=[,;}\s]|$)", value[1]))
+    if value and value[0].strip('"').casefold().rstrip(":=") in _SCHEME_NAMES:
+        return len(value) == 1 or bool(
+            re.match(r"(?i)^[\"'`]?<REDACTED>[\"'`]?(?=[,;}\s]|$)", value[1])
+        )
     prefix = match.group(1).rstrip()
     scheme_match = re.search(r"(?i)([A-Za-z][A-Za-z0-9_-]*)[ \t]*$", prefix)
     if scheme_match and scheme_match.group(1).casefold() in _SCHEME_NAMES:
@@ -657,61 +728,125 @@ def _authorization_scheme(match: re.Match[str]) -> bool:
     return scheme in _SCHEME_NAMES
 
 
-def _redact_authorization_remainders(text: str, counts: dict[str, int]) -> str:  # noqa: PLR0912
+def _redact_authorization_remainders(  # noqa: PLR0912, PLR0915
+    text: str, counts: dict[str, int]
+) -> str:
     header = re.compile(
         r"(?i)(?<![\w.-])(?:[A-Za-z0-9_.]+-)*authorization[\"']?[ \t]*[=:][ \t]*([\"'`]?)"
     )
     replacements: list[tuple[int, int, str]] = []
-    for match in header.finditer(text):
-        line_start = max(text.rfind("\n", 0, match.start()), text.rfind("\r", 0, match.start())) + 1
-        line_end = len(text)
-        for marker in ("\n", "\r"):
-            found = text.find(marker, match.end())
-            if found >= 0:
-                line_end = min(line_end, found)
-        quote_char = ""
-        escaped = False
-        for char in text[line_start : match.start()]:
-            if escaped:
+    lines = list(re.finditer(r"[^\r\n]*(?:\r?\n|\r|$)", text))
+    for line_index, line in enumerate(lines):
+        body = line.group(0).rstrip("\r\n")
+        line_start, line_end = line.start(), line.start() + len(body)
+        covered_end = line_start
+        for match in header.finditer(body):
+            start = line_start + match.start()
+            if start < covered_end:
+                continue
+            value_start = line_start + match.end()
+            value = text[value_start:line_end]
+            leading = len(value) - len(value.lstrip())
+            stripped = value.strip()
+            if not stripped:
+                following_index = line_index + 1
+                while following_index < len(lines):
+                    following = lines[following_index]
+                    next_body = following.group(0).rstrip("\r\n")
+                    if next_body.strip():
+                        next_value = next_body.strip()
+                        if next_body[: len(next_body) - len(next_body.lstrip())] or not re.search(
+                            r"\s", next_value
+                        ):
+                            replacements.append(
+                                (following.start(), following.start() + len(next_body), REDACTED)
+                            )
+                        break
+                    following_index += 1
+                continue
+            if stripped == REDACTED:
+                continue
+            opening_consumed = bool(match.group(1))
+            quote_char = match.group(1) or (stripped[0] if stripped[0] in "\"'`" else "")
+            quoted_end = -1
+            if quote_char:
                 escaped = False
-            elif char == "\\":
-                escaped = True
-            elif quote_char and char == quote_char:
-                quote_char = ""
-            elif not quote_char and char in "\"'`":
-                quote_char = char
-        if match.group(1):
-            quote_char = match.group(1)
-        if quote_char:
-            cursor = match.end()
-            escaped = False
-            while cursor < line_end:
-                char = text[cursor]
-                if escaped:
-                    escaped = False
-                elif char == "\\":
-                    escaped = True
-                elif char == quote_char:
-                    line_end = cursor
-                    break
-                cursor += 1
-        value_start = match.end()
-        value = text[value_start:line_end]
-        if not value.strip() or value.strip() == REDACTED:
-            continue
-        stripped = value.strip()
-        pieces = stripped.split(None, 1)
-        first = pieces[0].rstrip(",;") if pieces else ""
-        if first.casefold() in _SCHEME_NAMES and len(pieces) > 1 and pieces[1].strip() == REDACTED:
-            continue
-        if first.casefold() in _SCHEME_NAMES and len(pieces) > 1:
-            replacement = value[: len(value) - len(value.lstrip())] + first + " " + REDACTED
-        else:
-            replacement = REDACTED
-        replacements.append((value_start, line_end, replacement))
+                quote_content_start = value_start + leading + (0 if opening_consumed else 1)
+                for pos in range(quote_content_start, line_end):
+                    char = text[pos]
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == quote_char:
+                        quoted_end = pos
+                        break
+            if quote_char and quoted_end >= 0:
+                inside_start = value_start + leading + (0 if opening_consumed else 1)
+                inside = text[inside_start:quoted_end]
+                after_start = quoted_end + 1
+                tail = text[after_start:line_end].strip()
+                inside_parts = inside.split(None, 1)
+                if (
+                    inside_parts
+                    and inside_parts[0].casefold() in _SCHEME_NAMES
+                    and not inside_parts[1:]
+                    and tail
+                ):
+                    replacement = value[:leading] + inside + quote_char + " " + REDACTED
+                    replacements.append((value_start, line_end, replacement))
+                elif inside.strip() != REDACTED:
+                    if (
+                        inside_parts
+                        and inside_parts[0].casefold() in _SCHEME_NAMES
+                        and len(inside_parts) > 1
+                    ):
+                        clean_inside = inside_parts[0] + " " + REDACTED
+                    else:
+                        clean_inside = REDACTED
+                    replacement_start = value_start + leading - (1 if opening_consumed else 0)
+                    replacements.append(
+                        (
+                            replacement_start,
+                            quoted_end + 1,
+                            quote_char + clean_inside + quote_char,
+                        )
+                    )
+                covered_end = line_end
+                continue
+            pieces = stripped.split(None, 1)
+            first = pieces[0].strip("\"'`").rstrip(",;") if pieces else ""
+            if first.casefold() in _SCHEME_NAMES and len(pieces) > 1:
+                if pieces[1].strip().strip("\"'`") == REDACTED:
+                    covered_end = line_end
+                    continue
+                replacement = value[:leading] + first + " " + REDACTED
+            elif first.casefold() in _SCHEME_NAMES:
+                replacement = value[:leading] + first
+            else:
+                replacement = REDACTED
+            if replacement != value:
+                replacements.append((value_start, line_end, replacement))
+            covered_end = line_end
+            if first.casefold() in _SCHEME_NAMES and len(pieces) == 1:
+                following_index = line_index + 1
+                while following_index < len(lines):
+                    following = lines[following_index]
+                    next_body = following.group(0).rstrip("\r\n")
+                    if next_body.strip():
+                        next_value = next_body.strip()
+                        if next_body[: len(next_body) - len(next_body.lstrip())] or not re.search(
+                            r"\s", next_value
+                        ):
+                            replacements.append(
+                                (following.start(), following.start() + len(next_body), REDACTED)
+                            )
+                        break
+                    following_index += 1
     for start, end, replacement in reversed(replacements):
-        text = text[:start] + replacement + text[end:]
-        counts["credential_pattern"] = counts.get("credential_pattern", 0) + 1
+        if text[start:end] != replacement:
+            text = text[:start] + replacement + text[end:]
+            counts["credential_pattern"] = counts.get("credential_pattern", 0) + 1
     return text
 
 
@@ -828,12 +963,12 @@ def _embedded_secrets(text: str) -> set[str]:
             not in {"null", "undefined", "none", "nil", "true", "false"}
         )
     if "://" in text:
-        values.update(match.group(3) for match in _URL_USERINFO.finditer(text))
         values.update(
-            _rtmp_key(match.group(2))
-            for match in _RTMP_STREAM_KEY.finditer(text)
-            if _looks_like_rtmp_key(_rtmp_key(match.group(2)))
+            match.group(3)[:-1]
+            for match in _URL_USERINFO.finditer(text)
+            if match.group(3) != f"{REDACTED}@"
         )
+        values.update(text[start:end] for start, end in _rtmp_segment_spans(text))
     if "streamlabs.com/" in text.casefold():
         values.update(match.group(2) for match in _STREAMLABS_WIDGET_TOKEN.finditer(text))
     if _SENSITIVE_NAME_HINT.search(text):
@@ -857,7 +992,10 @@ def _embedded_secrets(text: str) -> set[str]:
                 pattern is _LOG_PATTERNS[-1]
                 or _log_match_key(match).casefold() != "key"
                 or not is_noncredential_log_match(text, match)
-            ) and (pattern is _LOG_PATTERNS[-1] or _is_sensitive_key(_log_match_key(match))):
+            ) and (
+                pattern is _LOG_PATTERNS[-1]
+                or _is_sensitive_key(_log_match_key(match), value=_unquote(match.group(2)))
+            ):
                 if (
                     pattern is _LOG_PATTERNS[0]
                     and _log_match_key(match).casefold().endswith("authorization")
@@ -896,7 +1034,7 @@ def _embedded_secrets(text: str) -> set[str]:
 
 def _rtmp_key(value: str) -> str:
     """Drop sentence punctuation accidentally attached to a URL path segment."""
-    return value.rstrip(".,;:!?)]}\\'\u201d\u2019")
+    return value.rstrip(".,;:!?)]}>\\\"'`\u201d\u2019")
 
 
 @lru_cache(maxsize=2)
@@ -1132,7 +1270,9 @@ def _redact_embedded(  # noqa: PLR0912, PLR0915
             return match.group(0)
         if pattern is _LOG_PATTERNS[0] and _is_url_query_assignment(match.string, match.start(1)):
             return match.group(1) + match.group(2)
-        if pattern is not _LOG_PATTERNS[-1] and not _is_sensitive_key(key):
+        if pattern is not _LOG_PATTERNS[-1] and not _is_sensitive_key(
+            key, value=_unquote(match.group(2))
+        ):
             return match.group(1) + match.group(2)
         if (
             pattern is _LOG_PATTERNS[0]
@@ -1164,16 +1304,13 @@ def _redact_embedded(  # noqa: PLR0912, PLR0915
         pieces.append(text[cursor:])
         text = "".join(pieces)
 
-    def redact_rtmp(match: re.Match[str]) -> str:
-        key = _rtmp_key(match.group(2))
-        if not key or key == REDACTED or not _looks_like_rtmp_key(key):
-            return match.group(0)
-        trailing = match.group(2)[len(key) :]
-        counts["credential_pattern"] = counts.get("credential_pattern", 0) + 1
-        return f"{match.group(1)}{REDACTED}{trailing}"
+    if "authorization" in text.casefold():
+        text = _redact_authorization_remainders(text, counts)
 
     if "://" in text:
-        text = _sub_outside_json(text, _RTMP_STREAM_KEY, redact_rtmp)
+        text = _sub_outside_json(
+            text, _RTMP_URL, lambda match: _redact_rtmp_segments(match.group(0), counts)
+        )
 
     def replace_query(match: re.Match[str]) -> str:
         if not _is_sensitive_key(match.group(2), ("__url_query__",)):
@@ -1190,7 +1327,7 @@ def _redact_embedded(  # noqa: PLR0912, PLR0915
     text = _redact_url_fragments(text, counts)
 
     def redact_userinfo(match: re.Match[str]) -> str:
-        if match.group(3) == REDACTED:
+        if match.group(3) == f"{REDACTED}@":
             return match.group(0)
         counts["credential_pattern"] = counts.get("credential_pattern", 0) + 1
         return f"{match.group(1)}{match.group(2)}:{REDACTED}@{match.group(4)}"
@@ -1215,8 +1352,6 @@ def _redact_embedded(  # noqa: PLR0912, PLR0915
             return match.group(1) + REDACTED
 
         text = _COOKIE_HEADER.sub(redact_cookie, text)
-    if "authorization" in text.casefold():
-        text = _redact_authorization_remainders(text, counts)
     if "--" in text or re.search(r"(?i)(?:^|\s)-[A-Za-z]", text):
 
         def redact_cli(match: re.Match[str]) -> str:
@@ -1337,10 +1472,7 @@ def has_unredacted_embedded_json(text: str) -> bool:  # noqa: PLR0911
         return False
     if any(has_unredacted_fields(value, context) for _, _, value, context in _json_fragments(text)):
         return True
-    if any(
-        _rtmp_key(match.group(2)) != REDACTED and _looks_like_rtmp_key(_rtmp_key(match.group(2)))
-        for match in _RTMP_STREAM_KEY.finditer(text)
-    ):
+    if _rtmp_segment_spans(text):
         return True
     if any(_unquote(text[start:end]) != REDACTED for start, end in _fragment_secret_spans(text)):
         return True
@@ -1352,7 +1484,7 @@ def has_unredacted_embedded_json(text: str) -> bool:  # noqa: PLR0911
         for match in _URL_QUERY_SECRET.finditer(text)
     ):
         return True
-    if any(match.group(3) != REDACTED for match in _URL_USERINFO.finditer(text)):
+    if any(match.group(3) != f"{REDACTED}@" for match in _URL_USERINFO.finditer(text)):
         return True
     if _SENSITIVE_NAME_HINT.search(text) and any(
         _unquote(value) != REDACTED and not noncredential
@@ -1380,7 +1512,10 @@ def has_unredacted_embedded_json(text: str) -> bool:  # noqa: PLR0911
                     and _log_match_key(match).casefold().endswith("authorization")
                     and _authorization_has_scheme(match)
                 )
-                and (pattern is _LOG_PATTERNS[-1] or _is_sensitive_key(_log_match_key(match)))
+                and (
+                    pattern is _LOG_PATTERNS[-1]
+                    or _is_sensitive_key(_log_match_key(match), value=_unquote(match.group(2)))
+                )
                 for match in pattern.finditer(scan_segment)
             ):
                 return True

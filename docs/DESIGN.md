@@ -106,9 +106,10 @@ path segments of RTMP-family URLs and SRT `passphrase`/`streamid` values. Scan l
 known credential patterns and redact matching values while keeping the surrounding
 diagnostic line. Maintain a versioned field/path rule list and fixtures taken from
 synthetic OBS data; never commit Rin's real configuration or log samples.
-For cross-file literal scans, search collected values of at least four characters,
-except numeric values of four or five digits; the credential field itself is always
-redacted, and this limit avoids rewriting benign short tokens.
+For cross-file literal scans, first redact every collected file and gather eligible
+credential literals, then scrub and verify every staged file before promotion. Search
+collected values of at least four characters, except numeric values of four or five
+digits; the credential field itself is always redacted.
 
 Also inspect valid JSON objects and arrays embedded in INI values, log lines, and
 string-valued JSON fields. Redact credential fields within those fragments and scan
@@ -118,17 +119,16 @@ the binding field in `OBSBasic.*` JSON-valued INI assignments, including multili
 values; nested settings named `key` remain sensitive. Leave credential-free embedded
 JSON text byte-for-byte intact.
 
-The hotkey `key` exemption is value-based: only empty values and `OBS_KEY_*` binding
-names are preserved, and a `settings` ancestor makes `key` sensitive. Unquoted URL
-query and fragment values continue through slashes and punctuation. They stop before
-a following named parameter or whitespace; a bare separator remains part of the
-credential. Values that start with a quote end at its matching closer. Authorization
-assignments accept quoted names and values and keep a known scheme while redacting
-the credential. Cross-file log checks include partially and multiply percent-encoded
-forms of known literals.
-RTMP path segments are harvested by length and character rules, excluding common
-application names; unlisted camelCase `*Key` fields keep the stricter key-material
-check.
+The hotkey `key` exemption is value-based: only empty values and valid `OBS_KEY_*`
+binding names are preserved, and a `settings` ancestor makes `key` sensitive.
+Unquoted URL query and fragment values end at whitespace, end of text, or a following
+named parameter. Quotes and angle brackets end a value only when they are closing
+delimiters. Authorization assignments accept quoted names and values, keep a known
+scheme, and redact the credential, including a token on the next indented line.
+Cross-file scrubbing covers raw and percent-encoded forms of known literals in every
+file. RTMP path segments are checked individually and common application names and
+ordinary words are excluded. Unlisted camelCase `*Key` values are redacted only when
+they look like key material.
 
 For serialized JSON, verification is structural: inspect sensitive keys and scan
 decoded string values. For INI, classify assignments by key and parse JSON-valued

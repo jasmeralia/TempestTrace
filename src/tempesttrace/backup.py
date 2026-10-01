@@ -31,7 +31,9 @@ from tempesttrace.redaction import (
     _is_repeated_redacted_key_log,
     _is_repeated_redacted_quoted_key_log,
     _is_url_query_assignment,
+    _is_weak_camel_key,
     _json_fragments,
+    _looks_like_key_material,
     _mask_urls,
     _query_value_is_redacted,
     _query_value_parts,
@@ -407,9 +409,13 @@ def _independent_json_secret(value: object, context: tuple[str, ...] = ()) -> bo
         for key, child in value.items():
             if isinstance(key, str):
                 is_hotkey_key = _hotkey_key_exempt(key, context, child)
+                weak_key_is_benign = _is_weak_camel_key(key) and not _looks_like_key_material(
+                    child if isinstance(child, str) else ""
+                )
                 if (
                     _is_sensitive_signature_name(key)
                     and not is_hotkey_key
+                    and not weak_key_is_benign
                     and child not in (None, "", "<REDACTED>", True, False)
                     and not (
                         isinstance(child, str)
@@ -480,6 +486,8 @@ def _independent_secret_scan(text: str) -> bool:  # noqa: PLR0912
             "nil",
         }:
             continue
+        if _is_weak_camel_key(name) and not _looks_like_key_material(unquoted):
+            continue
         if normalized == "authorization":
             parts = unquoted.split(None, 1)
             schemes = {
@@ -503,6 +511,8 @@ def _independent_secret_scan(text: str) -> bool:  # noqa: PLR0912
                 "client-id",
             }
             if parts and parts[0].casefold() in schemes:
+                if len(parts) == 1:
+                    continue
                 tail = text[match.end("value") :]
                 next_value = re.match(r"[ \t]+([^\s,;]+)", tail)
                 if next_value and _unwrap_signature_value(next_value.group(1)) == "<REDACTED>":
@@ -653,10 +663,73 @@ def _private_literal_patterns(secret: str) -> set[str]:
                 escaped,
             )
             patterns.add(escaped)
+    if secret.isascii() and secret:
+        patterns.add("".join(f"%{ord(character):02X}" for character in secret))
     return patterns
 
 
-def _contains_private_secret(path: Path, secrets: set[str]) -> bool:
+def _compile_private_literals(secrets: set[str]) -> re.Pattern[str] | None:
+    patterns = sorted(
+        {
+            pattern
+            for secret in secrets
+            if _is_searchable_secret(secret)
+            for pattern in _private_literal_patterns(secret)
+        },
+        key=len,
+        reverse=True,
+    )
+    return (
+        re.compile(r"(?<!\w)(?:" + "|".join(patterns) + r")(?!\w)", re.IGNORECASE)
+        if patterns
+        else None
+    )
+
+
+def _scrub_private_literals(path: Path, pattern: re.Pattern[str] | None) -> int:
+    if pattern is None:
+        return 0
+    text = read_text_safely(path)
+    suffix = path.name.casefold()
+    is_json = suffix.endswith(".json") or suffix.endswith(".json.bak")
+    replacements = 0
+
+    def scrub(value: str) -> str:
+        nonlocal replacements
+        cleaned, count = pattern.subn("<REDACTED>", value)
+        replacements += count
+        return cleaned
+
+    if is_json:
+        document = json.loads(text)
+
+        def scrub_values(value: object) -> object:
+            if isinstance(value, str):
+                return scrub(value)
+            if isinstance(value, list):
+                return [scrub_values(item) for item in value]
+            if isinstance(value, dict):
+                return {key: scrub_values(child) for key, child in value.items()}
+            return value
+
+        cleaned_text = json.dumps(scrub_values(document), ensure_ascii=False, indent=2) + "\n"
+    elif suffix.endswith(".ini") or suffix.endswith(".ini.bak"):
+        lines = []
+        for line in text.splitlines(keepends=True):
+            match = re.match(r"([^=:\r\n]*[=:])", line)
+            clean_line = line[: match.end()] + scrub(line[match.end() :]) if match else scrub(line)
+            lines.append(clean_line)
+        cleaned_text = "".join(lines)
+    else:
+        cleaned_text = scrub(text)
+    if cleaned_text != text:
+        path.write_text(cleaned_text, encoding="utf-8", newline="")
+    return replacements
+
+
+def _contains_private_secret(
+    path: Path, secrets: set[str], compiled: re.Pattern[str] | None = None
+) -> bool:
     """Check that redacted credential literals did not survive in the staged file."""
     if not secrets:
         return False
@@ -664,13 +737,8 @@ def _contains_private_secret(path: Path, secrets: set[str]) -> bool:
         text = read_text_safely(path)
     except OSError, ValueError:
         return True
-    for secret in secrets:
-        if not _is_searchable_secret(secret):
-            continue
-        for escaped in _private_literal_patterns(secret):
-            if re.search(rf"(?<!\w){escaped}(?!\w)", text):
-                return True
-    return False
+    pattern = compiled if compiled is not None else _compile_private_literals(secrets)
+    return bool(pattern and pattern.search(text))
 
 
 def create_backup(  # noqa: PLR0912, PLR0915
@@ -716,6 +784,7 @@ def create_backup(  # noqa: PLR0912, PLR0915
         files = _inventory(root, skipped)
         total = 0
         discovered_secrets: set[str] = set()
+        pending: list[tuple[Path, Path, Path, dict[str, int], bool, str]] = []
         for index, source_file in enumerate(files, 1):
             if cancelled is not None and cancelled():
                 raise BackupCancelled("Collection cancelled.")
@@ -737,7 +806,6 @@ def create_backup(  # noqa: PLR0912, PLR0915
                 continue
             staged = staging / relative
             private_staged = private_staging / relative
-            cross_redaction_count = 0
             try:
                 if progress:
                     progress("copying", index - 1, len(files))
@@ -750,25 +818,10 @@ def create_backup(  # noqa: PLR0912, PLR0915
                         raise ValueError("Text line exceeds the safe scan limit.")
                     if re.search(r"\[{201,}", log_text):
                         raise ValueError("Log contains excessive nested brackets.")
-                    if discovered_secrets:
-                        for literal in sorted(discovered_secrets, key=len, reverse=True):
-                            if not _is_searchable_secret(literal):
-                                continue
-                            for escaped in _private_literal_patterns(literal):
-                                log_text, replacements = re.subn(
-                                    rf"(?<!\w){escaped}(?!\w)", "<REDACTED>", log_text
-                                )
-                                cross_redaction_count += replacements
-                        private_staged.write_text(log_text, encoding="utf-8", newline="")
                 if progress:
                     progress("redacting", index - 1, len(files))
                 categories, _redaction_count, secrets = redact_file_with_secrets(private_staged)
-                if cross_redaction_count:
-                    categories["credential_pattern"] = (
-                        categories.get("credential_pattern", 0) + cross_redaction_count
-                    )
-                if relative.parts[0] != "logs":
-                    discovered_secrets.update(secrets)
+                discovered_secrets.update(secrets)
             except UnsupportedFileType:
                 private_staged.unlink(missing_ok=True)
                 skipped.append({"path": rel_text, "reason": "unsupported_file_type"})
@@ -802,9 +855,39 @@ def create_backup(  # noqa: PLR0912, PLR0915
                 )
             for category, amount in categories.items():
                 redaction_counts[category] = redaction_counts.get(category, 0) + amount
+            pending.append((source_file, staged, private_staged, categories, consistent, rel_text))
+
+        # Every file has now contributed its sensitive literals. Scrub the full set
+        # from every staged copy before any bytes enter the output staging tree.
+        private_patterns = _compile_private_literals(discovered_secrets)
+        for index, (
+            _source_file,
+            staged,
+            private_staged,
+            categories,
+            consistent,
+            rel_text,
+        ) in enumerate(pending, 1):
+            if cancelled is not None and cancelled():
+                raise BackupCancelled("Collection cancelled.")
             if progress:
-                progress("verifying", index, len(files))
-            if _contains_private_secret(private_staged, secrets) or _secret_scan(private_staged):
+                progress("redacting", index - 1, len(pending))
+            try:
+                cross_redaction_count = _scrub_private_literals(private_staged, private_patterns)
+            except OSError, UnicodeError, ValueError, RecursionError, MemoryError:
+                private_staged.unlink(missing_ok=True)
+                skipped.append({"path": rel_text, "reason": "unreadable_or_unsanitizable"})
+                warnings.append(f"Could not safely include {rel_text}.")
+                continue
+            if cross_redaction_count:
+                categories["credential_pattern"] = (
+                    categories.get("credential_pattern", 0) + cross_redaction_count
+                )
+            if progress:
+                progress("verifying", index, len(pending))
+            if _contains_private_secret(
+                private_staged, discovered_secrets, private_patterns
+            ) or _secret_scan(private_staged):
                 private_staged.unlink(missing_ok=True)
                 skipped.append({"path": rel_text, "reason": "verification_secret_found"})
                 warnings.append(

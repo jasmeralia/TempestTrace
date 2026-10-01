@@ -144,12 +144,19 @@ JSON numbers are replaced only when their canonical rendering equals a harvested
 numeric credential. Log matching for numeric credentials requires an exact token
 boundary and does not treat adjacent decimal points or minus signs as boundaries.
 Unlisted camelCase `*Key` values are redacted only when they look like key material.
+Track strong and weak provenance per literal: any explicit credential source makes a
+literal strong even if the same characters also occur in a weak RTMP or camelCase
+source. Strong literals match case-insensitively; literals found only in weak sources
+remain case-sensitive. Redact Discord webhook token segments after the numeric ID on
+`discord.com` and `discordapp.com`, plus the final token segment on
+`hooks.slack.com/services`, while retaining the host, path prefix, and webhook ID.
 
 For serialized JSON, verification is structural: inspect sensitive keys and scan
-decoded string values. For INI, classify assignments by key and parse JSON-valued
-assignments before checking decoded strings. Keep independent raw-text verification
-for logs and generated reports. Reject excessively nested JSON and text lines above
-the safe scan limit rather than risking an incomplete scan.
+decoded string values, never property names. For INI, classify assignments by key
+and parse JSON-valued assignments before checking decoded values, never section names
+or keys. Keep independent raw-text verification for logs and generated reports.
+Reject excessively nested JSON and text lines above the safe scan limit rather than
+risking an incomplete scan.
 
 Free-text credential assignments redact the full non-whitespace token. URL query
 redaction preserves a following named parameter such as `&region=us` while absorbing

@@ -7,7 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from tempesttrace.backup import _contains_private_secret, _secret_scan, create_backup
+from tempesttrace.backup import (
+    _compile_private_literals,
+    _contains_private_secret,
+    _secret_scan,
+    create_backup,
+)
 from tempesttrace.redaction import (
     _OBS_KEY_NAMES,
     RULE_VERSION,
@@ -580,8 +585,56 @@ def backup_secret_scan(path: Path) -> bool:
     return _secret_scan(path)
 
 
-def test_rule_version_is_eighteen() -> None:
-    assert RULE_VERSION == 18
+def test_rule_version_is_nineteen() -> None:
+    assert RULE_VERSION == 19
+
+
+@pytest.mark.parametrize(
+    ("url", "token", "suffix"),
+    [
+        (
+            "https://discord.com/api/webhooks/123456789012345678/DiscordWebhookToken123",
+            "DiscordWebhookToken123",
+            ".txt",
+        ),
+        (
+            "https://discordapp.com/api/webhooks/123456789012345678/DiscordWebhookToken123",
+            "DiscordWebhookToken123",
+            ".json",
+        ),
+        (
+            "https://hooks.slack.com/services/T12345678/B12345678/SlackWebhookToken123",
+            "SlackWebhookToken123",
+            ".ini",
+        ),
+    ],
+)
+def test_webhook_url_tokens_are_redacted_and_benign_urls_are_preserved(
+    url: str, token: str, suffix: str, tmp_path: Path
+) -> None:
+    path = tmp_path / f"fixture{suffix}"
+    benign = "https://discord.com/channels/123/456 https://slack.com/app_redirect?channel=C123"
+    content = (
+        json.dumps({"url": url, "benign": benign})
+        if suffix == ".json"
+        else f"url={url}\nbenign={benign}\n"
+    )
+    path.write_text(content, encoding="utf-8")
+    assert _secret_scan(path)
+    redact_file_with_secrets(path)
+    cleaned = path.read_text(encoding="utf-8")
+    assert token not in cleaned
+    assert "<REDACTED>" in cleaned
+    assert url.rsplit("/", 1)[0] in cleaned
+    assert benign in cleaned
+    assert not _secret_scan(path)
+
+
+def test_weak_only_literal_remains_case_sensitive() -> None:
+    compiled = _compile_private_literals({"Facebook"}, {"Facebook"}, set())
+    assert compiled is not None
+    assert compiled.search("Facebook")
+    assert compiled.search("facebook") is None
 
 
 @pytest.mark.parametrize("segment", ["mystreamkey", "abcdefghijklmno", "MYSTREAMKEY"])

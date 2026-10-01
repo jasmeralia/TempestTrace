@@ -9,7 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-RULE_VERSION = 18
+RULE_VERSION = 19
 REDACTED = "<REDACTED>"
 _QUOTE_DELIMITER = (
     r"(?:\\*['\"]|`|&(?:quot|apos|ldquo|rdquo|lsquo|rsquo);|"
@@ -112,6 +112,14 @@ _STREAMLABS_WIDGET_TOKEN = re.compile(
 )
 _STREAMELEMENTS_TOKEN = re.compile(
     r"(?i)(https?://(?:www\.)?streamelements\.com/overlay/[^/?#\s]+/)"
+    r"([^/?#\s\"'<>]+)"
+)
+_DISCORD_WEBHOOK_TOKEN = re.compile(
+    r"(?i)(https?://(?:www\.)?(?:discord|discordapp)\.com/api/webhooks/\d+/)"
+    r"([^/?#\s\"'<>]+)"
+)
+_SLACK_WEBHOOK_TOKEN = re.compile(
+    r"(?i)(https?://hooks\.slack\.com/services/[A-Z0-9]+/[A-Z0-9]+/)"
     r"([^/?#\s\"'<>]+)"
 )
 _SCHEME_NAMES = frozenset(
@@ -921,9 +929,29 @@ _OBS_KEY_NAMES = frozenset(
 class CredentialSecrets(set[str]):
     """Collected credential literals with their weaker matching provenance."""
 
-    def __init__(self, values: set[str], weak: set[str]) -> None:
+    def __init__(self, values: set[str], weak: set[str], strong: set[str] | None = None) -> None:
         super().__init__(values)
         self.weak = weak
+        self.strong = strong if strong is not None else values - weak
+
+
+def _strong_credential_values(value: Any, context: tuple[str, ...] = ()) -> set[str]:
+    """Collect literals that came from explicit credential fields or assignments."""
+    values: set[str] = set()
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_context = context + ((key,) if isinstance(key, str) else ())
+            if isinstance(key, str) and _is_sensitive_key(key, context, child):
+                if not _is_weak_camel_key(key):
+                    values.update(_credential_literals(child))
+            else:
+                values.update(_strong_credential_values(child, child_context))
+    elif isinstance(value, list):
+        for child in value:
+            values.update(_strong_credential_values(child, context))
+    elif isinstance(value, str):
+        values.update(_strong_embedded_secrets(value))
+    return values
 
 
 def _weak_credential_values(value: Any) -> set[str]:
@@ -1657,6 +1685,37 @@ def _embedded_secrets(text: str) -> set[str]:
     }
 
 
+def _strong_embedded_secrets(text: str) -> set[str]:
+    """Keep explicit assignment provenance when a value also appears in a weak source."""
+    weak = _weak_credential_values(text)
+    values = _embedded_secrets(text) - weak
+    for pattern in _LOG_PATTERNS:
+        if pattern is _LOG_PATTERNS[-1] and "authorization" not in text.casefold():
+            continue
+        for match in pattern.finditer(_mask_urls(text)):
+            key = _log_match_key(match)
+            literal = _unquote(match.group(2))
+            if (
+                _is_sensitive_key(key, value=literal)
+                and not _is_weak_camel_key(key)
+                and literal
+                and literal != REDACTED
+            ):
+                values.add(literal)
+    if _has_sensitive_query_assignment(text):
+        values.update(
+            _query_value_parts(match.group(3))[0]
+            for match in _URL_QUERY_SECRET.finditer(text)
+            if _is_sensitive_key(match.group(2), ("__url_query__",))
+        )
+    for match in _URL_USERINFO.finditer(text):
+        if _userinfo_candidate(match) and match.group(3) != f"{REDACTED}@":
+            values.add(match.group(3)[:-1])
+    for _start, _end, value, context in _json_fragments(text):
+        values.update(_strong_credential_values(value, context))
+    return values
+
+
 def _rtmp_key(value: str) -> str:
     """Drop sentence punctuation accidentally attached to a URL path segment."""
     return value.rstrip(".,;:!?)]}>\\\"'`\u201d\u2019")
@@ -1969,6 +2028,23 @@ def _redact_embedded(  # noqa: PLR0912, PLR0915
             return f"{match.group(1)}{REDACTED}"
 
         text = _sub_outside_json(text, _STREAMELEMENTS_TOKEN, redact_elements)
+    if (
+        "discord.com/api/webhooks/" in text.casefold()
+        or "discordapp.com/api/webhooks/" in text.casefold()
+    ):
+
+        def redact_discord(match: re.Match[str]) -> str:
+            counts["credential_pattern"] = counts.get("credential_pattern", 0) + 1
+            return f"{match.group(1)}{REDACTED}"
+
+        text = _sub_outside_json(text, _DISCORD_WEBHOOK_TOKEN, redact_discord)
+    if "hooks.slack.com/services/" in text.casefold():
+
+        def redact_slack(match: re.Match[str]) -> str:
+            counts["credential_pattern"] = counts.get("credential_pattern", 0) + 1
+            return f"{match.group(1)}{REDACTED}"
+
+        text = _sub_outside_json(text, _SLACK_WEBHOOK_TOKEN, redact_slack)
     if "cookie:" in text.casefold() or "set-cookie:" in text.casefold():
 
         def redact_cookie(match: re.Match[str]) -> str:
@@ -2318,17 +2394,22 @@ def redact_file_with_secrets(path: Path) -> tuple[dict[str, int], int, set[str]]
         raw = json.loads(text)
         secrets = _credential_values(raw, (path.name,))
         weak_secrets = _weak_credential_values(raw)
+        strong_secrets = _strong_credential_values(raw, (path.name,))
         clean = _redact_object(raw, counts, secrets, (path.name,))
         path.write_text(json.dumps(clean, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     elif is_ini:
         text = read_text_safely(path)
         secrets = _ini_secret_values(text, path.name) | _embedded_secrets(text)
         weak_secrets = _weak_credential_values(text)
+        strong_secrets = _strong_embedded_secrets(text)
         for match in re.finditer(r"(?im)^\s*([A-Za-z0-9_.-]+)\s*[=:]\s*([^\r\n]+)", text):
-            if _is_weak_camel_key(match.group(1)) and _looks_like_key_material(
-                _unquote(match.group(2))
+            value = _unquote(match.group(2))
+            if _is_sensitive_key(match.group(1), (path.name,), value) and not _is_weak_camel_key(
+                match.group(1)
             ):
-                weak_secrets.add(_unquote(match.group(2)))
+                strong_secrets.add(value)
+            if _is_weak_camel_key(match.group(1)) and _looks_like_key_material(value):
+                weak_secrets.add(value)
         clean = _redact_ini(text, path.name, counts, secrets)
         clean = _scrub_text(_redact_embedded(clean, counts, secrets), secrets)
         path.write_text(clean, encoding="utf-8", newline="")
@@ -2336,13 +2417,15 @@ def redact_file_with_secrets(path: Path) -> tuple[dict[str, int], int, set[str]]
         text = read_text_safely(path)
         secrets = _embedded_secrets(text)
         weak_secrets = _weak_credential_values(text)
+        strong_secrets = _strong_embedded_secrets(text)
         text = _redact_embedded(text, counts, secrets)
         # Supported UTF-16 input is deliberately normalized to UTF-8 in staging.
         path.write_text(_scrub_text(text, secrets), encoding="utf-8")
     else:
         secrets = set()
         weak_secrets = set()
-    return counts, sum(counts.values()), CredentialSecrets(secrets, weak_secrets)
+        strong_secrets = set()
+    return counts, sum(counts.values()), CredentialSecrets(secrets, weak_secrets, strong_secrets)
 
 
 def read_text_safely(path: Path) -> str:

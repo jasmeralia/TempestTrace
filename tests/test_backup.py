@@ -344,6 +344,117 @@ def test_cross_file_literals_preserve_short_word_boundaries(tmp_path: Path) -> N
     assert backup._compile_private_literals({"abcd"}).search("xabcdY") is None
 
 
+def test_explicit_secret_provenance_wins_over_weak_sources(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    secret = "AbCdEfGh12345678"
+    service = source / "basic/profiles/default/service.json"
+    service.write_text(
+        json.dumps(
+            {
+                "settings": {
+                    "server": f"rtmp://ingest.example.net/live/{secret}",
+                    "key": secret,
+                    "password": "Qw8xErtY99as",
+                    "bannerKey": "Qw8xErtY99as",
+                    "onlyPassword": "ZzYyXxWw12345678",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (source / "logs/2026-01-01.txt").write_text(
+        "zzyyxxww12345678 qw8xerty99as abcdefgh12345678 Facebook\n", encoding="utf-8"
+    )
+    destination = tmp_path / "out"
+    destination.mkdir()
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        body = archive.read("logs/2026-01-01.txt").decode("utf-8")
+    assert "zzyyxxww12345678" not in body
+    assert "qw8xerty99as" not in body
+    assert "abcdefgh12345678" not in body
+    assert "Facebook" in body
+    assert "facebook" not in body
+
+
+def test_private_literal_equal_to_json_property_name_is_not_overmatched(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    (source / "logs/2026-01-01.txt").write_text(
+        "[obs-browser] [console] token: server returned 401; token: hotkeys\n", encoding="utf-8"
+    )
+    scene = source / "basic/scenes/main.json"
+    scene.write_text(
+        json.dumps(
+            {
+                "server": "safe",
+                "note": "hotkeys",
+                "hotkeys": [
+                    {"key": "OBS_KEY_F9", "note": "binding one"},
+                    {"key": "OBS_KEY_F10", "note": "binding two"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    destination = tmp_path / "out"
+    destination.mkdir()
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        assert "basic/scenes/main.json" in archive.namelist()
+        cleaned = json.loads(archive.read("basic/scenes/main.json"))
+    assert cleaned["server"] == "safe"
+    assert cleaned["note"] == "<REDACTED>"
+    assert cleaned["hotkeys"][0]["key"] == "OBS_KEY_F9"
+    assert cleaned["hotkeys"][1]["key"] == "OBS_KEY_F10"
+
+
+def test_private_literal_verifier_checks_json_values_not_property_names(tmp_path: Path) -> None:
+    path = tmp_path / "service.json"
+    path.write_text('{"server":"safe"}', encoding="utf-8")
+    assert not backup._contains_private_secret(path, {"server"})
+    path.write_text('{"server":"server"}', encoding="utf-8")
+    assert backup._contains_private_secret(path, {"server"})
+    path.write_text('{"server":', encoding="utf-8")
+    assert backup._contains_private_secret(path, {"server"})
+
+
+def test_private_literal_verifier_checks_ini_values_not_embedded_json_keys(tmp_path: Path) -> None:
+    path = tmp_path / "basic.ini"
+    path.write_text('OBSBasic.Bindings={"hotkeys":[{"key":"OBS_KEY_F9"}]}\n', encoding="utf-8")
+    assert not backup._contains_private_secret(path, {"hotkeys"})
+    path.write_text('OBSBasic.Bindings={"hotkeys":[{"note":"hotkeys"}]}\n', encoding="utf-8")
+    assert backup._contains_private_secret(path, {"hotkeys"})
+
+
+def test_multiline_ini_json_scrubbing_preserves_keys_and_scans_values(tmp_path: Path) -> None:
+    path = tmp_path / "basic.ini"
+    path.write_text(
+        'OBSBasic.Bindings={\n  "hotkeys": [{"key":"OBS_KEY_F9", "note":"hotkeys"}]\n}\n',
+        encoding="utf-8",
+    )
+    pattern = backup._compile_private_literals({"hotkeys"})
+    backup._scrub_private_literals(path, pattern)
+    cleaned = path.read_text(encoding="utf-8")
+    assert '"hotkeys"' in cleaned
+    assert '"key":"OBS_KEY_F9"' in cleaned
+    assert '"note":"<REDACTED>"' in cleaned
+    assert not backup._contains_private_secret(path, {"hotkeys"}, pattern)
+
+
+def test_redacting_progress_is_monotonic_and_ends_at_total(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    events: list[tuple[str, int, int]] = []
+    create_backup(source, destination, progress=lambda *event: events.append(event))
+    redacting = [(current, total) for phase, current, total in events if phase == "redacting"]
+    assert redacting
+    assert [current for current, _total in redacting] == sorted(
+        current for current, _total in redacting
+    )
+    assert redacting[-1][0] == redacting[-1][1]
+
+
 @pytest.mark.parametrize("number", [123456, 123456.0])
 def test_numeric_cross_file_secret_is_redacted_without_omitting_scene(
     number: int | float, tmp_path: Path

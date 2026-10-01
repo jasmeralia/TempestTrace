@@ -379,6 +379,13 @@ def _secret_scan(path: Path) -> bool:  # noqa: PLR0911
         text = read_text_safely(path)
     except OSError, ValueError:
         return True
+    if re.search(
+        r"(?i)https?://(?:www\.)?(?:discord|discordapp)\.com/api/webhooks/\d+/"
+        r"[^/?#\s\"'<>]+|https?://hooks\.slack\.com/services/[A-Z0-9]+/[A-Z0-9]+/"
+        r"[^/?#\s\"'<>]+",
+        text,
+    ):
+        return True
     is_json = path.suffix.lower() == ".json" or path.name.lower().endswith(".json.bak")
     is_ini = path.suffix.lower() == ".ini" or path.name.lower().endswith(".ini.bak")
     if is_json:
@@ -676,7 +683,7 @@ def _private_literal_patterns(secret: str) -> set[str]:
 
 
 def _compile_private_literals(
-    secrets: set[str], weak_secrets: set[str] | None = None
+    secrets: set[str], weak_secrets: set[str] | None = None, strong_secrets: set[str] | None = None
 ) -> re.Pattern[str] | None:
     embedded: set[str] = set()
     weak_embedded: set[str] = set()
@@ -684,6 +691,7 @@ def _compile_private_literals(
     weak_bounded: set[str] = set()
     numeric: set[str] = set()
     weak_secrets = weak_secrets or set()
+    strong_secrets = strong_secrets if strong_secrets is not None else secrets - weak_secrets
     for secret in secrets:
         if not _is_searchable_secret(secret):
             continue
@@ -691,7 +699,7 @@ def _compile_private_literals(
             numeric.add(secret)
             continue
         is_long_key = len(secret) >= 12 and any(char.isdigit() for char in secret)
-        if secret in weak_secrets:
+        if secret in weak_secrets and secret not in strong_secrets:
             target = weak_embedded if is_long_key else weak_bounded
         else:
             target = embedded if is_long_key else bounded
@@ -743,6 +751,36 @@ def _scrub_private_literals(
         replacements += count
         return cleaned
 
+    def scrub_embedded_values(value: object) -> object:
+        if isinstance(value, str):
+            return scrub(value)
+        if isinstance(value, list):
+            return [scrub_embedded_values(item) for item in value]
+        if isinstance(value, dict):
+            return {key: scrub_embedded_values(child) for key, child in value.items()}
+        if isinstance(value, int) and not isinstance(value, bool):
+            return REDACTED if str(value) in (numeric_secrets or set()) else value
+        if isinstance(value, float):
+            return REDACTED if json.dumps(value) in (numeric_secrets or set()) else value
+        return value
+
+    def scrub_ini_value(value: str) -> str:
+        fragments = _json_fragments(value)
+        if not fragments:
+            return scrub(value)
+        pieces: list[str] = []
+        cursor = 0
+        for start, end, document, _context in fragments:
+            pieces.append(scrub(value[cursor:start]))
+            pieces.append(
+                json.dumps(
+                    scrub_embedded_values(document), ensure_ascii=False, separators=(",", ":")
+                )
+            )
+            cursor = end
+        pieces.append(scrub(value[cursor:]))
+        return "".join(pieces)
+
     if is_json:
         document = json.loads(text)
 
@@ -764,7 +802,9 @@ def _scrub_private_literals(
         lines = []
         for line in text.splitlines(keepends=True):
             match = re.match(r"([^=:\r\n]*[=:])", line)
-            clean_line = line[: match.end()] + scrub(line[match.end() :]) if match else scrub(line)
+            clean_line = (
+                line[: match.end()] + scrub_ini_value(line[match.end() :]) if match else scrub(line)
+            )
             lines.append(clean_line)
         cleaned_text = "".join(lines)
     else:
@@ -774,7 +814,7 @@ def _scrub_private_literals(
     return replacements
 
 
-def _contains_private_secret(
+def _contains_private_secret(  # noqa: PLR0911, PLR0912
     path: Path, secrets: set[str], compiled: re.Pattern[str] | None = None
 ) -> bool:
     """Check that redacted credential literals did not survive in the staged file."""
@@ -784,8 +824,73 @@ def _contains_private_secret(
         text = read_text_safely(path)
     except OSError, ValueError:
         return True
-    pattern = compiled if compiled is not None else _compile_private_literals(secrets)
+    pattern = (
+        compiled
+        if compiled is not None
+        else _compile_private_literals(
+            secrets,
+            getattr(secrets, "weak", None),
+            getattr(secrets, "strong", None),
+        )
+    )
+    suffix = path.name.casefold()
+    if suffix.endswith(".json") or suffix.endswith(".json.bak"):
+        try:
+            _guard_json_depth(text)
+            value = json.loads(text)
+        except ValueError, UnicodeError, json.JSONDecodeError, RecursionError, MemoryError:
+            return True
+
+        def contains_value(child: object) -> bool:
+            if isinstance(child, str):
+                return bool(pattern and pattern.search(child))
+            if isinstance(child, bool) or child is None:
+                return False
+            if isinstance(child, (int, float)):
+                return bool(pattern and pattern.search(json.dumps(child, ensure_ascii=False)))
+            if isinstance(child, list):
+                return any(contains_value(item) for item in child)
+            if isinstance(child, dict):
+                return any(contains_value(item) for item in child.values())
+            return False
+
+        return contains_value(value)
+    if suffix.endswith(".ini") or suffix.endswith(".ini.bak"):
+        for line in text.splitlines():
+            assignment = re.match(r"^\s*[^=:#\s][^=:]*\s*[=:]\s*(.*)$", line)
+            if not assignment:
+                continue
+            value = assignment.group(1)
+            fragments = _json_fragments(value)
+            if not fragments:
+                if pattern and pattern.search(value):
+                    return True
+                continue
+            cursor = 0
+            for start, end, embedded, _context in fragments:
+                if pattern and pattern.search(value[cursor:start]):
+                    return True
+                if _contains_in_value(embedded, pattern):
+                    return True
+                cursor = end
+            if pattern and pattern.search(value[cursor:]):
+                return True
+        return False
     return bool(pattern and pattern.search(text))
+
+
+def _contains_in_value(value: object, pattern: re.Pattern[str] | None) -> bool:
+    if isinstance(value, str):
+        return bool(pattern and pattern.search(value))
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(pattern and pattern.search(json.dumps(value, ensure_ascii=False)))
+    if isinstance(value, list):
+        return any(_contains_in_value(item, pattern) for item in value)
+    if isinstance(value, dict):
+        return any(_contains_in_value(item, pattern) for item in value.values())
+    return False
 
 
 def create_backup(  # noqa: PLR0912, PLR0915
@@ -832,6 +937,7 @@ def create_backup(  # noqa: PLR0912, PLR0915
         total = 0
         discovered_secrets: set[str] = set()
         weak_secrets: set[str] = set()
+        strong_secrets: set[str] = set()
         pending: list[tuple[Path, Path, Path, dict[str, int], bool, str]] = []
         for index, source_file in enumerate(files, 1):
             if cancelled is not None and cancelled():
@@ -871,6 +977,7 @@ def create_backup(  # noqa: PLR0912, PLR0915
                 categories, _redaction_count, secrets = redact_file_with_secrets(private_staged)
                 discovered_secrets.update(secrets)
                 weak_secrets.update(getattr(secrets, "weak", set()))
+                strong_secrets.update(getattr(secrets, "strong", set()))
             except UnsupportedFileType:
                 private_staged.unlink(missing_ok=True)
                 skipped.append({"path": rel_text, "reason": "unsupported_file_type"})
@@ -908,7 +1015,9 @@ def create_backup(  # noqa: PLR0912, PLR0915
 
         # Every file has now contributed its sensitive literals. Scrub the full set
         # from every staged copy before any bytes enter the output staging tree.
-        private_patterns = _compile_private_literals(discovered_secrets, weak_secrets)
+        private_patterns = _compile_private_literals(
+            discovered_secrets, weak_secrets, strong_secrets
+        )
         numeric_secrets = {
             secret for secret in discovered_secrets if re.fullmatch(r"-?\d+(?:\.\d+)?", secret)
         }
@@ -923,7 +1032,7 @@ def create_backup(  # noqa: PLR0912, PLR0915
             if cancelled is not None and cancelled():
                 raise BackupCancelled("Collection cancelled.")
             if progress:
-                progress("redacting", index - 1, len(pending))
+                progress("redacting", len(files) + index - 1, len(files) + len(pending))
             try:
                 cross_redaction_count = _scrub_private_literals(
                     private_staged, private_patterns, numeric_secrets
@@ -972,6 +1081,9 @@ def create_backup(  # noqa: PLR0912, PLR0915
                     "warning": not consistent,
                 }
             )
+
+        if progress:
+            progress("redacting", len(files) + len(pending), len(files) + len(pending))
         if not records:
             raise ValueError("No supported OBS files could be safely included.")
         if cancelled is not None and cancelled():

@@ -662,6 +662,46 @@ def test_backslash_quoted_password_is_fast(tmp_path: Path) -> None:
     assert time.perf_counter() - started < 2
 
 
+def test_dense_quoted_key_verification_is_linear(tmp_path: Path) -> None:
+    path = tmp_path / "dense-keys.txt"
+    path.write_text('"key": "abcd"\n' * 18000, encoding="utf-8")
+    started = time.perf_counter()
+    backup.redact_file_with_secrets(path)
+    assert not backup._secret_scan(path)
+    assert time.perf_counter() - started < 3
+
+
+def test_benign_ffmpeg_muxer_log_redact_and_verify_is_fast(tmp_path: Path) -> None:
+    path = tmp_path / "benign.txt"
+    line = "10:00:00.123: [ffmpeg muxer: ...] settings: rate_control=CBR\n"
+    path.write_text(line * ((1024 * 1024 + len(line) - 1) // len(line)), encoding="utf-8")
+    started = time.perf_counter()
+    backup.redact_file_with_secrets(path)
+    assert not backup._secret_scan(path)
+    assert time.perf_counter() - started < 6
+
+
+@pytest.mark.parametrize(
+    ("label", "content"),
+    [
+        ("backslashes", "\\" * (256 * 1024) + " key"),
+        ("query", "http://h/?x=1" + "&a=b" * (256 * 1024 // 4) + " token=x"),
+        ("semicolon", "a=b;" * (256 * 1024 // 4) + " key=x"),
+        ("brace-quote", '{"' * (256 * 1024 // 2)),
+    ],
+)
+def test_r4_hostile_inputs_redact_and_verify_under_three_seconds(
+    tmp_path: Path, label: str, content: str
+) -> None:
+    path = tmp_path / f"{label}.txt"
+    path.write_text(content, encoding="utf-8")
+    started = time.perf_counter()
+    _counts, _total, secrets = backup.redact_file_with_secrets(path)
+    assert not backup._contains_private_secret(path, secrets)
+    assert not backup._secret_scan(path)
+    assert time.perf_counter() - started < 3
+
+
 @pytest.mark.parametrize(
     ("filename", "content"),
     [
@@ -1251,3 +1291,85 @@ def test_late_final_name_collision_is_preserved_and_backup_uses_suffix(
         assert archive.testzip() is None
         assert "manifest.json" in archive.namelist()
     assert not list(destination.glob(".*.reserve"))
+
+
+def test_round4_end_to_end_structural_redaction_keeps_scene_ini_and_log(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    secrets = [
+        "SCENE_TOKEN_R4",
+        "GLOBAL_WS_R4",
+        "AUTH_NO_SCHEME_R4",
+        "AUTH_SCHEME_R4",
+        "CLI_PASS_R4",
+        "GLUED_PASS_R4",
+        "COOKIE_R4",
+    ]
+    scene = {
+        "sources": [
+            {
+                "id": "browser_source",
+                "settings": {
+                    "url": "https://example.com/widget?token=SCENE_TOKEN_R4&region=us",
+                    "width": 800,
+                },
+            },
+            {"hotkeys": {"mute": [{"key": "OBS_KEY_M"}], "unmute": [{"key": "OBS_KEY_U"}]}},
+        ]
+    }
+    scene_path = source / "basic/scenes/Main.json"
+    scene_path.write_text(json.dumps(scene, indent=2), encoding="utf-8")
+    basic = source / "basic/profiles/default/basic.ini"
+    basic.write_text(
+        '[Hotkeys]\nOBSBasic.StartStreaming={"bindings":[{"key":"OBS_KEY_F9"},{"key":"OBS_KEY_F10"}]}\n',
+        encoding="utf-8",
+    )
+    (source / "global.ini").write_text(
+        "[OBSWebSocket]\nServerPassword=GLOBAL_WS_R4\n", encoding="utf-8"
+    )
+    log = source / "logs/2026-09-30.txt"
+    log.write_text(
+        "Authorization: AUTH_NO_SCHEME_R4 (expired)\n"
+        "Authorization: Bearer AUTH_SCHEME_R4 - retrying\n"
+        "Command Line Arguments: --websocket_password CLI_PASS_R4 --foo\n"
+        "token=abc;password: GLUED_PASS_R4\nCookie: a=1; b=COOKIE_R4\n"
+        "Raw config value was GLOBAL_WS_R4\n",
+        encoding="utf-8",
+    )
+    before = {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()}
+
+    result = create_backup(source, destination, now=datetime(2026, 9, 30, 10, 0, 0))
+
+    assert not result.warnings
+    with zipfile.ZipFile(result.archive) as archive:
+        names = archive.namelist()
+        assert "basic/scenes/Main.json" in names
+        assert "basic/profiles/default/basic.ini" in names
+        assert "global.ini" in names
+        assert "logs/2026-09-30.txt" in names
+        payload = b"".join(archive.read(name) for name in names)
+        assert all(secret.encode() not in payload for secret in secrets)
+        cleaned_scene = json.loads(archive.read("basic/scenes/Main.json"))
+        assert cleaned_scene["sources"][1]["hotkeys"]["mute"][0]["key"] == "OBS_KEY_M"
+        cleaned_ini = archive.read("basic/profiles/default/basic.ini")
+        assert b"OBS_KEY_F9" in cleaned_ini and b"OBS_KEY_F10" in cleaned_ini
+    after = {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()}
+    assert after == before
+
+
+@pytest.mark.parametrize("line", ["[" * 100000, "x" * (512 * 1024 + 1)])
+def test_unsafe_deep_or_long_log_is_omitted_and_backup_continues(tmp_path: Path, line: str) -> None:
+    source = fixture(tmp_path / "obs")
+    (source / "logs/2026-09-30.txt").write_text(line, encoding="utf-8")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        assert "basic/profiles/default/service.json" in archive.namelist()
+        assert "logs/2026-09-30.txt" not in archive.namelist()
+        manifest = json.loads(archive.read("manifest.json"))
+        assert any(item["path"] == "logs/2026-09-30.txt" for item in manifest["skipped"])
+    assert any(
+        "Could not safely include logs/2026-09-30.txt" in warning for warning in result.warnings
+    )

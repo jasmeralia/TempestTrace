@@ -21,7 +21,15 @@ from datetime import datetime
 from pathlib import Path
 
 from tempesttrace.redaction import (
+    _SENSITIVE_FREE_NAME,
     RULE_VERSION,
+    _guard_json_depth,
+    _has_sensitive_query_assignment,
+    _is_repeated_redacted_key_log,
+    _is_repeated_redacted_quoted_key_log,
+    _is_url_query_assignment,
+    _json_fragments,
+    _mask_urls,
     has_unredacted_embedded_json,
     has_unredacted_fields,
     has_unredacted_ini_fields,
@@ -34,8 +42,11 @@ MAX_TOTAL_SIZE = 512 * 1024 * 1024
 MAX_LOG_FILES = 5
 ALLOWED_PROFILE_SUFFIXES = {".ini", ".json", ".txt"}
 _INDEPENDENT_SECRET_ASSIGNMENT = re.compile(
-    r"(?i)(?<![?&;A-Za-z0-9_.\-\"'])(?=(?P<name>[\"']?[A-Za-z0-9_.-]+[\"']?)"
-    r"[ \t]*[=:][ \t]*(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s]+))"
+    rf"(?i)(?<![A-Za-z0-9_.\-\"'])(?=(?P<name>{_SENSITIVE_FREE_NAME})"
+    r"[ \t]*[=:][ \t]*(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|`[^`\r\n]*`|"
+    r"\u201c[^\u201d\r\n]*\u201d|\u2018[^\u2019\r\n]*\u2019|"
+    r"&quot;[^\r\n]*?&quot;|&apos;[^\r\n]*?&apos;|%22[^\r\n]*?%22|%27[^\r\n]*?%27|"
+    r"[^\s](?:(?![;&,|/?(][A-Za-z0-9_.-]++[ \t]*[=:])[^\s])*))"
 )
 _INDEPENDENT_QUERY_ASSIGNMENT = re.compile(
     r"(?i)[?&;]([A-Za-z0-9_.-]+)=((?:[^&;\s]|[&;](?![A-Za-z0-9_.-]+=))+)"
@@ -318,34 +329,114 @@ def _read_consistent(source: Path, target: Path, max_bytes: int) -> tuple[bool, 
     return False, len(data)
 
 
-def _secret_scan(path: Path) -> bool:
+def _secret_scan(path: Path) -> bool:  # noqa: PLR0911
     try:
         text = read_text_safely(path)
     except OSError, ValueError:
         return True
-    contains_secret = has_unredacted_embedded_json(text) or _independent_secret_scan(text)
-    if path.suffix.lower() == ".json" or path.name.lower().endswith(".json.bak"):
+    is_json = path.suffix.lower() == ".json" or path.name.lower().endswith(".json.bak")
+    is_ini = path.suffix.lower() == ".ini" or path.name.lower().endswith(".ini.bak")
+    if is_json:
         try:
-            contains_secret = contains_secret or has_unredacted_fields(
-                json.loads(text), (path.name,)
-            )
-        except OSError, ValueError, UnicodeError, json.JSONDecodeError:
+            _guard_json_depth(text)
+            structural = has_unredacted_fields(json.loads(text), (path.name,))
+            if path.name.lower() == "manifest.json":
+                return (
+                    structural
+                    or has_unredacted_embedded_json(text)
+                    or _independent_secret_scan(text)
+                )
+            return structural
+        except OSError, ValueError, UnicodeError, json.JSONDecodeError, RecursionError, MemoryError:
             return True
-    elif path.suffix.lower() == ".ini" or path.name.lower().endswith(".ini.bak"):
-        contains_secret = contains_secret or has_unredacted_ini_fields(text, path.name)
-    return contains_secret
+    if is_ini:
+        return has_unredacted_ini_fields(text, path.name)
+    if _is_repeated_redacted_key_log(text) or _is_repeated_redacted_quoted_key_log(text):
+        return False
+    fragments = _json_fragments(text)
+    if any(_independent_json_secret(value, context) for _start, _end, value, context in fragments):
+        return True
+    return has_unredacted_embedded_json(text) or _independent_secret_scan(text)
 
 
-def _independent_secret_scan(text: str) -> bool:
+def _independent_json_secret(value: object, context: tuple[str, ...] = ()) -> bool:  # noqa: PLR0911
+    """Check parsed JSON independently, with a narrow hotkey-key exemption."""
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if isinstance(key, str):
+                normalized = re.sub(r"[^a-z0-9]", "", key.casefold())
+                hotkey_positions = [
+                    index
+                    for index, part in enumerate(context)
+                    if re.sub(r"[^a-z0-9]", "", part.casefold())
+                    in {
+                        "hotkey",
+                        "hotkeys",
+                        "binding",
+                        "bindings",
+                        "keybinding",
+                        "keybindings",
+                        "obsbasichotkeybinding",
+                    }
+                ]
+                settings_positions = [
+                    index
+                    for index, part in enumerate(context)
+                    if re.sub(r"[^a-z0-9]", "", part.casefold()) == "settings"
+                ]
+                is_hotkey_key = (
+                    normalized == "key"
+                    and bool(hotkey_positions)
+                    and (not settings_positions or max(hotkey_positions) > max(settings_positions))
+                )
+                if (
+                    _is_sensitive_signature_name(key)
+                    and not is_hotkey_key
+                    and child not in (None, "", "<REDACTED>", True, False)
+                    and not (
+                        isinstance(child, str)
+                        and child.casefold()
+                        in {"null", "undefined", "none", "nil", "true", "false"}
+                    )
+                ):
+                    return True
+                next_context = (*context, key)
+                if _independent_json_secret(child, next_context):
+                    return True
+        return False
+    if isinstance(value, list):
+        return any(_independent_json_secret(item, context) for item in value)
+    if isinstance(value, str):
+        nested = _json_fragments(value)
+        if any(
+            _independent_json_secret(item, child_context) for _s, _e, item, child_context in nested
+        ):
+            return True
+        return _independent_secret_scan(value)
+    return False
+
+
+def _independent_secret_scan(text: str) -> bool:  # noqa: PLR0912
     """Fail closed on credential assignments with a scanner independent of redactor patterns."""
-    for match in _INDEPENDENT_SECRET_ASSIGNMENT.finditer(text):
+    if _is_repeated_redacted_key_log(text) or _is_repeated_redacted_quoted_key_log(text):
+        return False
+    folded_text = text.casefold()
+    possible_hotkeys = any(
+        token in folded_text
+        for token in ('"hotkey"', '"hotkeys"', '"binding"', '"bindings"', "obsbasic.", "keybinding")
+    )
+    assignment_text = _mask_urls(text)
+    for match in _INDEPENDENT_SECRET_ASSIGNMENT.finditer(assignment_text):
         name = match.group("name").strip("\\\"'")
         normalized = re.sub(r"[^a-z0-9]", "", name.casefold())
         if not _is_sensitive_signature_name(name):
             continue
+        if _is_url_query_assignment(assignment_text, match.start("name")):
+            continue
         if (
             normalized == "key"
             and match.group("name").startswith(('"', "'"))
+            and possible_hotkeys
             and _is_hotkey_signature_context(text, match.start("name"))
         ):
             continue
@@ -358,14 +449,48 @@ def _independent_secret_scan(text: str) -> bool:
                 continue
         value = match.group("value").strip()
         unquoted = _unwrap_signature_value(value)
-        if unquoted in {"", "<REDACTED>"} or unquoted.casefold() in {"true", "false", "null"}:
+        if unquoted in {"", "<REDACTED>"} or unquoted.casefold() in {
+            "true",
+            "false",
+            "null",
+            "undefined",
+            "none",
+            "nil",
+        }:
             continue
         if normalized == "authorization":
-            scheme_value = re.match(r"[ \t]+(\S+)", text[match.end("value") :])
-            if scheme_value and _unwrap_signature_value(scheme_value.group(1)) == "<REDACTED>":
-                continue
+            parts = unquoted.split(None, 1)
+            schemes = {
+                "bearer",
+                "basic",
+                "digest",
+                "token",
+                "bot",
+                "oauth",
+                "oauth2",
+                "negotiate",
+                "ntlm",
+                "kerberos",
+                "mac",
+                "hawk",
+                "aws4-hmac-sha256",
+                "splunk",
+                "key",
+                "apikey",
+                "sharedaccesssignature",
+                "client-id",
+            }
+            if parts and parts[0].casefold() in schemes:
+                tail = text[match.end("value") :]
+                next_value = re.match(r"[ \t]+([^\s,;]+)", tail)
+                if next_value and _unwrap_signature_value(next_value.group(1)) == "<REDACTED>":
+                    continue
         return True
-    for match in _INDEPENDENT_QUERY_ASSIGNMENT.finditer(text):
+    if _has_sensitive_query_assignment(text):
+        query_matches = _INDEPENDENT_QUERY_ASSIGNMENT.finditer(text)
+    else:
+        query_matches = iter(())
+    for match in query_matches:
         normalized = re.sub(r"[^a-z0-9]", "", match.group(1).casefold())
         value = match.group(2)
         following = re.search(r"[&;](?=[A-Za-z0-9_.-]+=)", value)
@@ -373,8 +498,10 @@ def _independent_secret_scan(text: str) -> bool:
             value = value[: following.start()]
         value = _unwrap_signature_value(value)
         if (
-            normalized in {"auth", "sig"} or _is_sensitive_signature_name(match.group(1))
-        ) and value != "<REDACTED>":
+            (normalized in {"auth", "sig"} or _is_sensitive_signature_name(match.group(1)))
+            and value != "<REDACTED>"
+            and value.casefold() not in {"null", "undefined", "none", "nil", "true", "false"}
+        ):
             return True
     return False
 
@@ -397,7 +524,22 @@ def _is_sensitive_signature_name(name: str) -> bool:
             "streamid",
         }
         or normalized == "key"
+        or normalized.endswith("authorization")
         or normalized.endswith(("password", "passwd", "secret", "token"))
+        or normalized
+        in {
+            "apikey",
+            "streamkey",
+            "privatekey",
+            "secretkey",
+            "authkey",
+            "signingkey",
+            "encryptionkey",
+            "masterkey",
+            "sharedkey",
+            "sessionkey",
+            "accesskey",
+        }
         or (
             normalized.endswith("key")
             and normalized != "key"
@@ -437,6 +579,9 @@ def _unwrap_signature_value(value: str) -> str:
     value = value.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'`":
         return value[1:-1]
+    for opening, closing in (("\u201c", "\u201d"), ("\u2018", "\u2019")):
+        if value.startswith(opening) and closing in value:
+            return value[1 : value.rfind(closing)]
     if len(value) >= 2 and value[-1] in "\"'`" and value[0] != value[-1]:
         value = value[:-1]
     for opening, closing in (
@@ -514,6 +659,7 @@ def create_backup(  # noqa: PLR0912, PLR0915
             progress("scanning", 0, 0)
         files = _inventory(root, skipped)
         total = 0
+        discovered_secrets: set[str] = set()
         for index, source_file in enumerate(files, 1):
             if cancelled is not None and cancelled():
                 raise BackupCancelled("Collection cancelled.")
@@ -535,15 +681,37 @@ def create_backup(  # noqa: PLR0912, PLR0915
                 continue
             staged = staging / relative
             private_staged = private_staging / relative
+            cross_redaction_count = 0
             try:
                 if progress:
                     progress("copying", index - 1, len(files))
                 byte_limit = min(MAX_FILE_SIZE, MAX_TOTAL_SIZE - total)
                 consistent, actual_size = _read_consistent(source_file, private_staged, byte_limit)
                 total += actual_size
+                if relative.parts[0] == "logs":
+                    log_text = read_text_safely(private_staged)
+                    if any(len(line) > 512 * 1024 for line in log_text.splitlines()):
+                        raise ValueError("Text line exceeds the safe scan limit.")
+                    if re.search(r"\[{201,}", log_text):
+                        raise ValueError("Log contains excessive nested brackets.")
+                    if discovered_secrets:
+                        for literal in sorted(discovered_secrets, key=len, reverse=True):
+                            if len(literal) < 4 or literal.isdigit():
+                                continue
+                            log_text, replacements = re.subn(
+                                rf"(?<!\w){re.escape(literal)}(?!\w)", "<REDACTED>", log_text
+                            )
+                            cross_redaction_count += replacements
+                        private_staged.write_text(log_text, encoding="utf-8", newline="")
                 if progress:
                     progress("redacting", index - 1, len(files))
                 categories, _redaction_count, secrets = redact_file_with_secrets(private_staged)
+                if cross_redaction_count:
+                    categories["credential_pattern"] = (
+                        categories.get("credential_pattern", 0) + cross_redaction_count
+                    )
+                if relative.parts[0] != "logs":
+                    discovered_secrets.update(secrets)
             except UnsupportedFileType:
                 private_staged.unlink(missing_ok=True)
                 skipped.append({"path": rel_text, "reason": "unsupported_file_type"})
@@ -551,7 +719,14 @@ def create_backup(  # noqa: PLR0912, PLR0915
             except FileLimitExceeded:
                 skipped.append({"path": rel_text, "reason": "size_limit_exceeded_during_read"})
                 continue
-            except OSError, UnicodeError, ValueError, configparser.Error:
+            except (
+                OSError,
+                UnicodeError,
+                ValueError,
+                configparser.Error,
+                RecursionError,
+                MemoryError,
+            ):
                 private_staged.unlink(missing_ok=True)
                 reason = (
                     "unreadable" if relative.parts[0] == "logs" else "unreadable_or_unsanitizable"

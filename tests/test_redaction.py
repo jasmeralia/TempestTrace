@@ -576,8 +576,8 @@ def backup_secret_scan(path: Path) -> bool:
     return _secret_scan(path)
 
 
-def test_rule_version_is_twelve() -> None:
-    assert RULE_VERSION == 12
+def test_rule_version_is_thirteen() -> None:
+    assert RULE_VERSION == 13
 
 
 @pytest.mark.parametrize(
@@ -969,6 +969,7 @@ def test_punctuation_seeded_fuzz_has_no_shipped_leaks(tmp_path: Path) -> None:
     ]
     alphabet = "abcXYZ123#&;\\`~!@$%^*(){}[]|/+.,-_="
     leaks = []
+    overomissions = []
     for index in range(3000):
         name = rng.choice(names)
         secret = "".join(rng.choice(alphabet) for _ in range(rng.randint(8, 20)))
@@ -991,15 +992,168 @@ def test_punctuation_seeded_fuzz_has_no_shipped_leaks(tmp_path: Path) -> None:
         flagged = _contains_private_secret(path, secrets) or _secret_scan(path)
         if secret in output and not flagged:
             leaks.append(content)
+        elif secret not in output and flagged:
+            overomissions.append(content)
     assert leaks == []
+    assert overomissions == []
+
+
+@pytest.mark.parametrize(
+    "filename,content",
+    [
+        (
+            "scene.json",
+            json.dumps(
+                {
+                    "sources": [
+                        {
+                            "hotkeys": {"mute": [{"key": "OBS_KEY_M"}, {"key": "OBS_KEY_U"}]},
+                            "settings": {
+                                "url": "https://example.com/widget?token=URLSECRET&region=us"
+                            },
+                        }
+                    ]
+                }
+            ),
+        ),
+        (
+            "basic.ini",
+            '[H]\nOBSBasic.StartStreaming={"bindings":[{"key":"OBS_KEY_F9"},{"key":"OBS_KEY_F10"}]}\n',
+        ),
+        (
+            "basic.ini",
+            "[H]\nOBSBasic.StartStreaming={\n"
+            ' "bindings": [\n {"key":"OBS_KEY_F9"},\n'
+            ' {"key":"OBS_KEY_F10"}\n ]\n}\n',
+        ),
+    ],
+)
+def test_hotkey_structures_and_browser_url_survive_verification(
+    tmp_path: Path, filename: str, content: str
+) -> None:
+    path = tmp_path / filename
+    path.write_text(content, encoding="utf-8")
+    redact_file_with_secrets(path)
+    assert "OBS_KEY_F9" in path.read_text(encoding="utf-8") or "OBS_KEY_M" in path.read_text(
+        encoding="utf-8"
+    )
+    assert "URLSECRET" not in path.read_text(encoding="utf-8")
+    assert not _secret_scan(path)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Authorization: ghp_LKsecret99 (expired)\n",
+        "authorization=TOKEN user=bob\n",
+        "HTTP 401 for Authorization: TOKEN - retrying\n",
+        "x-authorization: TOKEN ok\n",
+        "Proxy-Authorization: Basic abcdefgh\n",
+        "Cookie: a=1; b=COOKIESECRET\n",
+        "--websocket_password hunterLEAK22 --foo\n",
+        "-Password X\n",
+        "pwd=hunter22abcXY\n",
+        "a=b;pwd: X\n",
+        "token=abc;password: 99887766\n",
+        "Authorization: Bearer <REDACTED>, retrying\n",
+    ],
+)
+def test_structural_log_credentials_are_redacted_and_verifier_accepts(
+    tmp_path: Path, line: str
+) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(line, encoding="utf-8")
+    redact_file_with_secrets(path)
+    output = path.read_text(encoding="utf-8")
+    assert not any(
+        secret in output
+        for secret in ("hunterLEAK22", "COOKIESECRET", "hunter22abcXY", "99887766", "abcdefgh")
+    )
+    assert not _secret_scan(path)
+
+
+@pytest.mark.parametrize("name", ["token", "password"])
+def test_noncredential_literals_under_sensitive_names_are_unchanged(
+    tmp_path: Path, name: str
+) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(
+        f"Console: {name}: null\nrequire password: false\nPortable mode: false\n", encoding="utf-8"
+    )
+    original = path.read_text(encoding="utf-8")
+    redact_file_with_secrets(path)
+    assert path.read_text(encoding="utf-8") == original
+    assert not _secret_scan(path)
+
+
+def test_redaction_is_idempotent_and_punctuation_fuzz_has_zero_overomission(tmp_path: Path) -> None:
+    rng = random.Random(13)
+    alphabet = "abcXYZ123#&;\\`~!@$%^*(){}[]|/+.,-_="
+    for i in range(3000):
+        secret = "LK" + "".join(rng.choice(alphabet) for _ in range(9)) + "ZZ"
+        text = f"token={secret}; password: xyz\n"
+        path = tmp_path / f"p{i}.txt"
+        path.write_text(text, encoding="utf-8")
+        counts, _, _ = redact_file_with_secrets(path)
+        once = path.read_bytes()
+        second_counts, second_total, _ = redact_file_with_secrets(path)
+        assert path.read_bytes() == once
+        assert not any(value in path.read_text(encoding="utf-8") for value in (secret,))
+        assert not _secret_scan(path)
+        assert not second_counts and second_total == 0
+        assert counts
+
+
+def test_sensitive_compound_keys_and_streamelements_overlay_token(tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(
+        "secretkey=KEYSECRET\nhttps://www.streamelements.com/overlay/id/OVERLAYSECRET\n",
+        encoding="utf-8",
+    )
+    redact_file_with_secrets(path)
+    assert "KEYSECRET" not in path.read_text(encoding="utf-8")
+    assert "OVERLAYSECRET" not in path.read_text(encoding="utf-8")
+    assert not _secret_scan(path)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/widget?token=URL_TOKEN_R4&region=us",
+        "https://example.com/widget?api_key=URL_API_R4&region=us",
+        "https://example.com/widget?region=us&token=URL_MIDDLE_R4&theme=dark",
+        "https://example.com/widget?region=us&token=URL_END_R4",
+    ],
+)
+def test_browser_source_query_secrets_are_redacted_structurally(tmp_path: Path, url: str) -> None:
+    path = tmp_path / "scene.json"
+    path.write_text(json.dumps({"sources": [{"settings": {"url": url, "width": 800}}]}))
+    redact_file_with_secrets(path)
+    output = path.read_text(encoding="utf-8")
+    assert "URL_" not in output
+    assert "region=us" in output
+    assert not _secret_scan(path)
+
+
+@pytest.mark.parametrize("literal", ["null", "undefined", "none", "nil", "true", "false"])
+def test_sensitive_word_literals_are_not_credentials(tmp_path: Path, literal: str) -> None:
+    path = tmp_path / "current.txt"
+    content = f"token={literal}\npassword: {literal}\nvalue is {literal}\n"
+    path.write_text(content, encoding="utf-8")
+    redact_file_with_secrets(path)
+    assert path.read_text(encoding="utf-8") == content
+    assert not _secret_scan(path)
 
 
 @pytest.mark.parametrize("name", ["SortKey", "audio_key"])
 def test_short_numeric_values_do_not_drop_log(name: str, tmp_path: Path) -> None:
     path = tmp_path / "current.txt"
     path.write_text(f"{name}: 1\nvalue=1 and 0\n", encoding="utf-8")
-    secrets = {"1", "0"}
-    assert not _contains_private_secret(path, secrets)
+    redact_file_with_secrets(path)
+    expected = "<REDACTED>"
+    assert path.read_text(encoding="utf-8") == f"{name}: {expected}\nvalue=1 and 0\n"
+    assert not _contains_private_secret(path, {"1", "0"})
+    assert not _secret_scan(path)
 
 
 @pytest.mark.parametrize("n", [40])
@@ -1035,3 +1189,34 @@ def test_new_log_credential_assignments_are_redacted_and_verified(
     redact_file(path)
     assert path.read_text(encoding="utf-8") == f"{name}=<REDACTED>\n"
     assert not backup_secret_scan(path)
+
+
+def test_ini_note_redacts_cli_style_sensitive_assignments(tmp_path: Path) -> None:
+    path = tmp_path / "global.ini"
+    path.write_text("[General]\nNote=--ApiKey=INI_API_SECRET\n", encoding="utf-8")
+    redact_file_with_secrets(path)
+    output = path.read_text(encoding="utf-8")
+    assert "INI_API_SECRET" not in output
+    assert not _secret_scan(path)
+
+
+@pytest.mark.parametrize(
+    "content,secret",
+    [
+        ("pwd:LKQ<Z&59043:Xcf5ZZ\n", "LKQ<Z&59043:Xcf5ZZ"),
+        ('websocket_password=LK$?Q0=".eYaa9Z4\u6f22dZZ}\n', 'LK$?Q0=".eYaa9Z4\u6f22dZZ}'),
+        ("Key = LK\u6f228X1?4f96Qa=d'42YZZ\n", "LK\u6f228X1?4f96Qa=d'42YZZ"),
+        ("a=b&privateKey: LKd`|7c4ecbc=bQZ:9a}ZZ&region=us\n", "LKd`|7c4ecbc=bQZ:9a}ZZ"),
+        ("a=b&streamKey=&quot;LKQb:{1=98!=0?bu794ZZ&quot;\n", "LKQb:{1=98!=0?bu794ZZ"),
+        ("url=https://h.example/p?token : COLON_QUERY_SECRET\n", "COLON_QUERY_SECRET"),
+    ],
+)
+def test_punctuation_in_secret_values_is_fully_redacted_and_accepted(
+    tmp_path: Path, content: str, secret: str
+) -> None:
+    path = tmp_path / "punctuation.txt"
+    path.write_text(content, encoding="utf-8")
+    redact_file_with_secrets(path)
+    output = path.read_text(encoding="utf-8")
+    assert secret not in output
+    assert not _secret_scan(path)

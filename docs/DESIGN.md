@@ -115,6 +115,12 @@ the binding field in `OBSBasic.*` JSON-valued INI assignments, including multili
 values; nested settings named `key` remain sensitive. Leave credential-free embedded
 JSON text byte-for-byte intact.
 
+For serialized JSON, verification is structural: inspect sensitive keys and scan
+decoded string values. For INI, classify assignments by key and parse JSON-valued
+assignments before checking decoded strings. Keep independent raw-text verification
+for logs and generated reports. Reject excessively nested JSON and text lines above
+the safe scan limit rather than risking an incomplete scan.
+
 Free-text credential assignments redact the full non-whitespace token. URL query
 redaction preserves a following named parameter such as `&region=us` while absorbing
 punctuation into the credential value when it does not begin another parameter.

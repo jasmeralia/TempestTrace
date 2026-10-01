@@ -149,10 +149,10 @@ _FREE_TEXT_SCHEME_WORDS = "|".join(
     re.escape(value) for value in sorted(_SCHEME_NAMES, key=len, reverse=True)
 )
 _FREE_TEXT_SPECIAL_HINT = re.compile(
-    rf"(?i)(?<![A-Za-z0-9_.-]){_SENSITIVE_FREE_NAME}[ \t]*[=:][ \t]*"
+    rf"(?i)(?<![A-Za-z0-9_.-]){_FREE_NAME}[ \t]*[=:][ \t]*"
     rf"[\"'`]?(?:{_FREE_TEXT_SCHEME_WORDS})[\"'`]?"
     rf"(?:[ \t]+\S|[ \t]*\r?\n(?:[ \t]*\r?\n)*[ \t]*\S)|"
-    rf"(?<![A-Za-z0-9_.-]){_SENSITIVE_FREE_NAME}[ \t]*[=:][ \t]*"
+    rf"(?<![A-Za-z0-9_.-]){_FREE_NAME}[ \t]*[=:][ \t]*"
     r"(?:[ \t]*\r?\n)+[ \t]*\S"
 )
 
@@ -1639,6 +1639,7 @@ def _clean_log_key(token: str) -> str:
     return next((value for value in field.groups() if value), "") if field else ""
 
 
+@lru_cache(maxsize=2)
 def _free_text_credential_spans(  # noqa: PLR0912, PLR0915
     text: str,
 ) -> list[tuple[int, int, str, bool]]:
@@ -1874,6 +1875,8 @@ def _rtmp_key(value: str) -> str:
 @lru_cache(maxsize=2)
 def _json_fragments(text: str) -> list[tuple[int, int, Any, tuple[str, ...]]]:  # noqa: PLR0912, PLR0915
     """Find valid JSON object/array fragments in otherwise free-form text."""
+    if not (_JSON_OBJECT_START.search(text) or _JSON_ARRAY_START.search(text)):
+        return []
     decoder = json.JSONDecoder()
     fragments: list[tuple[int, int, Any, tuple[str, ...]]] = []
     line_starts = [0, *(match.end() for match in re.finditer("\n", text))]

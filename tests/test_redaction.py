@@ -17,6 +17,7 @@ from tempesttrace.redaction import (
     _OBS_KEY_NAMES,
     RULE_VERSION,
     _embedded_secrets,
+    _free_text_credential_spans,
     _is_sensitive_key,
     _json_fragments,
     _scrub_text,
@@ -27,6 +28,17 @@ from tempesttrace.redaction import (
     redact_file,
     redact_file_with_secrets,
 )
+
+
+def test_free_text_span_results_are_reused_for_unchanged_input() -> None:
+    text = "token=Bearer PerfRegression123\n"
+    first = _free_text_credential_spans(text)
+    misses_after_first_call = _free_text_credential_spans.cache_info().misses
+
+    second = _free_text_credential_spans(text)
+
+    assert first == second == [(13, 30, "PerfRegression123", False)]
+    assert _free_text_credential_spans.cache_info().misses == misses_after_first_call
 
 
 def test_structured_redaction_preserves_other_values(tmp_path: Path) -> None:

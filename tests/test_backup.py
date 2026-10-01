@@ -963,6 +963,55 @@ def test_numeric_json_credentials_are_harvested_for_log_scrubbing(tmp_path: Path
     assert "12345" in body
 
 
+def test_numeric_secret_matching_requires_exact_json_number_and_log_token(
+    tmp_path: Path,
+) -> None:
+    source = fixture(tmp_path / "obs")
+    (source / "basic/profiles/default/service.json").write_text(
+        '{"settings":{"password":123456}}', encoding="utf-8"
+    )
+    (source / "basic/scenes/main.json").write_text(
+        '{"exact":123456,"decimal_below":0.123456,"negative":-123456,'
+        '"decimal_above":123456.5,"longer":1234567,"other":6000}',
+        encoding="utf-8",
+    )
+    log_text = "volume 0.123456 offset -123456 build 30.123456 exact 123456\n"
+    (source / "logs/2026-01-01.txt").write_text(log_text, encoding="utf-8")
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    result = create_backup(source, destination)
+
+    with zipfile.ZipFile(result.archive) as archive:
+        scene = json.loads(archive.read("basic/scenes/main.json"))
+        log = archive.read("logs/2026-01-01.txt").decode("utf-8")
+    assert scene == {
+        "exact": "<REDACTED>",
+        "decimal_below": 0.123456,
+        "negative": -123456,
+        "decimal_above": 123456.5,
+        "longer": 1234567,
+        "other": 6000,
+    }
+    assert log == "volume 0.123456 offset -123456 build 30.123456 exact <REDACTED>\n"
+
+
+def test_long_numeric_credential_does_not_match_digit_substrings(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    (source / "basic/profiles/default/service.json").write_text(
+        '{"settings":{"password":123456789012}}', encoding="utf-8"
+    )
+    (source / "basic/scenes/main.json").write_text('{"longer":999123456789012}', encoding="utf-8")
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    result = create_backup(source, destination)
+
+    with zipfile.ZipFile(result.archive) as archive:
+        scene = json.loads(archive.read("basic/scenes/main.json"))
+    assert scene["longer"] == 999123456789012
+
+
 def test_weak_rtmp_and_generic_key_literals_do_not_rewrite_benign_logs_or_names(
     tmp_path: Path,
 ) -> None:
@@ -993,6 +1042,41 @@ def test_weak_rtmp_and_generic_key_literals_do_not_rewrite_benign_logs_or_names(
     assert "live.twitch.tv" in body and "go live now" in body and "CPU Name: Test CPU" in body
     assert "SortKey=Name" in body
     assert "STREAMKEYSECRET999" not in body and "APIKEYSECRET999" not in body
+
+
+def test_weak_source_literals_match_case_sensitively(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    service = source / "basic/profiles/default/service.json"
+    service.write_text(
+        '{"settings":{"server":"rtmp://host/app/AbCd1234","uniqueKey":"KeyMaterial123"}}',
+        encoding="utf-8",
+    )
+    (source / "basic/scenes/main.json").write_text(
+        '{"names":["AbCd1234","abcd1234","ABCD1234",'
+        '"KeyMaterial123","keymaterial123","KEYMATERIAL123"]}',
+        encoding="utf-8",
+    )
+    (source / "logs/2026-01-01.txt").write_text(
+        "AbCd1234 abcd1234 ABCD1234 KeyMaterial123 keymaterial123 KEYMATERIAL123\n",
+        encoding="utf-8",
+    )
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    result = create_backup(source, destination)
+
+    with zipfile.ZipFile(result.archive) as archive:
+        scene = json.loads(archive.read("basic/scenes/main.json"))
+        log = archive.read("logs/2026-01-01.txt").decode("utf-8")
+    assert scene["names"] == [
+        "<REDACTED>",
+        "abcd1234",
+        "ABCD1234",
+        "<REDACTED>",
+        "keymaterial123",
+        "KEYMATERIAL123",
+    ]
+    assert log == "<REDACTED> abcd1234 ABCD1234 <REDACTED> keymaterial123 KEYMATERIAL123\n"
 
 
 def test_percent_encoded_known_credentials_are_scrubbed_case_insensitively(

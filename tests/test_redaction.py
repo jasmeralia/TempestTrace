@@ -2,11 +2,12 @@ import json
 import random
 import re
 import time
+import zipfile
 from pathlib import Path
 
 import pytest
 
-from tempesttrace.backup import _contains_private_secret, _secret_scan
+from tempesttrace.backup import _contains_private_secret, _secret_scan, create_backup
 from tempesttrace.redaction import (
     _OBS_KEY_NAMES,
     RULE_VERSION,
@@ -579,8 +580,8 @@ def backup_secret_scan(path: Path) -> bool:
     return _secret_scan(path)
 
 
-def test_rule_version_is_seventeen() -> None:
-    assert RULE_VERSION == 17
+def test_rule_version_is_eighteen() -> None:
+    assert RULE_VERSION == 18
 
 
 @pytest.mark.parametrize("segment", ["mystreamkey", "abcdefghijklmno", "MYSTREAMKEY"])
@@ -612,6 +613,44 @@ def test_rtmp_harvesting_does_not_scrub_streaming_log_word(tmp_path: Path) -> No
 
 
 @pytest.mark.parametrize(
+    "server,log",
+    [
+        (
+            "rtmp://live.example.com/live/1080p",
+            "info: base resolution 1920x1080 output 1080p\ninfo: encoder stream_1080p_high\n",
+        ),
+        (
+            "rtmp://host/Facebook/live",
+            "facebook output started\nFacebook Live connected\n",
+        ),
+    ],
+)
+def test_rtmp_ordinary_path_segments_do_not_scrub_logs(
+    server: str, log: str, tmp_path: Path
+) -> None:
+    source = tmp_path / "obs"
+    (source / "basic/profiles/default").mkdir(parents=True)
+    (source / "basic/scenes").mkdir()
+    (source / "logs").mkdir()
+    (source / "basic/profiles/default/service.json").write_text(
+        json.dumps({"settings": {"server": server, "key": ""}}), encoding="utf-8"
+    )
+    (source / "basic/scenes/main.json").write_text(
+        json.dumps({"name": server.rsplit("/", 1)[-1]}), encoding="utf-8"
+    )
+    (source / "logs/2026-01-01.txt").write_text(log, encoding="utf-8")
+    destination = tmp_path / "out"
+    destination.mkdir()
+
+    result = create_backup(source, destination)
+
+    with zipfile.ZipFile(result.archive) as archive:
+        assert archive.read("logs/2026-01-01.txt").decode("utf-8") == log
+        scene = json.loads(archive.read("basic/scenes/main.json"))
+    assert scene["name"] == server.rsplit("/", 1)[-1]
+
+
+@pytest.mark.parametrize(
     "url",
     [
         "http://user:abcd/EFGH12@ingest.example.com/live",
@@ -627,7 +666,18 @@ def test_userinfo_password_redacts_slashes_through_last_at(url: str, tmp_path: P
 
 
 def test_real_obs_key_enum_names_are_exempt_and_spoofs_are_not(tmp_path: Path) -> None:
-    assert len(_OBS_KEY_NAMES) == 509
+    mouse_names = {f"OBS_KEY_MOUSE{number}" for number in range(1, 30)}
+    keyboard_names = {
+        "OBS_KEY_A",
+        "OBS_KEY_F9",
+        "OBS_KEY_CONTROL",
+        "OBS_KEY_LEFT",
+        "OBS_KEY_VK_VOLUME_MUTE",
+        "OBS_KEY_AACUTE",
+    }
+    assert len(_OBS_KEY_NAMES) == 538
+    assert mouse_names <= _OBS_KEY_NAMES
+    assert keyboard_names <= _OBS_KEY_NAMES
     assert all(
         not has_unredacted_fields({"hotkeys": {"bindings": {"key": name}}})
         for name in _OBS_KEY_NAMES
@@ -646,6 +696,24 @@ def test_real_obs_key_enum_names_are_exempt_and_spoofs_are_not(tmp_path: Path) -
     assert "OBS_KEY_NK8SQ7WL91" not in ini_clean
     for name in ("OBS_KEY_NK8SQ7WL91", "OBS_KEY_A1B2C3D4E5F6", "obs_key_f9", "OBS_KEY_"):
         assert has_unredacted_fields({"hotkeys": {"bindings": {"key": name}}})
+
+
+@pytest.mark.parametrize("mouse", ["OBS_KEY_MOUSE1", "OBS_KEY_MOUSE4", "OBS_KEY_MOUSE29"])
+def test_mouse_hotkeys_survive_scene_and_obsbasic_ini_redaction(mouse: str, tmp_path: Path) -> None:
+    scene = tmp_path / "scene.json"
+    ini = tmp_path / "OBSBasic.ini"
+    scene_text = json.dumps({"hotkeys": {"libobs.mute": [{"key": mouse}]}})
+    ini_text = f'OBSBasic.PushToTalk={{"bindings":[{{"key":"{mouse}","control":true}}]}}\n'
+    scene.write_text(scene_text, encoding="utf-8")
+    ini.write_text(ini_text, encoding="utf-8")
+
+    redact_file_with_secrets(scene)
+    redact_file_with_secrets(ini)
+
+    assert (
+        json.loads(scene.read_text(encoding="utf-8"))["hotkeys"]["libobs.mute"][0]["key"] == mouse
+    )
+    assert ini.read_text(encoding="utf-8") == ini_text
 
 
 def test_json_fragments_scales_for_many_small_objects(tmp_path: Path) -> None:
@@ -670,6 +738,20 @@ def test_json_fragments_scales_for_many_small_objects(tmp_path: Path) -> None:
         assert time.perf_counter() - started < 8.0
 
 
+def test_dense_json_credential_fragments_redact_in_linear_time(tmp_path: Path) -> None:
+    path = tmp_path / "dense.txt"
+    secret = "JSON_SECRET_DENSE_123456789"
+    line = f'{{"token":"{secret}","volume":1,"mute":false}}\n'
+    path.write_text(line * (1024 * 1024 // len(line)), encoding="utf-8")
+
+    started = time.perf_counter()
+    redact_file_with_secrets(path)
+    elapsed = time.perf_counter() - started
+
+    assert secret not in path.read_text(encoding="utf-8")
+    assert elapsed < 8.0
+
+
 @pytest.mark.parametrize(
     "url, expected",
     [
@@ -681,6 +763,35 @@ def test_json_fragments_scales_for_many_small_objects(tmp_path: Path) -> None:
     ],
 )
 def test_url_userinfo_password_guards(url: str, expected: str, tmp_path: Path) -> None:
+    path = tmp_path / "current.txt"
+    path.write_text(url, encoding="utf-8")
+    redact_file_with_secrets(path)
+    assert path.read_text(encoding="utf-8").strip() == expected
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("http://[2001:db8::1]:8080/path@name", "http://[2001:db8::1]:8080/path@name"),
+        (
+            "http://[2001:db8::1]:8080/path?password=SUPERSECRET99&email=a@b.com",
+            "http://[2001:db8::1]:8080/path?password=<REDACTED>&email=a@b.com",
+        ),
+        (
+            "http://[2001:db8::1]:8080/path@name?password=SUPERSECRET99&email=a@b.com",
+            "http://[2001:db8::1]:8080/path@name?password=<REDACTED>&email=a@b.com",
+        ),
+        (
+            "http://user:pass@[2001:db8::1]:443/path",
+            "http://user:<REDACTED>@[2001:db8::1]:443/path",
+        ),
+        ("ssh://git@github.com/user/repo", "ssh://git@github.com/user/repo"),
+        ("mailto:alice@example.com", "mailto:alice@example.com"),
+        ("https://cdn.example.com/@creator/video", "https://cdn.example.com/@creator/video"),
+        ("user@example.com", "user@example.com"),
+    ],
+)
+def test_bracketed_ipv6_authority_and_userinfo(url: str, expected: str, tmp_path: Path) -> None:
     path = tmp_path / "current.txt"
     path.write_text(url, encoding="utf-8")
     redact_file_with_secrets(path)

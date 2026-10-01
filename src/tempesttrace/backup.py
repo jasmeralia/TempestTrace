@@ -675,29 +675,60 @@ def _private_literal_patterns(secret: str) -> set[str]:
     return patterns
 
 
-def _compile_private_literals(secrets: set[str]) -> re.Pattern[str] | None:
+def _compile_private_literals(
+    secrets: set[str], weak_secrets: set[str] | None = None
+) -> re.Pattern[str] | None:
     embedded: set[str] = set()
+    weak_embedded: set[str] = set()
     bounded: set[str] = set()
+    weak_bounded: set[str] = set()
+    numeric: set[str] = set()
+    weak_secrets = weak_secrets or set()
     for secret in secrets:
         if not _is_searchable_secret(secret):
             continue
+        if re.fullmatch(r"-?\d+(?:\.\d+)?", secret):
+            numeric.add(secret)
+            continue
         is_long_key = len(secret) >= 12 and any(char.isdigit() for char in secret)
-        target = embedded if is_long_key else bounded
+        if secret in weak_secrets:
+            target = weak_embedded if is_long_key else weak_bounded
+        else:
+            target = embedded if is_long_key else bounded
         target.update(_private_literal_patterns(secret))
     alternatives = []
     if embedded:
-        alternatives.append("(?:" + "|".join(sorted(embedded, key=len, reverse=True)) + ")")
+        alternatives.append("(?i:" + "|".join(sorted(embedded, key=len, reverse=True)) + ")")
+    if weak_embedded:
+        alternatives.append("(?:" + "|".join(sorted(weak_embedded, key=len, reverse=True)) + ")")
     if bounded:
         alternatives.append(
-            r"(?<![A-Za-z0-9])(?:"
+            "(?i:"
+            + r"(?<![A-Za-z0-9])(?:"
             + "|".join(sorted(bounded, key=len, reverse=True))
-            + r")(?![A-Za-z0-9])"
+            + r")(?![A-Za-z0-9]))"
         )
-    return re.compile("(?:" + "|".join(alternatives) + ")", re.IGNORECASE) if alternatives else None
+    if weak_bounded:
+        alternatives.append(
+            "(?-i:(?<![A-Za-z0-9])(?:"
+            + "|".join(sorted(weak_bounded, key=len, reverse=True))
+            + r")(?![A-Za-z0-9]))"
+        )
+    if numeric:
+        alternatives.append(
+            r"(?<![A-Za-z0-9.-])(?:"
+            + "|".join(sorted(numeric, key=len, reverse=True))
+            + r")(?![A-Za-z0-9.-])"
+        )
+    return re.compile("(?:" + "|".join(alternatives) + ")") if alternatives else None
 
 
-def _scrub_private_literals(path: Path, pattern: re.Pattern[str] | None) -> int:
-    if pattern is None:
+def _scrub_private_literals(
+    path: Path,
+    pattern: re.Pattern[str] | None,
+    numeric_secrets: set[str] | None = None,
+) -> int:
+    if pattern is None and not numeric_secrets:
         return 0
     text = read_text_safely(path)
     suffix = path.name.casefold()
@@ -706,6 +737,8 @@ def _scrub_private_literals(path: Path, pattern: re.Pattern[str] | None) -> int:
 
     def scrub(value: str) -> str:
         nonlocal replacements
+        if pattern is None:
+            return value
         cleaned, count = pattern.subn("<REDACTED>", value)
         replacements += count
         return cleaned
@@ -721,9 +754,9 @@ def _scrub_private_literals(path: Path, pattern: re.Pattern[str] | None) -> int:
             if isinstance(value, dict):
                 return {key: scrub_values(child) for key, child in value.items()}
             if isinstance(value, int) and not isinstance(value, bool):
-                return REDACTED if pattern.search(str(value)) else value
+                return REDACTED if str(value) in (numeric_secrets or set()) else value
             if isinstance(value, float):
-                return REDACTED if pattern.search(json.dumps(value)) else value
+                return REDACTED if json.dumps(value) in (numeric_secrets or set()) else value
             return value
 
         cleaned_text = json.dumps(scrub_values(document), ensure_ascii=False, indent=2) + "\n"
@@ -798,6 +831,7 @@ def create_backup(  # noqa: PLR0912, PLR0915
         files = _inventory(root, skipped)
         total = 0
         discovered_secrets: set[str] = set()
+        weak_secrets: set[str] = set()
         pending: list[tuple[Path, Path, Path, dict[str, int], bool, str]] = []
         for index, source_file in enumerate(files, 1):
             if cancelled is not None and cancelled():
@@ -836,6 +870,7 @@ def create_backup(  # noqa: PLR0912, PLR0915
                     progress("redacting", index - 1, len(files))
                 categories, _redaction_count, secrets = redact_file_with_secrets(private_staged)
                 discovered_secrets.update(secrets)
+                weak_secrets.update(getattr(secrets, "weak", set()))
             except UnsupportedFileType:
                 private_staged.unlink(missing_ok=True)
                 skipped.append({"path": rel_text, "reason": "unsupported_file_type"})
@@ -873,7 +908,10 @@ def create_backup(  # noqa: PLR0912, PLR0915
 
         # Every file has now contributed its sensitive literals. Scrub the full set
         # from every staged copy before any bytes enter the output staging tree.
-        private_patterns = _compile_private_literals(discovered_secrets)
+        private_patterns = _compile_private_literals(discovered_secrets, weak_secrets)
+        numeric_secrets = {
+            secret for secret in discovered_secrets if re.fullmatch(r"-?\d+(?:\.\d+)?", secret)
+        }
         for index, (
             _source_file,
             staged,
@@ -887,7 +925,9 @@ def create_backup(  # noqa: PLR0912, PLR0915
             if progress:
                 progress("redacting", index - 1, len(pending))
             try:
-                cross_redaction_count = _scrub_private_literals(private_staged, private_patterns)
+                cross_redaction_count = _scrub_private_literals(
+                    private_staged, private_patterns, numeric_secrets
+                )
             except OSError, UnicodeError, ValueError, RecursionError, MemoryError:
                 private_staged.unlink(missing_ok=True)
                 skipped.append({"path": rel_text, "reason": "unreadable_or_unsanitizable"})

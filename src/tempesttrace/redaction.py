@@ -9,7 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-RULE_VERSION = 17
+RULE_VERSION = 18
 REDACTED = "<REDACTED>"
 _QUOTE_DELIMITER = (
     r"(?:\\*['\"]|`|&(?:quot|apos|ldquo|rdquo|lsquo|rsquo);|"
@@ -104,7 +104,7 @@ _URL_QUERY_SECRET = re.compile(
     r"(?:&quot;[^\r\n]*?&quot;|&apos;[^\r\n]*?&apos;|%22[^\r\n]*?%22|%27[^\r\n]*?%27)|"
     r"(?:(?![&;][A-Za-z0-9_.-]+=)[^\s])+))"
 )
-_URL_USERINFO = re.compile(r"(?i)(\b[A-Za-z][A-Za-z0-9+.-]*://)([^:/?#@\s]*):([^\s]*@)([^\s]*)")
+_URL_USERINFO = re.compile(r"(?i)(\b[A-Za-z][A-Za-z0-9+.-]*://)([^:/?#@\[\]\s]*):([^\s]*@)([^\s]*)")
 _RTMP_URL = re.compile(r"(?i)\b(?:rtmp|rtmps|rtmpe|rtmpt|rtmpte|rtmfp)://[^\s]+")
 _STREAMLABS_WIDGET_TOKEN = re.compile(
     r"(?i)(https?://(?:www\.)?streamlabs\.com/(?:widgets/)?[^/?#\s]+/v\d+/)"
@@ -141,9 +141,12 @@ _SCHEME_NAMES = frozenset(
 
 def _userinfo_candidate(match: re.Match[str]) -> bool:
     """Accept URL userinfo passwords, including slashes, but not host ports."""
+    username = match.group(2)
     password = match.group(3)[:-1]
     first_slash = password.find("/")
-    return not (first_slash >= 0 and password[:first_slash].isdigit())
+    return not (username.startswith("[") or "[" in username or "]" in username) and not (
+        first_slash >= 0 and password[:first_slash].isdigit()
+    )
 
 
 _CLI_ASSIGNMENT = re.compile(
@@ -276,12 +279,43 @@ def _looks_like_rtmp_in_place(value: str) -> bool:
 def _looks_like_rtmp_harvest(value: str) -> bool:
     if value.casefold() in _RTMP_APPLICATION_NAMES:
         return False
+    if _is_rtmp_quality_or_resolution(value):
+        return False
     return (
-        (value.isalpha() and value.lower() != value and value.upper() != value)
+        len(value) >= 16
+        or (any(char.isdigit() for char in value) and any(char.isalpha() for char in value))
         or bool(re.fullmatch(r"(?i)[a-f]{8,}", value))
-        or len(value) >= 16
-        or (len(value) >= 4 and any(not char.isalpha() for char in value))
     )
+
+
+def _is_rtmp_quality_or_resolution(value: str) -> bool:
+    return bool(re.fullmatch(r"(?i)(?:\d{3,4}[pi]\d{0,3}|\d{2,4}x\d{2,4})", value))
+
+
+def _rtmp_harvest_spans(text: str) -> list[tuple[int, int]]:
+    """Find only key-like final RTMP path segments suitable for cross-file scanning."""
+    spans: list[tuple[int, int]] = []
+    for url in _RTMP_URL.finditer(text):
+        scheme_end = url.start() + url.group(0).find("://") + 3
+        slash = text.find("/", scheme_end, url.end())
+        if slash < 0:
+            continue
+        path_end = min(
+            (
+                position
+                for marker in ("?", "#")
+                if (position := text.find(marker, slash, url.end())) >= 0
+            ),
+            default=url.end(),
+        )
+        last_slash = text.rfind("/", slash + 1, path_end)
+        segment_start = last_slash + 1 if last_slash >= 0 else slash + 1
+        segment_end = path_end
+        segment = text[segment_start:segment_end]
+        clean = _rtmp_key(segment)
+        if clean and _looks_like_rtmp_harvest(clean):
+            spans.append((segment_start, segment_start + len(clean)))
+    return spans
 
 
 def _is_explicit_camel_key(key: str) -> bool:
@@ -338,7 +372,8 @@ def _hotkey_key_exempt(  # noqa: PLR0911
     return value in _OBS_KEY_NAMES
 
 
-# Identifier names from obsproject/obs-studio libobs/obs-hotkeys.h OBS_HOTKEY entries.
+# Identifier names from OBS_HOTKEY and OBS_MOUSE_BUTTON entries in
+# obsproject/obs-studio libobs/obs-hotkeys.h.
 _OBS_KEY_NAMES = frozenset(
     {
         "OBS_KEY_0",
@@ -616,6 +651,35 @@ _OBS_KEY_NAMES = frozenset(
         "OBS_KEY_MODE_SWITCH",
         "OBS_KEY_MONBRIGHTNESSDOWN",
         "OBS_KEY_MONBRIGHTNESSUP",
+        "OBS_KEY_MOUSE1",
+        "OBS_KEY_MOUSE10",
+        "OBS_KEY_MOUSE11",
+        "OBS_KEY_MOUSE12",
+        "OBS_KEY_MOUSE13",
+        "OBS_KEY_MOUSE14",
+        "OBS_KEY_MOUSE15",
+        "OBS_KEY_MOUSE16",
+        "OBS_KEY_MOUSE17",
+        "OBS_KEY_MOUSE18",
+        "OBS_KEY_MOUSE19",
+        "OBS_KEY_MOUSE2",
+        "OBS_KEY_MOUSE20",
+        "OBS_KEY_MOUSE21",
+        "OBS_KEY_MOUSE22",
+        "OBS_KEY_MOUSE23",
+        "OBS_KEY_MOUSE24",
+        "OBS_KEY_MOUSE25",
+        "OBS_KEY_MOUSE26",
+        "OBS_KEY_MOUSE27",
+        "OBS_KEY_MOUSE28",
+        "OBS_KEY_MOUSE29",
+        "OBS_KEY_MOUSE3",
+        "OBS_KEY_MOUSE4",
+        "OBS_KEY_MOUSE5",
+        "OBS_KEY_MOUSE6",
+        "OBS_KEY_MOUSE7",
+        "OBS_KEY_MOUSE8",
+        "OBS_KEY_MOUSE9",
         "OBS_KEY_MU",
         "OBS_KEY_MUHENKAN",
         "OBS_KEY_MULTIPLECANDIDATE",
@@ -853,6 +917,36 @@ _OBS_KEY_NAMES = frozenset(
     }
 )
 
+
+class CredentialSecrets(set[str]):
+    """Collected credential literals with their weaker matching provenance."""
+
+    def __init__(self, values: set[str], weak: set[str]) -> None:
+        super().__init__(values)
+        self.weak = weak
+
+
+def _weak_credential_values(value: Any) -> set[str]:
+    weak: set[str] = set()
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if (
+                isinstance(key, str)
+                and _is_weak_camel_key(key)
+                and _is_sensitive_key(key, value=child)
+            ):
+                for literal in _credential_literals(child):
+                    if _looks_like_key_material(literal):
+                        weak.add(literal)
+            weak.update(_weak_credential_values(child))
+    elif isinstance(value, list):
+        for child in value:
+            weak.update(_weak_credential_values(child))
+    elif isinstance(value, str):
+        weak.update(value[start:end] for start, end in _rtmp_harvest_spans(value))
+    return weak
+
+
 _CREDENTIAL_NAMES = frozenset(
     {
         "apikey",
@@ -1015,7 +1109,7 @@ def _sub_outside_json(text: str, pattern: re.Pattern[str], replace: Any) -> str:
     return "".join(pieces)
 
 
-def _sub_overlapping_assignments(text: str, replace: Any) -> str:
+def _sub_overlapping_assignments(text: str, replace: Any) -> str:  # noqa: PLR0912
     """Replace credential assignments even when they start inside another value."""
     pattern = _LOG_PATTERNS[0]
     fragments = _json_fragments(text)
@@ -1025,11 +1119,16 @@ def _sub_overlapping_assignments(text: str, replace: Any) -> str:
         for match in pattern.finditer(full_scan)
         if _is_sensitive_key(_log_match_key(match), value=_unquote(match.group(2)))
     ]
-    fragments = [
-        fragment
-        for fragment in fragments
-        if not any(start < fragment[0] and end > fragment[1] for start, end in covered)
-    ]
+    filtered_fragments: list[tuple[int, int, Any, tuple[str, ...]]] = []
+    covered_index = 0
+    furthest_covered_end = -1
+    for fragment in fragments:
+        while covered_index < len(covered) and covered[covered_index][0] < fragment[0]:
+            furthest_covered_end = max(furthest_covered_end, covered[covered_index][1])
+            covered_index += 1
+        if furthest_covered_end <= fragment[1]:
+            filtered_fragments.append(fragment)
+    fragments = filtered_fragments
     pieces: list[str] = []
     fragment_cursor = 0
     spans = [(0, len(text))]
@@ -1494,11 +1593,7 @@ def _embedded_secrets(text: str) -> set[str]:
             for match in _URL_USERINFO.finditer(text)
             if match.group(3) != f"{REDACTED}@" and _userinfo_candidate(match)
         )
-        values.update(
-            text[start:end]
-            for start, end in _rtmp_segment_spans(text)
-            if _looks_like_rtmp_harvest(text[start:end])
-        )
+        values.update(text[start:end] for start, end in _rtmp_harvest_spans(text))
     if "streamlabs.com/" in text.casefold():
         values.update(match.group(2) for match in _STREAMLABS_WIDGET_TOKEN.finditer(text))
     if _SENSITIVE_NAME_HINT.search(text):
@@ -2222,23 +2317,32 @@ def redact_file_with_secrets(path: Path) -> tuple[dict[str, int], int, set[str]]
         _guard_json_depth(text)
         raw = json.loads(text)
         secrets = _credential_values(raw, (path.name,))
+        weak_secrets = _weak_credential_values(raw)
         clean = _redact_object(raw, counts, secrets, (path.name,))
         path.write_text(json.dumps(clean, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     elif is_ini:
         text = read_text_safely(path)
         secrets = _ini_secret_values(text, path.name) | _embedded_secrets(text)
+        weak_secrets = _weak_credential_values(text)
+        for match in re.finditer(r"(?im)^\s*([A-Za-z0-9_.-]+)\s*[=:]\s*([^\r\n]+)", text):
+            if _is_weak_camel_key(match.group(1)) and _looks_like_key_material(
+                _unquote(match.group(2))
+            ):
+                weak_secrets.add(_unquote(match.group(2)))
         clean = _redact_ini(text, path.name, counts, secrets)
         clean = _scrub_text(_redact_embedded(clean, counts, secrets), secrets)
         path.write_text(clean, encoding="utf-8", newline="")
     elif suffix == ".txt":
         text = read_text_safely(path)
         secrets = _embedded_secrets(text)
+        weak_secrets = _weak_credential_values(text)
         text = _redact_embedded(text, counts, secrets)
         # Supported UTF-16 input is deliberately normalized to UTF-8 in staging.
         path.write_text(_scrub_text(text, secrets), encoding="utf-8")
     else:
         secrets = set()
-    return counts, sum(counts.values()), secrets
+        weak_secrets = set()
+    return counts, sum(counts.values()), CredentialSecrets(secrets, weak_secrets)
 
 
 def read_text_safely(path: Path) -> str:

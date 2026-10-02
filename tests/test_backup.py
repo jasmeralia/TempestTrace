@@ -2499,6 +2499,132 @@ def test_round11_header_name_value_pairs_scrub_scene_and_log_but_keep_other_pair
     assert scene["headers"][3]["value"] == "application/json"
 
 
+def test_independent_json_verifier_catches_header_pair_when_redactor_check_is_bypassed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "scene.json"
+    path.write_text('{"headers":[{"name":"X-Api-Key","value":"leaked-value"}]}', encoding="ascii")
+    monkeypatch.setattr(backup, "has_unredacted_fields", lambda *_args, **_kwargs: False)
+    assert backup._secret_scan(path)
+
+
+def test_list_header_value_survives_independent_json_verification(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    (source / "basic/profiles/default/service.json").write_text('{"key":""}', encoding="ascii")
+    (source / "basic/scenes/main.json").write_text(
+        json.dumps(
+            {
+                "sources": [],
+                "headers": [{"name": "Authorization", "value": ["Bearer", "ListSecret99"]}],
+            }
+        ),
+        encoding="ascii",
+    )
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        payloads = {name: archive.read(name) for name in archive.namelist()}
+    assert b"ListSecret99" not in b"\n".join(payloads.values())
+    scene = json.loads(payloads["basic/scenes/main.json"])
+    assert scene["headers"][0]["value"] == ["Bearer", "<REDACTED>"]
+
+
+def test_long_credentials_redact_across_log_scene_and_service_json(tmp_path: Path) -> None:
+    for size in (1000, 4000, 20000):
+        source = fixture(tmp_path / f"obs-{size}")
+        destination = tmp_path / f"out-{size}"
+        destination.mkdir()
+        secret = "S3cret99" + "x" * (size - 8)
+        (source / "basic/profiles/default/service.json").write_text(
+            json.dumps({"key": secret}), encoding="ascii"
+        )
+        (source / "basic/scenes/main.json").write_text(
+            json.dumps({"sources": [], "note": secret}), encoding="ascii"
+        )
+        (source / "logs/2026-01-01.txt").write_text(
+            f"Authorization: Bearer {secret}\n", encoding="ascii"
+        )
+        result = create_backup(source, destination)
+        assert not any("Could not safely include" in warning for warning in result.warnings)
+        with zipfile.ZipFile(result.archive) as archive:
+            members = archive.namelist()
+            assert "basic/profiles/default/service.json" in members
+            assert "basic/scenes/main.json" in members
+            assert "logs/2026-01-01.txt" in members
+            payloads = [archive.read(name) for name in members]
+        assert all(secret.encode("ascii") not in payload for payload in payloads)
+
+
+def test_escaped_json_secret_is_scrubbed_from_bare_copy_in_zip(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    (source / "basic/profiles/default/service.json").write_text('{"key":""}', encoding="ascii")
+    (source / "basic/scenes/main.json").write_text('{"sources":[]}', encoding="ascii")
+    secret = "s3cret99xxK"
+    (source / "logs/2026-01-01.txt").write_text(
+        f'Console: "{{\\"token\\":\\"{secret}\\"}}"\n', encoding="ascii"
+    )
+    (source / "logs/2026-01-02.txt").write_text(f"copied {secret}\n", encoding="ascii")
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        payloads = {name: archive.read(name) for name in archive.namelist()}
+    assert secret.encode("ascii") not in b"\n".join(payloads.values())
+    assert "logs/2026-01-01.txt" in payloads
+    assert b'}"' in payloads["logs/2026-01-01.txt"]
+
+
+@pytest.mark.parametrize(
+    ("url", "secret"),
+    [
+        ("https://example.test/#access_token=FragmentSecret99", "FragmentSecret99"),
+        ("https://streamelements.com/overlay/room/WidgetSecret99", "WidgetSecret99"),
+        (
+            "https://discord.com/api/webhooks/123456789012345678/DiscordSecret99",
+            "DiscordSecret99",
+        ),
+        (
+            "https://hooks.slack.com/services/T12345678/B12345678/SlackSecret99",
+            "SlackSecret99",
+        ),
+    ],
+)
+def test_fragment_and_widget_values_are_scrubbed_from_bare_copy(
+    tmp_path: Path, url: str, secret: str
+) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    (source / "basic/profiles/default/service.json").write_text('{"key":""}', encoding="ascii")
+    (source / "basic/scenes/main.json").write_text(
+        json.dumps({"sources": [], "url": url}), encoding="ascii"
+    )
+    (source / "logs/2026-01-01.txt").write_text(f"copied {secret}\n", encoding="ascii")
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        payloads = {name: archive.read(name) for name in archive.namelist()}
+    assert secret.encode("ascii") not in b"\n".join(payloads.values())
+    assert "logs/2026-01-01.txt" in payloads
+
+
+def test_long_header_pair_key_name_scales_linearly(tmp_path: Path) -> None:
+    def scan(size: int) -> None:
+        path = tmp_path / "pair.json"
+        path.write_text(json.dumps({"key": "a-" * size, "value": "x"}), encoding="ascii")
+        assert backup._secret_scan(path)
+
+    def minimum(size: int, repeats: int = 2) -> float:
+        return _minimum_elapsed(lambda: scan(size), repeats)
+
+    small = minimum(8000)
+    large = minimum(16000)
+    if large / max(small, 0.001) >= 3.2:
+        large = min(large, minimum(16000, repeats=1))
+    assert large / max(small, 0.001) < 3.2
+    assert large < max(8 * small, 10.0)
+
+
 @pytest.mark.parametrize("header", ["WWW-Authenticate", "Proxy-Authenticate", "Authentication"])
 def test_round11_challenge_headers_scrub_tokens_but_preserve_realm(
     tmp_path: Path, header: str

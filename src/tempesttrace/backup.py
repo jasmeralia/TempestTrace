@@ -27,6 +27,7 @@ from tempesttrace.redaction import (
     _SENSITIVE_FREE_NAME,
     REDACTED,
     RULE_VERSION,
+    _before_named_parameter,
     _clean_credential_literal,
     _guard_json_depth,
     _has_sensitive_query_assignment,
@@ -396,7 +397,10 @@ def _secret_scan(path: Path) -> bool:  # noqa: PLR0911
     if is_json:
         try:
             _guard_json_depth(text)
-            structural = has_unredacted_fields(json.loads(text), (path.name,))
+            parsed = json.loads(text)
+            structural = has_unredacted_fields(parsed, (path.name,)) or _independent_json_secret(
+                parsed, (path.name,)
+            )
             if path.name.lower() == "manifest.json":
                 return (
                     structural
@@ -407,7 +411,10 @@ def _secret_scan(path: Path) -> bool:  # noqa: PLR0911
         except OSError, ValueError, UnicodeError, json.JSONDecodeError, RecursionError, MemoryError:
             return True
     if is_ini:
-        return has_unredacted_ini_fields(text, path.name)
+        return has_unredacted_ini_fields(text, path.name) or any(
+            _independent_json_secret(value, context)
+            for _start, _end, value, context in _json_fragments(text)
+        )
     if _is_repeated_redacted_key_log(text) or _is_repeated_redacted_quoted_key_log(text):
         return False
     fragments = _json_fragments(text)
@@ -419,30 +426,48 @@ def _secret_scan(path: Path) -> bool:  # noqa: PLR0911
 def _independent_json_secret(value: object, context: tuple[str, ...] = ()) -> bool:  # noqa: PLR0911, PLR0912
     """Check parsed JSON independently, with a narrow hotkey-key exemption."""
     if isinstance(value, dict):
+        value_aliases = {"value", "val", "v", "headervalue", "content", "data", "text", "string"}
+        name_aliases = {
+            "name",
+            "header",
+            "headername",
+            "key",
+            "field",
+            "label",
+            "k",
+            "id",
+            "param",
+            "parameter",
+        }
         value_key = next(
             (
-                candidate
-                for candidate in ("value", "val", "content", "data")
-                if isinstance(value.get(candidate), str)
+                key
+                for key, child in value.items()
+                if isinstance(key, str)
+                and key.casefold() in value_aliases
+                and isinstance(child, (str, list, int, float))
             ),
             None,
         )
         if value_key is not None:
-            for name_key in ("name", "header", "key", "field", "label"):
-                name = value.get(name_key)
+            for name_key, name in value.items():
+                if not isinstance(name_key, str) or name_key.casefold() not in name_aliases:
+                    continue
                 if not isinstance(name, str):
                     continue
-                if name_key == "key" and not re.fullmatch(
-                    r"(?i)(?:[A-Za-z][A-Za-z0-9-]*-)?(?:authorization|authentication|www-authenticate|proxy-authenticate|cookie|set-cookie|[A-Za-z0-9_.-]*(?:token|password|secret|key))",
-                    name,
+                if name_key.casefold() == "key" and (
+                    len(name) > 128 or not re.fullmatch(r"(?i)[A-Za-z][A-Za-z0-9_.-]*", name)
                 ):
                     continue
-                if _is_sensitive_signature_name(name) and value[value_key] != "<REDACTED>":
+                if _is_sensitive_header_signature(name) and not _independent_header_value_redacted(
+                    value[value_key]
+                ):
                     return True
         for key, child in value.items():
             if (
                 value_key is not None
-                and key in ("name", "header", "key", "field", "label")
+                and isinstance(key, str)
+                and key.casefold() in name_aliases
                 and isinstance(child, str)
                 and _is_sensitive_signature_name(child)
             ):
@@ -469,6 +494,13 @@ def _independent_json_secret(value: object, context: tuple[str, ...] = ()) -> bo
                     return True
         return False
     if isinstance(value, list):
+        if (
+            len(value) == 2
+            and isinstance(value[0], str)
+            and _is_sensitive_header_signature(value[0])
+            and not _independent_header_value_redacted(value[1])
+        ):
+            return True
         return any(_independent_json_secret(item, context) for item in value)
     if isinstance(value, str):
         nested = _json_fragments(value)
@@ -480,7 +512,7 @@ def _independent_json_secret(value: object, context: tuple[str, ...] = ()) -> bo
     return False
 
 
-def _independent_secret_scan(text: str) -> bool:  # noqa: PLR0912
+def _independent_secret_scan(text: str) -> bool:  # noqa: PLR0912, PLR0915
     """Fail closed on credential assignments with a scanner independent of redactor patterns."""
     if _is_repeated_redacted_key_log(text) or _is_repeated_redacted_quoted_key_log(text):
         return False
@@ -517,7 +549,7 @@ def _independent_secret_scan(text: str) -> bool:  # noqa: PLR0912
                 text[line_start : match.start()],
             ):
                 continue
-        value = match.group("value").strip()
+        value = _before_named_parameter(match.group("value").strip())
         unquoted = _unwrap_signature_value(value)
         if normalized in {"wwwauthenticate", "proxyauthenticate"}:
             line_end = text.find("\n", match.end("value"))
@@ -535,6 +567,8 @@ def _independent_secret_scan(text: str) -> bool:  # noqa: PLR0912
             "nil",
         }:
             continue
+        if _clean_credential_literal(value) == REDACTED:
+            continue
         if _is_weak_camel_key(name) and not _looks_like_key_material(unquoted):
             continue
         marker = re.fullmatch(r"[|>][+-]?[0-9]?", unquoted)
@@ -543,14 +577,14 @@ def _independent_secret_scan(text: str) -> bool:  # noqa: PLR0912
         if normalized == "authorization" or _is_sensitive_signature_name(name):
             resolved = resolve_credential_token(text, match.start("value"))
             if resolved is not None and resolved[0] > match.start("value"):
-                resolved_value = _unwrap_signature_value(text[resolved[0] : resolved[1]])
+                resolved_token = _before_named_parameter(text[resolved[0] : resolved[1]])
+                resolved_value = _unwrap_signature_value(resolved_token)
                 prefix = re.findall(r"[^\s]+", text[match.start("value") : resolved[0]])
                 recognized_scheme = any(
                     _normalize_scheme_candidate(part) in _SCHEME_NAMES for part in prefix
                 )
                 if resolved_value == "<REDACTED>" or (
-                    recognized_scheme
-                    and _clean_credential_literal(text[resolved[0] : resolved[1]]) == REDACTED
+                    recognized_scheme and _clean_credential_literal(resolved_token) == REDACTED
                 ):
                     continue
         return True
@@ -593,6 +627,10 @@ def _is_sensitive_signature_name(name: str) -> bool:
             "credential",
             "credentials",
             "streamid",
+            "pass",
+            "oauth",
+            "bearer",
+            "auth",
         }
         or normalized in {"key", "authorization"}
         or ("-" in name and normalized.endswith("authorization"))
@@ -617,6 +655,48 @@ def _is_sensitive_signature_name(name: str) -> bool:
             and (name[-3:] != "key" or name.casefold().endswith(("_key", "-key", ".key")))
         )
     )
+
+
+def _is_sensitive_header_signature(name: str) -> bool:
+    normalized = re.sub(r"[-_ ]", "", name.casefold())
+    suffixes = (
+        "key",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "authorization",
+        "authentication",
+        "authenticate",
+    )
+    return _is_sensitive_signature_name(name) or normalized.endswith(suffixes)
+
+
+def _independent_header_value_redacted(value: object) -> bool:
+    if value == "<REDACTED>" or value is None or isinstance(value, bool):
+        return True
+    if isinstance(value, str):
+        token = resolve_credential_token(value, 0)
+        return bool(
+            token is not None
+            and token[0] > 0
+            and any(
+                _normalize_scheme_candidate(part) in _SCHEME_NAMES
+                for part in value[: token[0]].split()
+            )
+            and _clean_credential_literal(_before_named_parameter(value[token[0] : token[1]]))
+            == REDACTED
+        )
+    if not isinstance(value, list):
+        return False
+    first = (
+        1
+        if value
+        and isinstance(value[0], str)
+        and _normalize_scheme_candidate(value[0]) in _SCHEME_NAMES
+        else 0
+    )
+    return all(item in ("<REDACTED>", None, True, False) for item in value[first:])
 
 
 def _is_hotkey_signature_context(text: str, start: int) -> bool:
@@ -648,6 +728,11 @@ def _is_hotkey_signature_context(text: str, start: int) -> bool:
 
 def _unwrap_signature_value(value: str) -> str:
     value = value.strip()
+    if value.startswith((r"\"", r"\'")):
+        escaped_marker = value[:2]
+        escaped_end = value.find(escaped_marker, 2)
+        if escaped_end >= 0:
+            return value[2:escaped_end]
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'`":
         return value[1:-1]
     for opening, closing in (("\u201c", "\u201d"), ("\u2018", "\u2019")):

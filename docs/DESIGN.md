@@ -108,7 +108,7 @@ diagnostic line. Maintain a versioned field/path rule list and fixtures taken fr
 synthetic OBS data; never commit Rin's real configuration or log samples.
 For cross-file literal scans, first redact every collected file and gather eligible
 credential literals, then scrub and verify every staged file before promotion. The
-redaction rules are versioned (currently version 24). Free-text assignments, URL query
+redaction rules are versioned (currently version 25). Free-text assignments, URL query
 and fragment values, CLI arguments, and next-line credentials are promoted only when
 they look like key material (at least eight characters and containing a digit or
 non-letter). Authorization and Proxy-Authorization credential tokens after a
@@ -116,7 +116,8 @@ recognized scheme, explicit JSON/INI credential fields, URL userinfo passwords, 
 recognized webhook/widget path tokens are promoted without that heuristic. Cookie and
 Set-Cookie headers are redacted as a whole, including quoted headers preceded by an
 opening parenthesis or bracket. Cookie pair values are promoted only when
-the value passes the key-material heuristic or is not a plain word; credential-like
+the value passes the key-material heuristic and does not have a benign version, locale,
+time-zone/path, date/time, boolean, number, or hostname shape; credential-like
 cookie names do not bypass that gate.
 Standard cookie attributes such as Domain, Path, Expires, Max-Age, SameSite, Secure,
 HttpOnly, Priority, and Partitioned are never promoted. Bare Authorization or Cookie
@@ -188,9 +189,9 @@ delimiters. Authorization assignments accept quoted names and values, preserve k
 scheme words, and redact the resolved credential token, including credentials after
 multiple schemes and credentials on indented continuation lines.
 Cross-file scrubbing covers raw, percent-encoded, JSON `\\u`, and `\\x` escaped
-forms of known literals in every file. RTMP harvesting considers only the final
-path segment, excludes resolution and quality tokens, and accepts segments of at
-least 16 characters, mixed alphanumeric segments, or hex-letter segments of at
+forms of known literals in every file. RTMP harvesting examines eligible stream-key
+segments in the path, excludes resolution and quality tokens, and accepts segments of
+at least 16 characters, mixed alphanumeric segments, or hex-letter segments of at
 least eight characters. Mixed case alone does not qualify. Weak-source literals
 from RTMP paths and generic camelCase `*Key` fields match case-sensitively; literals
 from explicit credential fields remain case-insensitive. In-place URL redaction
@@ -211,6 +212,23 @@ source. Strong literals match case-insensitively; literals found only in weak so
 remain case-sensitive. Redact Discord webhook token segments after the numeric ID on
 `discord.com` and `discordapp.com`, plus the final token segment on
 `hooks.slack.com/services`, while retaining the host, path prefix, and webhook ID.
+Sensitive URL fragment parameter values and StreamElements, Discord, and Slack widget
+tokens are harvested for cross-file scrubbing, along with existing Streamlabs tokens.
+Escaped quoted JSON values in logs are unwrapped consistently by redaction and
+verification.
+
+Header arrays represented as name/value objects redact and harvest the sibling value
+when the name is sensitive; unrelated pairs remain untouched. Pair aliases are matched
+without regard to case: name-like fields include name, header, headerName, field,
+label, k, id, and param; value-like fields include value, val, v, headerValue, content,
+data, text, and string. Two-element name/value arrays are also supported. Header names
+use header-specific suffix rules, so X-Api-Key is sensitive without changing generic
+JSON classification of SortKey. String lists are redacted element-wise while retaining
+a recognized leading scheme word. The exact generic JSON/INI field names pass, oauth,
+bearer, and auth are sensitive; broader names such as session, pin, code, and signature
+are not. Derived candidates reject parameter-name identifiers and benign-shaped values;
+percent-encoded byte escapes are separators, and only value sides of name=value
+components are considered.
 
 For serialized JSON, verification is structural: inspect sensitive keys and scan
 decoded string values, never property names. For INI, classify assignments by key
@@ -218,6 +236,13 @@ and parse JSON-valued assignments before checking decoded values, never section 
 or keys. Keep independent raw-text verification for logs and generated reports.
 Reject excessively nested JSON and text lines above the safe scan limit rather than
 risking an incomplete scan.
+
+Known limits: only labeled secrets are found. Unlabeled copies are scrubbed only when
+the value was harvested from a recognized source. Ordinary words can be blanked when a
+logged cookie or form body resembles credential material. Some files may be omitted
+with a warning when they contain unusually long credentials or escaped JSON that cannot
+be safely verified. The path, encoding, nesting, and size limits described above also
+apply.
 
 Free-text credential assignments redact the full non-whitespace token. URL query
 redaction preserves a following named parameter such as `&region=us` while absorbing

@@ -17,11 +17,13 @@ from tempesttrace.redaction import (
     _COOKIE_HEADER,
     _OBS_KEY_NAMES,
     RULE_VERSION,
+    _compiled_local_literals,
     _credential_literal_candidates,
     _embedded_secrets,
     _free_text_credential_spans,
     _is_sensitive_key,
     _json_fragments,
+    _redact_escaped_json,
     _scrub_text,
     _strong_embedded_secrets,
     has_unredacted_embedded_json,
@@ -591,7 +593,8 @@ def test_false_positive_fields_and_single_segment_url_are_preserved(tmp_path: Pa
     path.write_text(json.dumps(original), encoding="utf-8")
     redact_file(path)
     assert json.loads(path.read_text(encoding="utf-8")) == original
-    assert not _is_sensitive_key("auth") and not _is_sensitive_key("pass")
+    assert _is_sensitive_key("auth") and _is_sensitive_key("pass")
+    assert not _is_sensitive_key("authors") and not _is_sensitive_key("passes")
     assert not _is_sensitive_key("signature")
 
 
@@ -654,7 +657,158 @@ def backup_secret_scan(path: Path) -> bool:
 
 
 def test_rule_version_is_twenty_four() -> None:
-    assert RULE_VERSION == 24
+    assert RULE_VERSION == 25
+
+
+@pytest.mark.parametrize(
+    "header",
+    ["X-Api-Key", "X-Goog-Api-Key", "X-Auth-Key", "Ocp-Apim-Subscription-Key", "X-Stream-Key"],
+)
+def test_header_name_value_pairs_redact_independently(tmp_path: Path, header: str) -> None:
+    path = tmp_path / "scene.json"
+    path.write_text(
+        json.dumps({"headers": [{"name": header, "value": "s3cret99xxK"}]}), encoding="ascii"
+    )
+    redact_file(path)
+    assert json.loads(path.read_text(encoding="ascii"))["headers"][0]["value"] == "<REDACTED>"
+
+
+@pytest.mark.parametrize(
+    "pair",
+    [
+        {"Name": "Authorization", "Value": "Bearer Secret99xx"},
+        {"header": "X-Api-Key", "value": "Secret99xx"},
+        {"headerName": "X-Auth-Key", "headerValue": "Secret99xx"},
+        {"k": "Authorization", "v": "Bearer Secret99xx"},
+        {"id": "api_key", "value": "Secret99xx"},
+        {"param": "token", "value": "Secret99xx"},
+        {"name": "Authorization", "text": "Bearer Secret99xx"},
+        {"name": "Authorization", "string": "Bearer Secret99xx"},
+        {"name": "Authorization", "value": ["Bearer", "Secret99xx"]},
+    ],
+)
+def test_header_pair_alias_shapes_redact(tmp_path: Path, pair: dict) -> None:
+    path = tmp_path / "scene.json"
+    path.write_text(json.dumps({"headers": [pair]}), encoding="ascii")
+    redact_file(path)
+    assert "Secret99xx" not in path.read_text(encoding="ascii")
+
+
+def test_header_tuple_array_and_benign_pair_behavior(tmp_path: Path) -> None:
+    path = tmp_path / "scene.json"
+    original = {
+        "headers": [
+            ["Authorization", "Bearer Secret99xx"],
+            {"name": "title", "value": "x"},
+        ]
+    }
+    path.write_text(json.dumps(original), encoding="ascii")
+    redact_file(path)
+    result = json.loads(path.read_text(encoding="ascii"))
+    assert result["headers"][0] == ["Authorization", "Bearer <REDACTED>"]
+    assert result["headers"][1] == {"name": "title", "value": "x"}
+
+
+@pytest.mark.parametrize("name", ["pass", "oauth", "bearer", "auth"])
+def test_additional_exact_sensitive_names(name: str) -> None:
+    assert has_unredacted_fields({name: "tok"})
+
+
+def test_extra_sensitive_names_keep_boolean_null_and_similar_words(tmp_path: Path) -> None:
+    original = {
+        "use_auth": True,
+        "auth": False,
+        "authors": ["Rin"],
+        "passes": 3,
+        "code": "abc",
+    }
+    path = tmp_path / "fixture.json"
+    path.write_text(json.dumps(original), encoding="ascii")
+    redact_file(path)
+    assert json.loads(path.read_text(encoding="ascii")) == original
+
+
+def test_parameter_names_and_benign_cookie_values_are_not_harvested() -> None:
+    candidates = _credential_literal_candidates(
+        "s3cret99xxK&expires_in=3600&token_type=bearer&scope=chat%3Aread"
+    )
+    assert "s3cret99xxK" in candidates
+    assert not {"expires_in", "token_type", "bearer", "chat", "read"} & candidates
+    cookie = "Cookie: lang=en-US; tz=America/Los_Angeles; obs_version=30.2.3; theme=dark\n"
+    assert "en-US" not in _embedded_secrets(cookie)
+
+
+def test_form_parameters_are_not_derived_as_credentials(tmp_path: Path) -> None:
+    path = tmp_path / "scene.json"
+    secret = "s3cret99xxK"
+    body = f"access_token={secret}&expires_in=14400&token_type=bearer&scope=chat%3Aread"
+    path.write_text(
+        json.dumps({"text": body, "url": "https://example.test/authorize?scope=chat%3Aread"}),
+        encoding="ascii",
+    )
+    redact_file(path)
+    result = json.loads(path.read_text(encoding="ascii"))
+    assert secret not in result["text"]
+    assert "expires_in=14400&token_type=bearer&scope=chat%3Aread" in result["text"]
+    assert result["url"] == "https://example.test/authorize?scope=chat%3Aread"
+
+
+def test_long_literal_trie_compiles_without_recursion() -> None:
+    pattern = _compiled_local_literals(("A" * 4000,), ())
+    assert pattern is not None and pattern.search(" " + "A" * 4000 + " ")
+
+
+def test_long_literal_compilation_scales_across_credential_lengths() -> None:
+    for size in (1000, 4000, 20000):
+        literal = "S3cret" + "x" * size
+        _compiled_local_literals.cache_clear()
+        assert _compiled_local_literals((literal,), ()) is not None
+
+    def compile_size(size: int) -> None:
+        _compiled_local_literals.cache_clear()
+        assert _compiled_local_literals(("S3cret" + "x" * size,), ()) is not None
+
+    small = min(
+        _minimum_runtime(lambda: compile_size(1000)), _minimum_runtime(lambda: compile_size(1000))
+    )
+    large = min(
+        _minimum_runtime(lambda: compile_size(2000)), _minimum_runtime(lambda: compile_size(2000))
+    )
+    if large / max(small, 0.001) >= 3.2:
+        _compiled_local_literals.cache_clear()
+        started = time.perf_counter()
+        compile_size(2000)
+        retry = time.perf_counter() - started
+        large = min(large, retry)
+    assert large / max(small, 0.001) < 3.2
+    assert large < max(8 * small, 10.0)
+
+
+def test_escaped_json_credential_is_harvested() -> None:
+    assert "s3cret99xxK" in _embedded_secrets('Console: "{\\"token\\":\\"s3cret99xxK\\"}"')
+
+
+def test_escaped_json_scan_skips_plain_json_logs(monkeypatch: pytest.MonkeyPatch) -> None:
+    text = '{"name":"Mic","volume":1,"mute":false}' * 1000
+
+    def fail_if_scanned(_text: str) -> None:
+        raise AssertionError("plain JSON text should bypass escaped-JSON parsing")
+
+    monkeypatch.setattr("tempesttrace.redaction._json_fragments", fail_if_scanned)
+    assert _redact_escaped_json(text, {}, set()) == text
+
+
+@pytest.mark.parametrize(
+    "url,token",
+    [
+        ("https://example.test/#access_token=FragmentSecret99", "FragmentSecret99"),
+        ("https://streamelements.com/overlay/room/WidgetSecret99", "WidgetSecret99"),
+        ("https://discord.com/api/webhooks/123456789012345678/DiscordSecret99", "DiscordSecret99"),
+        ("https://hooks.slack.com/services/T12345678/B12345678/SlackSecret99", "SlackSecret99"),
+    ],
+)
+def test_non_query_url_credentials_are_harvested(url: str, token: str) -> None:
+    assert token in _embedded_secrets(url)
 
 
 @pytest.mark.parametrize(
@@ -674,7 +828,10 @@ def test_rule_version_is_twenty_four() -> None:
 def test_separator_segments_harvest_only_key_like_secret(value: str) -> None:
     candidates = _credential_literal_candidates(value)
     assert value in candidates
-    assert "s3cret99xxK" in candidates
+    if value == "s3cret99xxK=extra":
+        assert "s3cret99xxK" not in candidates
+    else:
+        assert "s3cret99xxK" in candidates
     assert "extra=1" not in candidates
     assert "live" not in candidates
     assert "region=us" not in candidates

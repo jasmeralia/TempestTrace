@@ -9,7 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-RULE_VERSION = 24
+RULE_VERSION = 25
 REDACTED = "<REDACTED>"
 _QUOTE_DELIMITER = (
     r"(?:\\*['\"]|`|&(?:quot|apos|ldquo|rdquo|lsquo|rsquo);|"
@@ -238,24 +238,108 @@ def _is_challenge_realm_match(match: re.Match[str]) -> bool:
 
 def _header_pair_keys(value: dict[str, Any]) -> tuple[str, str] | None:
     """Return name/value member keys for a credential header pair object."""
+    aliases = {"value", "val", "v", "headervalue", "content", "data", "text", "string"}
     value_key = next(
-        (key for key in ("value", "val", "content", "data") if isinstance(value.get(key), str)),
+        (
+            key
+            for key, child in value.items()
+            if isinstance(key, str)
+            and key.casefold() in aliases
+            and isinstance(child, (str, list, int, float))
+        ),
         None,
     )
     if value_key is None:
         return None
-    for name_key in ("name", "header", "key", "field", "label"):
-        name = value.get(name_key)
+    name_aliases = {
+        "name",
+        "header",
+        "headername",
+        "key",
+        "field",
+        "label",
+        "k",
+        "id",
+        "param",
+        "parameter",
+    }
+    for name_key, name in value.items():
+        if not isinstance(name_key, str) or name_key.casefold() not in name_aliases:
+            continue
         if not isinstance(name, str):
             continue
-        if name_key == "key" and not re.fullmatch(
-            r"(?i)(?:[A-Za-z][A-Za-z0-9-]*-)?(?:authorization|authentication|www-authenticate|proxy-authenticate|cookie|set-cookie|[A-Za-z0-9_.-]*(?:token|password|secret|key))",
-            name,
+        if name_key.casefold() == "key" and (
+            len(name) > 128 or not re.fullmatch(r"(?i)[A-Za-z][A-Za-z0-9_.-]*", name)
         ):
             continue
-        if _is_sensitive_key(name):
+        if _is_sensitive_header_name(name):
             return name_key, value_key
     return None
+
+
+def _is_sensitive_header_name(name: str) -> bool:
+    normalized = re.sub(r"[-_ ]", "", name.casefold())
+    suffixes = (
+        "key",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "authorization",
+        "authentication",
+        "authenticate",
+    )
+    return (
+        normalized in _CREDENTIAL_NAMES
+        or normalized in {"setcookie", "cookie2", "setcookie2"}
+        or normalized.endswith(suffixes)
+    )
+
+
+def _header_pair_list(value: list[Any]) -> bool:
+    return len(value) == 2 and isinstance(value[0], str) and _is_sensitive_header_name(value[0])
+
+
+def _header_pair_value_redacted(value: Any) -> bool:
+    if value == REDACTED or value is None or isinstance(value, bool):
+        return True
+    if not isinstance(value, list):
+        return False
+    first = (
+        1
+        if value
+        and isinstance(value[0], str)
+        and _normalize_scheme_candidate(value[0]) in _SCHEME_NAMES
+        else 0
+    )
+    return all(item in (REDACTED, None, True, False) for item in value[first:])
+
+
+def _sensitive_field_value_redacted(value: Any) -> bool:
+    if value in (None, "", REDACTED) or isinstance(value, bool):
+        return True
+    if isinstance(value, str):
+        if value.casefold() in {"null", "undefined", "none", "nil", "true", "false"}:
+            return True
+        token = resolve_credential_token(value, 0)
+        if token is not None and token[0] > 0:
+            prefix = value[: token[0]]
+            if any(_scheme_word(part) for part in re.findall(r"[^\s]+", prefix)):
+                return (
+                    _clean_credential_literal(_before_named_parameter(value[token[0] : token[1]]))
+                    == REDACTED
+                )
+    return False
+
+
+def _before_named_parameter(value: str) -> str:
+    match = re.search(r"&[A-Za-z][A-Za-z0-9_-]{1,79}[=:]", value)
+    if match is None:
+        return value
+    name = match.group(0)[1:-1].rstrip("=").casefold()
+    if name not in {"expires_in", "token_type", "scope", "region", "state", "expires"}:
+        return value
+    return value[: match.start()]
 
 
 def _cookie_pair_promotable(name: str, value: str) -> bool:
@@ -274,7 +358,8 @@ def _cookie_pair_promotable(name: str, value: str) -> bool:
     del name
     return any(
         not _never_promote_literal(literal)
-        and (_looks_like_key_material(literal) or not literal.isalpha())
+        and not _is_benign_shape(literal)
+        and _looks_like_key_material(literal)
         for literal in _credential_literal_candidates(value)
     )
 
@@ -420,9 +505,9 @@ def _clean_credential_literal(token: str) -> str:
         char in ".,;:)]" for char in unquoted[len(REDACTED) :]
     ):
         return REDACTED
-    if not unquoted or (unquoted[0] not in "([{<\"'`" and unquoted[-1] not in ".,;:)]}>!?\"'`"):
+    if not unquoted or (unquoted[0] not in "\\([{<\"'`" and unquoted[-1] not in "\\.,;:)]}>!?\"'`"):
         return unquoted
-    return unquoted.lstrip("([{<\"'`").rstrip(".,;:)]}>!?\"'`")
+    return unquoted.lstrip("\\([{<\"'`").rstrip("\\.,;:)]}>!?\"'`")
 
 
 @lru_cache(maxsize=4096)
@@ -434,19 +519,21 @@ def _credential_literal_candidates(token: str) -> set[str]:
     candidates = {cleaned}
     if not _CREDENTIAL_COMPONENT_SEPARATOR_RE.search(cleaned) and "=" not in cleaned:
         return candidates
-    split = _CREDENTIAL_COMPONENT_SEPARATOR_RE.split(cleaned)
+    split = _CREDENTIAL_COMPONENT_SEPARATOR_RE.split(re.sub(r"%[0-9a-fA-F]{2}", "&", cleaned))
     for part in split:
         component = _clean_credential_literal(part)
         components = [component]
         if "=" in component:
-            left, *right = component.split("=")
-            components = [left, *right]
+            _left, *right = component.split("=")
+            components = right
         for component_candidate in components:
             candidate = _clean_credential_literal(component_candidate)
             if (
                 len(candidate) >= 4
                 and _looks_like_key_material(candidate)
                 and not _is_hostname_or_module_like(candidate)
+                and not _is_benign_shape(candidate)
+                and not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*([_-][A-Za-z0-9]+)+", candidate)
             ):
                 candidates.add(candidate)
                 if len(candidates) >= 8:
@@ -454,6 +541,18 @@ def _credential_literal_candidates(token: str) -> set[str]:
         if len(candidates) >= 8:
             break
     return candidates
+
+
+def _is_benign_shape(value: str) -> bool:
+    return bool(
+        re.fullmatch(r"\d+(?:\.\d+)+(?:[-+][\w.]+)?", value)
+        or re.fullmatch(r"[a-z]{2,3}(?:[-_][A-Za-z]{2,4})?", value, re.I)
+        or re.fullmatch(r"[A-Za-z]+(?:/[A-Za-z_+-]+)+", value)
+        or re.fullmatch(r"\d{1,7}", value)
+        or re.fullmatch(r"\d{4}-\d\d-\d\d(?:[T ][\d:.+-]+Z?)?", value)
+        or value.casefold() in {"true", "false", "null", "none", "undefined"}
+        or _is_hostname_or_module_like(value)
+    )
 
 
 def _continuation_literal_is_promotable(text: str, start: int, end: int) -> bool:
@@ -1341,7 +1440,15 @@ def _is_sensitive_key(key: str, context: tuple[str, ...] = (), value: Any = None
         if context and context[-1] == "__obsbasic_hotkey_binding__":
             return not _hotkey_key_exempt(key, context, value)
         return not _hotkey_key_exempt(key, context, value)
-    if normalized in _CREDENTIAL_NAMES or normalized in {"setcookie", "setcookie2", "cookie2"}:
+    if normalized in _CREDENTIAL_NAMES or normalized in {
+        "setcookie",
+        "setcookie2",
+        "cookie2",
+        "pass",
+        "oauth",
+        "bearer",
+        "auth",
+    }:
         return True
     if normalized in {
         "authorization",
@@ -1681,7 +1788,8 @@ def _authorization_has_scheme(match: re.Match[str]) -> bool:
         return False
     prefix = match.string[match.start(2) : token[0]]
     return any(_scheme_word(part) for part in re.findall(r"[^\s]+", prefix)) and (
-        _clean_credential_literal(match.string[token[0] : token[1]]) == REDACTED
+        _clean_credential_literal(_before_named_parameter(match.string[token[0] : token[1]]))
+        == REDACTED
     )
 
 
@@ -1700,7 +1808,7 @@ def _scheme_prefixed_value_is_redacted(match: re.Match[str]) -> bool:
     if token is None or token[0] == match.start(2):
         return False
     start, end = token
-    return _clean_credential_literal(match.string[start:end]) == REDACTED
+    return _clean_credential_literal(_before_named_parameter(match.string[start:end])) == REDACTED
 
 
 def _resolved_value_has_scheme(match: re.Match[str]) -> bool:
@@ -1742,7 +1850,8 @@ def _redact_authorization_remainders(  # noqa: PLR0912, PLR0915
                     any(_scheme_word(part) for part in re.findall(r"[^\s]+", prefix))
                     and _clean_credential_literal(text[token_start:token_end]) == REDACTED
                 ):
-                    if token_start < line_end:
+                    tail = text[token_end:line_end]
+                    if tail.strip(" \t\"'`)}],.;"):
                         replacements.append((token_end, line_end, ""))
                     covered_end = line_end
                     continue
@@ -1973,6 +2082,7 @@ def _free_text_credential_spans(  # noqa: PLR0912
             has_cookie_pairs = cookie and _COOKIE_PAIR.match(cookie_value) is not None
             if token is not None and not has_cookie_pairs:
                 start, end = token
+                end = start + len(_before_named_parameter(text[start:end]))
                 raw = text[start:end]
                 literal = _clean_credential_literal(raw)
                 if literal and literal != REDACTED:
@@ -2014,7 +2124,7 @@ def _redact_free_text_credential_spans(text: str, counts: dict[str, int]) -> str
     replacements: list[tuple[int, int, str]] = []
     for start, end, _literal, _explicit_auth in spans:
         if _clean_credential_literal(text[start:end]) != REDACTED:
-            replacements.append((start, end, _quoted_redacted(text[start:end])))
+            replacements.append((start, end, _redact_token_preserving_delimiters(text[start:end])))
     if not replacements:
         return text
     pieces: list[str] = []
@@ -2027,6 +2137,16 @@ def _redact_free_text_credential_spans(text: str, counts: dict[str, int]) -> str
         counts["credential_pattern"] = counts.get("credential_pattern", 0) + 1
     pieces.append(text[cursor:])
     return "".join(pieces)
+
+
+def _redact_token_preserving_delimiters(raw: str) -> str:
+    cleaned = _clean_credential_literal(raw)
+    if cleaned == REDACTED:
+        return raw
+    position = raw.find(cleaned)
+    if position < 0:
+        return _quoted_redacted(raw)
+    return raw[:position] + REDACTED + raw[position + len(cleaned) :]
 
 
 def _embedded_secrets(text: str) -> set[str]:  # noqa: PLR0912
@@ -2070,6 +2190,18 @@ def _embedded_secrets(text: str) -> set[str]:  # noqa: PLR0912
         values.update(
             literal
             for match in _STREAMLABS_WIDGET_TOKEN.finditer(text)
+            for literal in _credential_literal_candidates(match.group(2))
+        )
+    for start, end in _fragment_secret_spans(text):
+        values.update(
+            literal
+            for literal in _credential_literal_candidates(text[start:end])
+            if _promotable_free_text(literal)
+        )
+    for pattern in (_STREAMELEMENTS_TOKEN, _DISCORD_WEBHOOK_TOKEN, _SLACK_WEBHOOK_TOKEN):
+        values.update(
+            literal
+            for match in pattern.finditer(text)
             for literal in _credential_literal_candidates(match.group(2))
         )
     for header in _COOKIE_HEADER.finditer(text):
@@ -2380,6 +2512,9 @@ def _credential_values(value: Any, context: tuple[str, ...] = ()) -> set[str]:
             else:
                 values.update(_credential_values(child, child_context))
     elif isinstance(value, list):
+        if _header_pair_list(value):
+            values.update(_credential_literals(value[1]))
+            return {literal for literal in values if not _never_promote_literal(literal)}
         for child in value:
             values.update(_credential_values(child, context))
     elif isinstance(value, str):
@@ -2424,22 +2559,21 @@ def _compiled_local_literals(
                 node = node.setdefault(character, {})
             node[""] = None
 
-        def render(node: dict[str, Any]) -> str:
-            choices = [
-                re.escape(character) + render(child)
-                for character, child in sorted(
-                    ((key, child) for key, child in node.items() if key),
-                    key=lambda pair: len(pair[1]),
-                    reverse=True,
-                )
-            ]
+        rendered: dict[int, str] = {}
+        stack = [(root, False)]
+        while stack:
+            node, ready = stack.pop()
+            if not ready:
+                stack.append((node, True))
+                stack.extend((child, False) for key, child in node.items() if key)
+                continue
+            choices = [re.escape(key) + rendered[id(child)] for key, child in node.items() if key]
             if "" in node:
                 choices.append("")
-            if len(choices) == 1:
-                return choices[0]
-            return "(?:" + "|".join(choices) + ")"
-
-        return render(root)
+            rendered[id(node)] = (
+                choices[0] if len(choices) == 1 else "(?:" + "|".join(choices) + ")"
+            )
+        return rendered[id(root)]
 
     alternatives: list[str] = []
     for bucket in ("strong_embedded", "weak_embedded", "strong_bounded", "weak_bounded", "numeric"):
@@ -2504,10 +2638,15 @@ def _redact_embedded(  # noqa: PLR0912, PLR0915
             text,
         )
 
+    text, escaped_json = _protect_escaped_json(text, counts, secrets or set())
     text = _redact_free_text_credential_spans(text, counts)
 
     def replace(match: re.Match[str], *, check_noncredential: bool = True) -> str:
-        literal = _unquote(match.group(2))
+        raw_value = match.group(2)
+        trimmed_value = _before_named_parameter(raw_value)
+        trailing_parameters = raw_value[len(trimmed_value) :]
+        raw_value = trimmed_value
+        literal = _unquote(raw_value)
         if _yaml_block_marker(literal):
             return match.group(1) + match.group(2)
         if _resolved_value_has_scheme(match):
@@ -2530,7 +2669,7 @@ def _redact_embedded(  # noqa: PLR0912, PLR0915
         ):
             return match.group(1) + match.group(2)
         counts["credential_pattern"] = counts.get("credential_pattern", 0) + 1
-        return f"{match.group(1)}{_quoted_redacted(match.group(2))}"
+        return f"{match.group(1)}{_quoted_redacted(raw_value)}{trailing_parameters}"
 
     def replace_log(match: re.Match[str], pattern: re.Pattern[str]) -> str:  # noqa: PLR0911
         key = _log_match_key(match)
@@ -2707,10 +2846,69 @@ def _redact_embedded(  # noqa: PLR0912, PLR0915
             text = _sub_overlapping_assignments(text, replace_match)
         else:
             text = _sub_outside_json(text, pattern, replace_match)
+    for marker, fragment in escaped_json.items():
+        text = text.replace(marker, fragment)
     return text
 
 
-def _redact_object(
+def _redact_escaped_json(text: str, counts: dict[str, int], secrets: set[str]) -> str:
+    """Redact JSON objects whose property quotes are escaped in a log string."""
+    if r"\"" not in text:
+        return text
+    pattern = re.compile(r"\{(?:\\.|[^{}])*\}")
+    valid_json_spans = [(start, end) for start, end, _value, _context in _json_fragments(text)]
+    pieces: list[str] = []
+    cursor = 0
+    for match in pattern.finditer(text):
+        if any(start <= match.start() < end for start, end in valid_json_spans):
+            continue
+        raw = match.group(0)
+        if r"\"" not in raw:
+            continue
+        try:
+            value = json.loads(raw.replace(r"\"", '"'))
+        except json.JSONDecodeError, RecursionError, MemoryError:
+            continue
+        before = sum(counts.values())
+        clean = _redact_object(value, counts, secrets)
+        if sum(counts.values()) == before:
+            continue
+        encoded = json.dumps(clean, ensure_ascii=False, separators=(",", ":")).replace('"', r"\"")
+        pieces.extend((text[cursor : match.start()], encoded))
+        cursor = match.end()
+    if not pieces:
+        return text
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
+def _protect_escaped_json(
+    text: str, counts: dict[str, int], secrets: set[str]
+) -> tuple[str, dict[str, str]]:
+    if r"\"" not in text:
+        return text, {}
+    pattern = re.compile(r"\{(?:\\.|[^{}])*\}")
+    valid_json_spans = [(start, end) for start, end, _value, _context in _json_fragments(text)]
+    pieces: list[str] = []
+    protected: dict[str, str] = {}
+    cursor = 0
+    for index, match in enumerate(pattern.finditer(text)):
+        if any(start <= match.start() < end for start, end in valid_json_spans):
+            continue
+        if r"\"" not in match.group(0):
+            continue
+        redacted = _redact_escaped_json(match.group(0), counts, secrets)
+        marker = f"\x00ESCAPED_JSON_{index}\x00"
+        pieces.extend((text[cursor : match.start()], marker))
+        protected[marker] = redacted
+        cursor = match.end()
+    if not protected:
+        return text, protected
+    pieces.append(text[cursor:])
+    return "".join(pieces), protected
+
+
+def _redact_object(  # noqa: PLR0911, PLR0912
     value: Any,
     counts: dict[str, int],
     secrets: set[str],
@@ -2721,7 +2919,23 @@ def _redact_object(
         pair = _header_pair_keys(value)
         for key, child in value.items():
             if pair is not None and key == pair[1]:
-                result[key] = REDACTED
+                if isinstance(child, list):
+                    items = list(child)
+                    first = (
+                        1
+                        if items
+                        and isinstance(items[0], str)
+                        and _normalize_scheme_candidate(items[0]) in _SCHEME_NAMES
+                        else 0
+                    )
+                    for index in range(first, len(items)):
+                        if isinstance(items[index], (str, int, float)) and not isinstance(
+                            items[index], bool
+                        ):
+                            items[index] = REDACTED
+                    result[key] = items
+                else:
+                    result[key] = REDACTED
                 counts["credential_field"] = counts.get("credential_field", 0) + 1
                 continue
             if pair is not None and key == pair[0]:
@@ -2744,6 +2958,32 @@ def _redact_object(
                 result[key] = _redact_object(child, counts, secrets, child_context)
         return result
     if isinstance(value, list):
+        if _header_pair_list(value):
+            name, child = value
+            if isinstance(child, list):
+                items = list(child)
+                first = (
+                    1
+                    if items
+                    and isinstance(items[0], str)
+                    and _normalize_scheme_candidate(items[0]) in _SCHEME_NAMES
+                    else 0
+                )
+                for index in range(first, len(items)):
+                    if not isinstance(items[index], (bool, type(None), dict, list)):
+                        items[index] = REDACTED
+                return [name, items]
+            if isinstance(child, str):
+                token = resolve_credential_token(child, 0)
+                if token is not None and any(
+                    _scheme_word(part) for part in re.findall(r"[^\s]+", child[: token[0]])
+                ):
+                    child = child[: token[0]] + REDACTED + child[token[1] :]
+                else:
+                    child = REDACTED
+            elif not isinstance(child, (bool, type(None), dict, list)):
+                child = REDACTED
+            return [name, child]
         return [_redact_object(child, counts, secrets, context) for child in value]
     if isinstance(value, str):
         if value in secrets:
@@ -2757,11 +2997,11 @@ def _redact_object(
     return value
 
 
-def has_unredacted_fields(value: Any, context: tuple[str, ...] = ()) -> bool:
+def has_unredacted_fields(value: Any, context: tuple[str, ...] = ()) -> bool:  # noqa: PLR0911
     """Check parsed JSON for recognized credential keys with remaining values."""
     if isinstance(value, dict):
         pair = _header_pair_keys(value)
-        if pair is not None and value[pair[1]] != REDACTED:
+        if pair is not None and not _header_pair_value_redacted(value[pair[1]]):
             return True
         for key, child in value.items():
             if pair is not None and key == pair[0]:
@@ -2769,28 +3009,28 @@ def has_unredacted_fields(value: Any, context: tuple[str, ...] = ()) -> bool:
             if (
                 isinstance(key, str)
                 and _is_sensitive_key(key, context, child)
-                and child not in (None, "", REDACTED)
-                and not isinstance(child, bool)
-                and not (
-                    isinstance(child, str)
-                    and child.casefold() in {"null", "undefined", "none", "nil", "true", "false"}
-                )
+                and not _sensitive_field_value_redacted(child)
             ):
                 return True
             child_context = context + ((key,) if isinstance(key, str) else ())
             if has_unredacted_fields(child, child_context):
                 return True
     elif isinstance(value, list):
+        if _header_pair_list(value) and not _sensitive_field_value_redacted(value[1]):
+            return True
         return any(has_unredacted_fields(child, context) for child in value)
     elif isinstance(value, str):
         return has_unredacted_embedded_json(value)
     return False
 
 
-def has_unredacted_embedded_json(text: str) -> bool:  # noqa: PLR0911
+def has_unredacted_embedded_json(text: str) -> bool:  # noqa: PLR0911, PLR0912
     """Check JSON-like credential assignments embedded in other text."""
     if _is_repeated_redacted_key_log(text) or _is_repeated_redacted_quoted_key_log(text):
         return False
+    if _redact_escaped_json(text, {}, set()) != text:
+        return True
+    text, _escaped_json = _protect_escaped_json(text, {}, set())
     if any(has_unredacted_fields(value, context) for _, _, value, context in _json_fragments(text)):
         return True
     if _rtmp_segment_spans(text):
@@ -2835,7 +3075,7 @@ def has_unredacted_embedded_json(text: str) -> bool:  # noqa: PLR0911
                     in {"wwwauthenticate", "proxyauthenticate"}
                     and _scheme_word(_unquote(match.group(2)))
                 )
-                and _unquote(match.group(2)) != REDACTED
+                and _unquote(_before_named_parameter(match.group(2))) != REDACTED
                 and not (
                     _yaml_block_marker(_unquote(match.group(2)))
                     and resolve_credential_token(match.string, match.start(2)) is None

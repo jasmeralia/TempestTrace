@@ -178,9 +178,11 @@ def test_worker_stopped_handles_disappearing_destination(tmp_path: Path, monkeyp
 
 
 def test_smoke_test_mode_opens_window_without_network_updates(monkeypatch) -> None:
-    app = cast(QApplication, QApplication.instance() or QApplication([]))
-    existing_windows = {id(window) for window in app.topLevelWidgets()}
+    cast(QApplication, QApplication.instance() or QApplication([]))
     lifecycle: list[str] = []
+    # Keep strong references to the windows main() shows. Scanning topLevelWidgets() by id() was
+    # fragile: it depended on garbage collection and on widgets left over from earlier tests.
+    created_windows: list[MainWindow] = []
     monkeypatch.setattr("tempesttrace.ui.discover_obs", lambda: [])
     monkeypatch.setattr("tempesttrace.ui.discover_dropbox", lambda: None)
     original_show = MainWindow.show
@@ -189,6 +191,7 @@ def test_smoke_test_mode_opens_window_without_network_updates(monkeypatch) -> No
 
     def record_show(window: MainWindow) -> None:
         lifecycle.append("show")
+        created_windows.append(window)
         original_show(window)
 
     def record_close(window: MainWindow) -> bool:
@@ -212,11 +215,6 @@ def test_smoke_test_mode_opens_window_without_network_updates(monkeypatch) -> No
 
     assert main() == 0
 
-    created_windows = [
-        window
-        for window in app.topLevelWidgets()
-        if isinstance(window, MainWindow) and id(window) not in existing_windows
-    ]
     assert len(created_windows) == 1
     assert not created_windows[0].isVisible()
     assert not created_windows[0].updates_enabled

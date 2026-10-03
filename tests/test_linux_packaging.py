@@ -139,3 +139,11 @@ def test_appimage_smoke_installs_host_graphics_after_deb_smoke() -> None:
     )
 
     assert deb_install < graphics_install < appimage_smoke
+
+
+def test_flatpak_prefers_runtime_libxkbcommon_over_bundled_copy() -> None:
+    """The PyInstaller-bundled libxkbcommon segfaults in Qt's XCB key handling in the sandbox."""
+    script = Path("packaging/linux/build-packages.sh").read_text(encoding="utf-8")
+    finish = script[script.index("flatpak build-finish") : script.index("flatpak build-export")]
+
+    assert "--env=LD_PRELOAD=/usr/lib/${flatpak_arch}-linux-gnu/libxkbcommon.so.0" in finish

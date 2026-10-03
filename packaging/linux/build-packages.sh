@@ -140,7 +140,10 @@ build_flatpak() {
     install -D -m 0644 "$app/usr/share/icons/hicolor/256x256/apps/io.github.jasmeralia.TempestTrace.png" \
         "$dir/files/share/icons/hicolor/256x256/apps/io.github.jasmeralia.TempestTrace.png"
     # Keep OBS/config files read-only and limit writes to the default Dropbox destination.
+    # The PyInstaller-bundled libxkbcommon segfaults in Qt's XCB key handling; use the pinned
+    # runtime's copy for this Flatpak only.
     flatpak build-finish --command=tempesttrace --socket=wayland --socket=fallback-x11 \
+        --env=LD_PRELOAD=/usr/lib/${flatpak_arch}-linux-gnu/libxkbcommon.so.0 \
         --share=ipc --share=network --device=dri --filesystem=home:ro \
         --filesystem=xdg-config/obs-studio:ro \
         --filesystem='~/.var/app/com.obsproject.Studio/config/obs-studio:ro' \

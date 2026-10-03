@@ -35,7 +35,10 @@ dependencies, including EGL and OpenGL. Their Wayland libraries are recommended
 because the CI smoke tests use X11 and offscreen Qt. The strict Snap stages its Qt
 graphics and Wayland support libraries; its `opengl` plug grants GPU access but does
 not supply `libEGL.so.1` or `libGL.so.1` by itself. The Flatpak uses the pinned
-Freedesktop 26.08 runtime, which supplies those libraries. Fedora 42 is the RPM
+Freedesktop 26.08 runtime, which supplies those libraries. It also preloads that
+runtime's `libxkbcommon.so.0` (via `LD_PRELOAD` in the Flatpak metadata) because the
+copy PyInstaller bundles crashes Qt's XCB keyboard handling inside the sandbox; other
+formats keep the bundled copy. Fedora 42 is the RPM
 install smoke-test container. Release notes identify Windows 10/11 x64, Ubuntu
 24.04 amd64/arm64, the glibc floor for DEB/RPM/AppImage, and Fedora 42 RPM smoke
 coverage. Flatpak and Snap are sideloaded without a configured remote or store channel.

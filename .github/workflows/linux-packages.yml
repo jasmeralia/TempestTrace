@@ -98,6 +98,14 @@ jobs:
           echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
       - name: Build Linux packages
         run: packaging/linux/build-packages.sh dist/linux
+      - name: Preserve Flatpak for manual crash investigation
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v7
+        with:
+          name: flatpak-debug-${{ matrix.arch }}
+          path: dist/linux/*.flatpak
+          if-no-files-found: error
+          retention-days: 1
       - name: Smoke-test DEB install and uninstall
         run: |
           package=$(find dist/linux -maxdepth 1 -name '*.deb' -print -quit)
@@ -169,6 +177,7 @@ jobs:
                   test -w "$HOME/Dropbox" && echo "Dropbox writable in sandbox"
                 '\''
                 flatpak run --user --command=tempesttrace --env=QT_QPA_PLATFORM=xcb \
+                  --env=PYTHONFAULTHANDLER=1 \
                   io.github.jasmeralia.TempestTrace >"$RUNNER_TEMP/tempesttrace-flatpak.log" 2>&1 &
                 app_pid=$!
                 trap "kill \$app_pid 2>/dev/null || true" EXIT

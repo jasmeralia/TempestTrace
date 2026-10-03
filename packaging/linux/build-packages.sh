@@ -128,8 +128,7 @@ build_flatpak() {
     local dir=$work/flatpak-build
     local repo=$work/flatpak-repo
     flatpak build-init --arch="$flatpak_arch" "$dir" \
-        io.github.jasmeralia.TempestTrace org.freedesktop.Platform 26.08 \
-        org.freedesktop.Sdk 26.08
+        io.github.jasmeralia.TempestTrace org.freedesktop.Sdk org.freedesktop.Platform 26.08
     install -D -m 0755 "$app/usr/bin/tempesttrace" "$dir/files/bin/tempesttrace"
     install -D -m 0644 "$app/usr/share/applications/io.github.jasmeralia.TempestTrace.desktop" \
         "$dir/files/share/applications/io.github.jasmeralia.TempestTrace.desktop"

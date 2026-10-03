@@ -86,3 +86,27 @@ def test_release_workflow_includes_supported_platform_notes() -> None:
         "sideloaded",
     ):
         assert note in workflow
+
+
+def test_flatpak_build_init_uses_documented_argument_order() -> None:
+    """`flatpak build-init DIRECTORY APPNAME SDK RUNTIME [BRANCH]` takes one branch, not two."""
+    script = Path("packaging/linux/build-packages.sh").read_text(encoding="utf-8")
+    start = script.index("flatpak build-init")
+    command = script[start : script.index("\n    install", start)].replace("\\\n", " ")
+    tokens = command.split()
+    positionals = [token for token in tokens[2:] if not token.startswith("--")]
+
+    assert positionals == [
+        '"$dir"',
+        "io.github.jasmeralia.TempestTrace",
+        "org.freedesktop.Sdk",
+        "org.freedesktop.Platform",
+        "26.08",
+    ]
+
+
+def test_linux_package_workflow_can_be_dispatched_for_manual_validation() -> None:
+    workflow = Path(".github/workflows/linux-packages.yml").read_text(encoding="utf-8")
+
+    assert "workflow_dispatch:" in workflow
+    assert "workflow_call:" in workflow

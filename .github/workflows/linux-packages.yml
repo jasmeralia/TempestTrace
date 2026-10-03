@@ -7,6 +7,14 @@ on:
         description: Shared release version tag, such as v0.1.12
         required: false
         type: string
+  # Manual validation of the full Linux package matrix without merging or tagging. Leave
+  # app_version empty to build a 0.0.0+<sha> development version from the selected ref.
+  workflow_dispatch:
+    inputs:
+      app_version:
+        description: Optional release tag to build, such as v0.1.12 (empty builds the selected ref)
+        required: false
+        type: string
 permissions:
   contents: read
 

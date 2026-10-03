@@ -159,6 +159,15 @@ jobs:
             local expected_archives=$1
             FLATPAK_TEST_OUTPUT="$output" FLATPAK_TEST_EXPECTED="$expected_archives" \
               xvfb-run -a bash -euc '
+                flatpak run --user --command=/bin/sh io.github.jasmeralia.TempestTrace -c '\''
+                  printf "Flatpak HOME=%s XDG_CONFIG_HOME=%s\n" "$HOME" "$XDG_CONFIG_HOME"
+                  for path in "$HOME/.config/obs-studio" \
+                    "$HOME/.var/app/com.obsproject.Studio/config/obs-studio" \
+                    "$HOME/.dropbox/info.json" "$HOME/Dropbox"; do
+                    if test -e "$path"; then echo "visible: $path"; else echo "missing: $path"; fi
+                  done
+                  test -w "$HOME/Dropbox" && echo "Dropbox writable in sandbox"
+                '\''
                 flatpak run --user --command=tempesttrace --env=QT_QPA_PLATFORM=xcb \
                   io.github.jasmeralia.TempestTrace >"$RUNNER_TEMP/tempesttrace-flatpak.log" 2>&1 &
                 app_pid=$!
@@ -179,6 +188,12 @@ jobs:
                   [[ "$archive_count" -ge "$FLATPAK_TEST_EXPECTED" ]] && exit 0
                   sleep 1
                 done
+                echo "Flatpak backup timed out; visible windows:"
+                while read -r id; do
+                  xdotool getwindowname "$id" 2>/dev/null || true
+                done < <(xdotool search --onlyvisible --name ".*" 2>/dev/null || true)
+                echo "Dropbox output entries:"
+                find "$FLATPAK_TEST_OUTPUT" -maxdepth 1 -printf "%f %s bytes\n"
                 cat "$RUNNER_TEMP/tempesttrace-flatpak.log"
                 exit 1
               '

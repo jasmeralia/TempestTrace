@@ -180,9 +180,10 @@ the binding field in `OBSBasic.*` JSON-valued INI assignments, including multili
 values; nested settings named `key` remain sensitive. Leave credential-free embedded
 JSON text byte-for-byte intact.
 
-The hotkey `key` exemption is value-based: only empty values and names from the
-complete `OBS_HOTKEY` and `OBS_MOUSE_BUTTON` lists in `libobs/obs-hotkeys.h` are
-preserved, and a `settings` ancestor makes `key` sensitive.
+The hotkey `key` exemption is value-based: empty values, recognized `OBS_HOTKEY`
+and `OBS_MOUSE_BUTTON` names, and `OBS_KEY_0x` followed by exactly two hexadecimal
+digits are preserved in a valid hotkey binding. A `settings` ancestor makes `key`
+sensitive.
 Unquoted URL query and fragment values end at whitespace, end of text, or a following
 named parameter. Quotes and angle brackets end a value only when they are closing
 delimiters. Authorization assignments accept quoted names and values, preserve known
@@ -210,8 +211,10 @@ Track strong and weak provenance per literal: any explicit credential source mak
 literal strong even if the same characters also occur in a weak RTMP or camelCase
 source. Strong literals match case-insensitively; literals found only in weak sources
 remain case-sensitive. Redact Discord webhook token segments after the numeric ID on
-`discord.com` and `discordapp.com`, plus the final token segment on
-`hooks.slack.com/services`, while retaining the host, path prefix, and webhook ID.
+`discord.com`, `discordapp.com`, `ptb.discord.com`, `canary.discord.com`, and their
+`www` forms, including versioned API paths. Redact the final token segment on
+`hooks.slack.com/services`, `/workflows`, and `/triggers`, while retaining the host,
+path prefix, and webhook IDs.
 Sensitive URL fragment parameter values and StreamElements, Discord, and Slack widget
 tokens are harvested for cross-file scrubbing, along with existing Streamlabs tokens.
 Escaped quoted JSON values in logs are unwrapped consistently by redaction and
@@ -219,16 +222,18 @@ verification.
 
 Header arrays represented as name/value objects redact and harvest the sibling value
 when the name is sensitive; unrelated pairs remain untouched. Pair aliases are matched
-without regard to case: name-like fields include name, header, headerName, field,
-label, k, id, and param; value-like fields include value, val, v, headerValue, content,
-data, text, and string. Two-element name/value arrays are also supported. Header names
-use header-specific suffix rules, so X-Api-Key is sensitive without changing generic
-JSON classification of SortKey. String lists are redacted element-wise while retaining
-a recognized leading scheme word. The exact generic JSON/INI field names pass, oauth,
-bearer, and auth are sensitive; broader names such as session, pin, code, and signature
-are not. Derived candidates reject parameter-name identifiers and benign-shaped values;
-percent-encoded byte escapes are separators, and only value sides of name=value
-components are considered.
+without regard to case and accept snake_case and camelCase forms. Name-like fields
+include name, header, headerName, headerKey, field, label, k, id, n, and param;
+value-like fields include value, val, v, headerValue, content, data, text, string, and
+defaultValue. Two-element name/value arrays and ADVSS alternating name/value lists are
+supported. Header names use header-specific suffix rules, so X-Api-Key is sensitive
+without changing generic JSON classification of SortKey. String lists are redacted
+element-wise while retaining a recognized leading scheme word. The exact generic
+JSON/INI field names pass, oauth, bearer, auth, refresh, authCode, and the documented
+password, pw, oauth, and jwt suffix forms are sensitive; broader names such as session,
+pin, code, and signature are not. Derived candidates reject known parameter names and
+benign-shaped values; percent-encoded byte escapes are separators, and only value sides
+of name=value components are considered.
 
 For serialized JSON, verification is structural: inspect sensitive keys and scan
 decoded string values, never property names. For INI, classify assignments by key
@@ -237,12 +242,25 @@ or keys. Keep independent raw-text verification for logs and generated reports.
 Reject excessively nested JSON and text lines above the safe scan limit rather than
 risking an incomplete scan.
 
-Known limits: only labeled secrets are found. Unlabeled copies are scrubbed only when
-the value was harvested from a recognized source. Ordinary words can be blanked when a
-logged cookie or form body resembles credential material. Some files may be omitted
-with a warning when they contain unusually long credentials or escaped JSON that cannot
-be safely verified. The path, encoding, nesting, and size limits described above also
-apply.
+Known limits: TempestTrace recognizes labels from a fixed vocabulary and a fixed set
+of storage shapes: JSON field names, header name/value pairs and alternating lists, URL
+query and fragment parameters, free-text `name=value` and `name: value` assignments,
+and known widget or webhook providers (Streamlabs, StreamElements, Discord including
+PTB and Canary, and Slack). Unknown labels and storage layouts are copied as is. An
+unlabeled second copy is scrubbed only when its value matches a value harvested from
+one of those recognized sources. Review the ZIP before sharing it, especially when OBS
+plugins use custom HTTP headers or store credentials in plugin-specific layouts.
+
+Large logs with many token-bearing URLs or escaped JSON can take minutes per file.
+Cancel takes effect between files. A local 4 MiB `create_backup` benchmark measured
+about 10.1 seconds for benign input and 25.1 seconds for dense token input; results vary
+with hardware and file contents. Empty password assignments in INI files are preserved
+without consuming a following section or assignment. Unusual multi-line INI values can
+still cause a neighboring line to be blanked. Ordinary words can be blanked when a
+logged cookie or form body resembles credential material. The path, encoding, nesting,
+and size limits described above also apply. Free-text parsing does not recognize tab
+separators or `=>`; free-text labels named `auth`, `oauth`, `bearer`, or `pass` are not
+recognized as assignments, although these names are handled in structured fields.
 
 Free-text credential assignments redact the full non-whitespace token. URL query
 redaction preserves a following named parameter such as `&region=us` while absorbing

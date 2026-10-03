@@ -23,7 +23,9 @@ from tempesttrace.redaction import (
     _free_text_credential_spans,
     _is_sensitive_key,
     _json_fragments,
+    _redact_embedded,
     _redact_escaped_json,
+    _redact_object,
     _scrub_text,
     _strong_embedded_secrets,
     has_unredacted_embedded_json,
@@ -257,7 +259,7 @@ def test_credential_free_embedded_json_keeps_its_original_formatting(tmp_path: P
         "{&#034;token&#034;:&#034;PADDED_NUM_SECRET&#034;}",
         "{&#x0022;token&#x0022;:&#x0022;PADDED_HEX_SECRET&#x0022;}",
         "{`token`: `BACKTICK_SECRET`}",
-        "{“token”: “CURLY_QUOTE_SECRET”}",
+        "{\u201ctoken\u201d: \u201cCURLY_QUOTE_SECRET\u201d}",
         "{%22token%22:%22PERCENT_QUOTE_SECRET%22}",
         "{%27password%27:%27PERCENT_APOS_SECRET%27}",
         "{\u2018token\u2019: \u2018CURLY_APOS_VALUE\u2019}",
@@ -656,8 +658,8 @@ def backup_secret_scan(path: Path) -> bool:
     return _secret_scan(path)
 
 
-def test_rule_version_is_twenty_four() -> None:
-    assert RULE_VERSION == 25
+def test_rule_version_is_twenty_six_after_rule_update() -> None:
+    assert RULE_VERSION == 26
 
 
 @pytest.mark.parametrize(
@@ -2904,4 +2906,280 @@ def test_punctuation_in_secret_values_is_fully_redacted_and_accepted(
     redact_file_with_secrets(path)
     output = path.read_text(encoding="utf-8")
     assert secret not in output
+    assert not _secret_scan(path)
+
+
+@pytest.mark.parametrize(
+    "payload,secret",
+    [
+        (
+            {"headers": [{"header": "Authorization"}, {"header": "Bearer ADVSSJWT987654321"}]},
+            "ADVSSJWT987654321",
+        ),
+        (
+            {"params": [{"param": "api_key"}, {"param": "ADVSSPARAM987654321"}]},
+            "ADVSSPARAM987654321",
+        ),
+        ({"args": [{"arg": "--password"}, {"arg": "ADVSSARGS987654321"}]}, "ADVSSARGS987654321"),
+        ({"value": "Bearer ADVSSJSON987654321"}, "ADVSSJSON987654321"),
+    ],
+)
+def test_advss_alternating_lists_and_scheme_values_redact(
+    tmp_path: Path, payload: dict, secret: str
+) -> None:
+    path = tmp_path / "scene.json"
+    path.write_text(json.dumps(payload), encoding="ascii")
+    redact_file(path)
+    assert secret not in path.read_text(encoding="ascii")
+    assert not has_unredacted_fields(json.loads(path.read_text(encoding="ascii")))
+
+
+def test_advss_benign_alternating_lists_remain_unchanged(tmp_path: Path) -> None:
+    payload = {
+        "headers": ["Accept", "application/json", "Content-Type", "text/plain"],
+        "params": [{"param": "limit"}, {"param": "10"}],
+    }
+    path = tmp_path / "scene.json"
+    path.write_text(json.dumps(payload), encoding="ascii")
+    redact_file(path)
+    assert json.loads(path.read_text(encoding="ascii")) == payload
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "mqtt_pw",
+        "wspass",
+        "session_jwt",
+        "twitch_oauth",
+        "twitchOAuth",
+        "TwitchOAuth",
+        "chat_oauth",
+        "irc_pass",
+        "pw",
+        "authCode",
+        "refresh",
+    ],
+)
+def test_added_credential_name_vocabulary(key: str) -> None:
+    assert has_unredacted_fields({key: "CredentialValue987654321"})
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "multipass",
+        "bypass",
+        "compass",
+        "passthrough",
+        "jwtimeout",
+        "Bitrate",
+        "keyint",
+        "passwordVariants",
+    ],
+)
+def test_credential_name_vocabulary_avoids_benign_words(key: str) -> None:
+    assert not _is_sensitive_key(key)
+
+
+@pytest.mark.parametrize("name", ["header_name", "headerKey", "n", "Api Key", "oauth", "bearer"])
+def test_header_pair_alias_regressions(name: str) -> None:
+    assert has_unredacted_fields(
+        {name: "Authorization" if name != "Api Key" else "Api Key", "value": "PairSecret987654321"}
+    )
+
+
+def test_hotkey_hex_codes_are_exempt_but_spoofs_are_not(tmp_path: Path) -> None:
+    for code in ("OBS_KEY_0x88", "OBS_KEY_0xC3", "OBS_KEY_0xE8"):
+        assert not has_unredacted_fields({"hotkeys": {"bindings": [{"key": code}]}})
+    for code in ("OBS_KEY_0xZZZZ", "OBS_KEY_0x1234"):
+        assert has_unredacted_fields({"token": code})
+    path = tmp_path / "scene.json"
+    path.write_text('{"variables":[{"name":"last_key","value":"OBS_KEY_F5"}]}', encoding="ascii")
+    redact_file(path)
+    assert "OBS_KEY_F5" in path.read_text(encoding="ascii")
+
+
+def test_empty_sensitive_ini_does_not_swallow_assignments(tmp_path: Path) -> None:
+    path = tmp_path / "basic.ini"
+    path.write_text(
+        "ServerPassword=\n\n[Accessibility]\nEnabled=true\n[Twitch]\nToken=\nRefreshToken=\nExpireTime=1790000000\n",
+        encoding="ascii",
+    )
+    redact_file(path)
+    cleaned = path.read_text(encoding="ascii")
+    assert "[Accessibility]" in cleaned and "ExpireTime=1790000000" in cleaned
+
+
+def test_rule_version_is_twenty_six() -> None:
+    assert RULE_VERSION == 26
+
+
+def test_embedded_webhook_bracket_pairs_redact_and_harvest() -> None:
+    text = (
+        'sent request with headers "[Authorization, Bearer ADVSSLOGJWT987654321]" '
+        'and params "[token, ADVSSLOGPARAM987654321]"'
+    )
+    values = _embedded_secrets(text)
+    assert "ADVSSLOGJWT987654321" in values
+    assert "ADVSSLOGPARAM987654321" in values
+    cleaned = _redact_embedded(text, {}, values)
+    assert "ADVSSLOGJWT987654321" not in cleaned
+    assert "ADVSSLOGPARAM987654321" not in cleaned
+    assert "Bearer <REDACTED>" in cleaned
+
+
+def test_extended_header_pair_aliases_recurse_and_check_every_value() -> None:
+    payload = {
+        "headers": [
+            {"header_name": "X-Api-Key", "header_value": "FirstSecret987654321"},
+            {"headerKey": "Authorization", "headerValue": "Bearer SecondSecret987654321"},
+            {"n": "Api Key", "v": "ThirdSecret987654321"},
+            {"name": "oauth", "text": "description", "value": "FourthSecret987654321"},
+            {"name": "last_key", "value": "OBS_KEY_F5"},
+            ["X-Api-Key", "FifthSecret987654321", "keep-this"],
+        ]
+    }
+    cleaned = _redact_object(payload, {}, set())
+    assert has_unredacted_fields(payload)
+    assert not has_unredacted_fields(cleaned)
+    assert cleaned["headers"][4]["value"] == "OBS_KEY_F5"
+    assert cleaned["headers"][5][2] == "keep-this"
+    assert "Secret987654321" not in json.dumps(cleaned)
+
+
+def test_canonical_stream_keys_survive_derived_component_gate() -> None:
+    candidates = (
+        "live_123456789_AbCdEfGhIjKlMnOpQrSt?bandwidthtest=true",
+        "abcd-efgh-ijkl-mnop-qrst;server=auto",
+        "a1b2-c3d4-e5f6-g7h8-i9j0/live",
+    )
+    for glued in candidates:
+        harvested = _embedded_secrets('stream_key="' + glued + '"')
+        expected = glued.split("?", 1)[0].split(";", 1)[0].split("/", 1)[0]
+        assert expected in harvested
+    assert not (
+        _embedded_secrets("token_type=bearer expires_in=3600 scope=chat%3Aread") - {"bearer"}
+    )
+
+
+def test_token_url_redaction_scales_by_input_size() -> None:
+    line = "Opening 'https://cdn.example/live.m3u8?token=abc123XYZ987' for reading\n"
+
+    def scan(size: int) -> None:
+        text = (line * (size // len(line) + 1))[:size]
+        cleaned = _redact_embedded(text, {}, set())
+        assert "abc123XYZ987" not in cleaned
+
+    _assert_linear_pair(scan, 64 * 1024, 10.0)
+
+
+def test_escaped_json_restoration_scales_by_input_size() -> None:
+    line = 'debug: "{\\"token\\":\\"EscapedSecret987654321\\"}"\n'
+
+    def scan(size: int) -> None:
+        text = (line * (size // len(line) + 1))[:size]
+        cleaned = _redact_embedded(text, {}, set())
+        assert "EscapedSecret987654321" not in cleaned
+
+    _assert_linear_pair(scan, 64 * 1024, 10.0)
+
+
+def test_header_pair_aliases_are_checked_individually_and_nested() -> None:
+    cases = [
+        {"header_name": "X-Api-Key", "header_value": "AliasOneSecret987654321"},
+        {"headerKey": "Authorization", "headerValue": "AliasTwoSecret987654321"},
+        {"n": "Api Key", "v": "AliasThreeSecret987654321"},
+        {"name": "Authorization", "text": "description", "value": "AliasFourSecret987654321"},
+        {"name": "api_key", "value": {"v": "AliasFiveSecret987654321"}},
+    ]
+    for item in cases:
+        assert has_unredacted_fields(item)
+        cleaned = _redact_object(item, {}, set())
+        assert not has_unredacted_fields(cleaned)
+        assert "Secret987654321" not in json.dumps(cleaned)
+
+
+def test_ini_leading_marker_is_not_harvested_as_part_of_secret(tmp_path: Path) -> None:
+    path = tmp_path / "basic.ini"
+    path.write_text("[General]\nToken=>IniMarkerSecret987654321\n", encoding="ascii")
+    counts, _, literals = redact_file_with_secrets(path)
+    assert counts["credential_field"] >= 1
+    assert "IniMarkerSecret987654321" in literals
+    assert ">IniMarkerSecret987654321" not in literals
+    assert "IniMarkerSecret987654321" not in path.read_text(encoding="ascii")
+
+
+def test_obs_hex_hotkeys_are_preserved_only_in_binding_context(tmp_path: Path) -> None:
+    path = tmp_path / "scene.json"
+    path.write_text(
+        json.dumps(
+            {
+                "hotkeys": {
+                    "bindings": [
+                        {"key": "OBS_KEY_0x88"},
+                        {"key": "OBS_KEY_0xC3"},
+                        {"key": "OBS_KEY_0xE8"},
+                        {"key": "OBS_KEY_0x1234"},
+                        {"key": "OBS_KEY_0xZZZZ"},
+                    ]
+                }
+            }
+        ),
+        encoding="ascii",
+    )
+    redact_file(path)
+    text = path.read_text(encoding="ascii")
+    for code in ("OBS_KEY_0x88", "OBS_KEY_0xC3", "OBS_KEY_0xE8"):
+        assert code in text
+    assert "OBS_KEY_0x1234" not in text and "OBS_KEY_0xZZZZ" not in text
+
+
+def test_long_dashed_label_scan_scales_by_input_size() -> None:
+    def scan(size: int) -> None:
+        text = "a" * size + "-key=LongNameValue987654321\n"
+        has_unredacted_embedded_json(text)
+        _embedded_secrets(text)
+
+    _assert_linear_pair(scan, 4 * 1024, 10.0)
+
+
+def test_escaped_quote_embedded_assignments_redact_whole_literal(tmp_path: Path) -> None:
+    cases = [
+        ("apiKey : %22LK4Q?976eZZ%22", "LK4Q?976eZZ"),
+        ("Token : %22LKQ7ZY59ZZ%22;c=d", "LKQ7ZY59ZZ"),
+    ]
+    for index, (text, secret) in enumerate(cases):
+        path = tmp_path / f"scene-{index}.json"
+        path.write_text(json.dumps({"settings": {"text": text}}), encoding="ascii")
+        redact_file(path)
+        cleaned = path.read_text(encoding="ascii")
+        assert secret not in cleaned
+        assert not _secret_scan(path)
+
+
+def test_redacted_quoted_cookie_assignment_passes_ini_verification(tmp_path: Path) -> None:
+    path = tmp_path / "global.ini"
+    path.write_text(
+        "[General]\nNote=debug: foo=bar cookie = \u201cLK]b)^Z!ZQ68c^'9-9:YZZ\u201d,\n",
+        encoding="utf-8",
+    )
+    redact_file(path)
+    cleaned = path.read_text(encoding="utf-8")
+    assert "LK]b)^Z!ZQ68c^'9-9:YZZ" not in cleaned
+    assert not _secret_scan(path)
+
+
+def test_percent_quoted_embedded_cookie_keeps_neighboring_ini_text(tmp_path: Path) -> None:
+    path = tmp_path / "global.ini"
+    path.write_text(
+        "[General]\nNote=info: cookie\t=\t%22LKYb}Q~2+ss=b00uu97ZZ%22;c=d\n",
+        encoding="ascii",
+    )
+
+    redact_file(path)
+
+    assert path.read_text(encoding="ascii") == (
+        "[General]\nNote=info: cookie\t=\t%22<REDACTED>%22;c=d\n"
+    )
     assert not _secret_scan(path)

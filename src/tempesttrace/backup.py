@@ -34,6 +34,7 @@ from tempesttrace.redaction import (
     _hotkey_key_exempt,
     _is_repeated_redacted_key_log,
     _is_repeated_redacted_quoted_key_log,
+    _is_sensitive_name,
     _is_url_query_assignment,
     _is_weak_camel_key,
     _json_fragments,
@@ -41,6 +42,7 @@ from tempesttrace.redaction import (
     _mask_urls,
     _normalize_scheme_candidate,
     _query_value_is_redacted,
+    _query_value_line_tail,
     _query_value_parts,
     _redact_authorization_remainders,
     _redact_free_text_credential_spans,
@@ -386,9 +388,9 @@ def _secret_scan(path: Path) -> bool:  # noqa: PLR0911
     except OSError, ValueError:
         return True
     if re.search(
-        r"(?i)https?://(?:www\.)?(?:discord|discordapp)\.com/api/webhooks/\d+/"
-        r"[^/?#\s\"'<>]+|https?://hooks\.slack\.com/services/[A-Z0-9]+/[A-Z0-9]+/"
-        r"[^/?#\s\"'<>]+",
+        r"(?i)https?://(?:(?:www|ptb|canary)\.)?(?:discord|discordapp)\.com/api(?:/v\d+)?/webhooks/\d+/"
+        r"[^/?#\s\"'<>]+(?=[?#\s\"'<>]|$)|https?://hooks\.slack\.com/(?:services|workflows|triggers)/(?:[^/?#\s]+/)*"
+        r"[^/?#\s\"'<>]+(?=[?#\s\"'<>]|$)",
         text,
     ):
         return True
@@ -426,11 +428,23 @@ def _secret_scan(path: Path) -> bool:  # noqa: PLR0911
 def _independent_json_secret(value: object, context: tuple[str, ...] = ()) -> bool:  # noqa: PLR0911, PLR0912
     """Check parsed JSON independently, with a narrow hotkey-key exemption."""
     if isinstance(value, dict):
-        value_aliases = {"value", "val", "v", "headervalue", "content", "data", "text", "string"}
+        value_aliases = {
+            "value",
+            "val",
+            "v",
+            "headervalue",
+            "content",
+            "data",
+            "text",
+            "string",
+            "defaultvalue",
+        }
         name_aliases = {
             "name",
             "header",
             "headername",
+            "headerkey",
+            "n",
             "key",
             "field",
             "label",
@@ -439,35 +453,32 @@ def _independent_json_secret(value: object, context: tuple[str, ...] = ()) -> bo
             "param",
             "parameter",
         }
-        value_key = next(
-            (
-                key
-                for key, child in value.items()
-                if isinstance(key, str)
-                and key.casefold() in value_aliases
-                and isinstance(child, (str, list, int, float))
-            ),
-            None,
-        )
-        if value_key is not None:
-            for name_key, name in value.items():
-                if not isinstance(name_key, str) or name_key.casefold() not in name_aliases:
-                    continue
-                if not isinstance(name, str):
-                    continue
-                if name_key.casefold() == "key" and (
-                    len(name) > 128 or not re.fullmatch(r"(?i)[A-Za-z][A-Za-z0-9_.-]*", name)
-                ):
-                    continue
-                if _is_sensitive_header_signature(name) and not _independent_header_value_redacted(
-                    value[value_key]
-                ):
-                    return True
+        value_keys = [
+            key
+            for key, child in value.items()
+            if isinstance(key, str) and re.sub(r"[^a-z0-9]", "", key.casefold()) in value_aliases
+        ]
+        for name_key, name in value.items():
+            if (
+                not isinstance(name_key, str)
+                or re.sub(r"[^a-z0-9]", "", name_key.casefold()) not in name_aliases
+            ):
+                continue
+            if not isinstance(name, str):
+                continue
+            if name_key.casefold() == "key" and (
+                len(name) > 128 or not re.fullmatch(r"(?i)[A-Za-z][A-Za-z0-9_.-]*", name)
+            ):
+                continue
+            if _is_sensitive_name(name) and any(
+                not _independent_header_value_redacted(value[key]) for key in value_keys
+            ):
+                return True
         for key, child in value.items():
             if (
-                value_key is not None
+                bool(value_keys)
                 and isinstance(key, str)
-                and key.casefold() in name_aliases
+                and re.sub(r"[^a-z0-9]", "", key.casefold()) in name_aliases
                 and isinstance(child, str)
                 and _is_sensitive_signature_name(child)
             ):
@@ -494,8 +505,37 @@ def _independent_json_secret(value: object, context: tuple[str, ...] = ()) -> bo
                     return True
         return False
     if isinstance(value, list):
+        if len(value) >= 2 and len(value) % 2 == 0:
+            index = 0
+            recognized = all(isinstance(item, str) for item in value)
+            if not recognized:
+                keys = [
+                    next(iter(item)) for item in value if isinstance(item, dict) and len(item) == 1
+                ]
+                recognized = len(keys) == len(value) and len(set(keys)) == 1
+            if recognized:
+                while index + 1 < len(value):
+                    name_item = value[index]
+                    name = (
+                        name_item if isinstance(name_item, str) else next(iter(name_item.values()))
+                    )
+                    next_item = value[index + 1]
+                    candidate = (
+                        next(iter(next_item.values())) if isinstance(next_item, dict) else next_item
+                    )
+                    if isinstance(name, str) and _is_sensitive_name(name):
+                        if not _independent_header_value_redacted(candidate):
+                            return True
+                        index += 2
+                    else:
+                        if _independent_json_secret(name_item, context) or _independent_json_secret(
+                            next_item, context
+                        ):
+                            return True
+                        index += 2
+                return False
         if (
-            len(value) == 2
+            len(value) >= 2
             and isinstance(value[0], str)
             and _is_sensitive_header_signature(value[0])
             and not _independent_header_value_redacted(value[1])
@@ -503,6 +543,19 @@ def _independent_json_secret(value: object, context: tuple[str, ...] = ()) -> bo
             return True
         return any(_independent_json_secret(item, context) for item in value)
     if isinstance(value, str):
+        token = resolve_credential_token(value, 0)
+        if (
+            token is not None
+            and token[0] > 0
+            and value[token[0] : token[1]] not in {":", "="}
+            and any(
+                _normalize_scheme_candidate(part) in _SCHEME_NAMES
+                for part in value[: token[0]].split()
+            )
+            and _clean_credential_literal(_before_named_parameter(value[token[0] : token[1]]))
+            != REDACTED
+        ):
+            return True
         nested = _json_fragments(value)
         if any(
             _independent_json_secret(item, child_context) for _s, _e, item, child_context in nested
@@ -598,7 +651,9 @@ def _independent_secret_scan(text: str) -> bool:  # noqa: PLR0912, PLR0915
         value = _unwrap_signature_value(value)
         if (
             (normalized in {"auth", "sig"} or _is_sensitive_signature_name(match.group(1)))
-            and not _query_value_is_redacted(match.group(2) + text[match.end(2) :])
+            and not _query_value_is_redacted(
+                match.group(2) + _query_value_line_tail(text, match.end(2))
+            )
             and value.casefold() not in {"null", "undefined", "none", "nil", "true", "false"}
         ):
             return True
@@ -607,6 +662,8 @@ def _independent_secret_scan(text: str) -> bool:  # noqa: PLR0912, PLR0915
 
 def _is_sensitive_signature_name(name: str) -> bool:
     """Classify known credential signatures without relying on redactor boundaries."""
+    if _is_sensitive_name(name):
+        return True
     normalized = re.sub(r"[^a-z0-9]", "", name.casefold())
     return (
         normalized
@@ -658,6 +715,8 @@ def _is_sensitive_signature_name(name: str) -> bool:
 
 
 def _is_sensitive_header_signature(name: str) -> bool:
+    if _is_sensitive_name(name):
+        return True
     normalized = re.sub(r"[-_ ]", "", name.casefold())
     suffixes = (
         "key",
@@ -675,6 +734,8 @@ def _is_sensitive_header_signature(name: str) -> bool:
 def _independent_header_value_redacted(value: object) -> bool:
     if value == "<REDACTED>" or value is None or isinstance(value, bool):
         return True
+    if isinstance(value, dict):
+        return all(_independent_header_value_redacted(child) for child in value.values())
     if isinstance(value, str):
         token = resolve_credential_token(value, 0)
         return bool(
@@ -696,7 +757,12 @@ def _independent_header_value_redacted(value: object) -> bool:
         and _normalize_scheme_candidate(value[0]) in _SCHEME_NAMES
         else 0
     )
-    return all(item in ("<REDACTED>", None, True, False) for item in value[first:])
+    return all(
+        item in ("<REDACTED>", None, True, False)
+        or (isinstance(item, dict) and _independent_header_value_redacted(item))
+        or (isinstance(item, list) and _independent_header_value_redacted(item))
+        for item in value[first:]
+    )
 
 
 def _is_hotkey_signature_context(text: str, start: int) -> bool:
@@ -807,10 +873,6 @@ def _private_literal_patterns(secret: str) -> set[str]:
 def _compile_private_literals(
     secrets: set[str], weak_secrets: set[str] | None = None, strong_secrets: set[str] | None = None
 ) -> re.Pattern[str] | None:
-    embedded: set[str] = set()
-    weak_embedded: set[str] = set()
-    bounded: set[str] = set()
-    weak_bounded: set[str] = set()
     numeric: set[str] = set()
     weak_secrets = weak_secrets or set()
     strong_secrets = strong_secrets if strong_secrets is not None else secrets - weak_secrets
@@ -820,37 +882,75 @@ def _compile_private_literals(
         if re.fullmatch(r"-?\d+(?:\.\d+)?", secret):
             numeric.add(secret)
             continue
-        is_long_key = len(secret) >= 12 and any(char.isdigit() for char in secret)
-        if secret in weak_secrets and secret not in strong_secrets:
-            target = weak_embedded if is_long_key else weak_bounded
-        else:
-            target = embedded if is_long_key else bounded
-        target.update(_private_literal_patterns(secret))
-    alternatives = []
-    if embedded:
-        alternatives.append("(?i:" + "|".join(sorted(embedded, key=len, reverse=True)) + ")")
-    if weak_embedded:
-        alternatives.append("(?:" + "|".join(sorted(weak_embedded, key=len, reverse=True)) + ")")
-    if bounded:
-        alternatives.append(
-            "(?i:"
-            + r"(?<![A-Za-z0-9])(?:"
-            + "|".join(sorted(bounded, key=len, reverse=True))
-            + r")(?![A-Za-z0-9]))"
-        )
-    if weak_bounded:
-        alternatives.append(
-            "(?-i:(?<![A-Za-z0-9])(?:"
-            + "|".join(sorted(weak_bounded, key=len, reverse=True))
-            + r")(?![A-Za-z0-9]))"
-        )
+    searchable = {secret for secret in secrets if _is_searchable_secret(secret)}
+    strong = ((searchable - weak_secrets) | (searchable & strong_secrets)) - numeric
+    weak = (searchable & weak_secrets) - strong_secrets - numeric
+
+    def trie_pattern(values: set[str], *, insensitive: bool, bounded: bool) -> str:
+        root: dict[str, object] = {}
+        for secret in values:
+            node = root
+            for char in secret:
+                if char == " ":
+                    edge = r"(?:\ |\+|%20|%2520)"
+                elif ord(char) < 128:
+                    code = f"{ord(char):02X}"
+                    hex_pattern = "".join(
+                        f"[{c.lower()}{c.upper()}]" if c.isalpha() else c for c in code
+                    )
+                    unicode_escape = re.escape("\\u00" + code.lower())
+                    hex_escape = re.escape("\\x" + code.lower())
+                    edge = (
+                        f"(?:{re.escape(char)}|%{hex_pattern}|%25{hex_pattern}|"
+                        f"{unicode_escape}|{hex_escape})"
+                    )
+                else:
+                    escaped = re.escape("\\u" + format(ord(char), "04x"))
+                    edge = f"(?:{re.escape(char)}|{escaped})"
+                node = node.setdefault(edge, {})  # type: ignore[assignment]
+            node[""] = None
+        rendered: dict[int, str] = {}
+        stack = [(root, False)]
+        while stack:
+            node, ready = stack.pop()
+            if not ready:
+                stack.append((node, True))
+                stack.extend(
+                    (child, False) for key, child in node.items() if key and isinstance(child, dict)
+                )
+                continue
+            choices = [key + rendered[id(child)] for key, child in node.items() if key]
+            if "" in node:
+                choices.append("")
+            rendered[id(node)] = (
+                choices[0] if len(choices) == 1 else "(?:" + "|".join(choices) + ")"
+            )
+        body = rendered[id(root)]
+        if insensitive:
+            body = "(?i:" + body + ")"
+        if bounded:
+            body = r"(?<![A-Za-z0-9])" + body + r"(?![A-Za-z0-9])"
+        return body
+
+    patterns: list[str] = []
+    for values, insensitive in (
+        ({s for s in strong if len(s) >= 12 and any(c.isdigit() for c in s)}, True),
+        ({s for s in strong if not (len(s) >= 12 and any(c.isdigit() for c in s))}, True),
+        ({s for s in weak if len(s) >= 12 and any(c.isdigit() for c in s)}, False),
+        ({s for s in weak if not (len(s) >= 12 and any(c.isdigit() for c in s))}, False),
+    ):
+        if values:
+            bounded = not (
+                len(next(iter(values))) >= 12 and any(c.isdigit() for c in next(iter(values)))
+            )
+            patterns.append(trie_pattern(values, insensitive=insensitive, bounded=bounded))
     if numeric:
-        alternatives.append(
+        patterns.append(
             r"(?<![A-Za-z0-9.-])(?:"
-            + "|".join(sorted(numeric, key=len, reverse=True))
+            + "|".join(re.escape(item) for item in sorted(numeric, key=len, reverse=True))
             + r")(?![A-Za-z0-9.-])"
         )
-    return re.compile("(?:" + "|".join(alternatives) + ")") if alternatives else None
+    return re.compile("(?:" + "|".join(patterns) + ")") if patterns else None
 
 
 def _scrub_private_literals(

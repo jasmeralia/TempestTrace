@@ -1838,7 +1838,7 @@ def test_backup_includes_redacted_logs_with_mixed_quote_encodings(tmp_path: Path
         '{"token" /*\nnote\n*/ : "CLOSED_MULTILINE_SECRET"}\n'
         "password: &#39;ENTITY_QUOTE_SECRET&#39;\n"
         "token: `BACKTICK_QUOTE_SECRET`\n"
-        "{“token”: “CURLY_QUOTE_SECRET”}\n"
+        "{\u201ctoken\u201d: \u201cCURLY_QUOTE_SECRET\u201d}\n"
         "{%22token%22:%22PERCENT_QUOTE_SECRET%22}\n"
         "{%27password%27:%27PERCENT_APOS_SECRET%27}\n"
         "{\u2018token\u2019: \u2018CURLY_APOS_VALUE\u2019}\n"
@@ -1879,7 +1879,7 @@ def test_backup_includes_redacted_logs_with_mixed_quote_encodings(tmp_path: Path
     [
         "password: &#39;<REDACTED>&#39;",
         "token: `<REDACTED>`",
-        "{“token”: “<REDACTED>”}",
+        "{\u201ctoken\u201d: \u201c<REDACTED>\u201d}",
         "{%22token%22:%22<REDACTED>%22}",
         "{%27password%27:%27<REDACTED>%27}",
         "{\u2018token\u2019: \u2018<REDACTED>\u2019}",
@@ -2831,3 +2831,97 @@ def test_unsafe_deep_or_long_log_is_omitted_and_backup_continues(tmp_path: Path,
     assert any(
         "Could not safely include logs/2026-09-30.txt" in warning for warning in result.warnings
     )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://ptb.discord.com/api/webhooks/12345/DiscordSecret987654321",
+        "https://canary.discordapp.com/api/v10/webhooks/12345/DiscordSecret987654321",
+        "https://hooks.slack.com/workflows/T123/B123/SlackSecret987654321",
+        "https://hooks.slack.com/triggers/T123/B123/SlackSecret987654321",
+    ],
+)
+def test_extended_webhook_urls_are_removed_from_backup(tmp_path: Path, url: str) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    (source / "basic/profiles/default/service.json").write_text(
+        json.dumps({"key": ""}), encoding="ascii"
+    )
+    (source / "basic/scenes/main.json").write_text(
+        json.dumps({"sources": [], "url": url}), encoding="ascii"
+    )
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        all_data = b"\n".join(archive.read(name) for name in archive.namelist())
+    assert b"DiscordSecret987654321" not in all_data and b"SlackSecret987654321" not in all_data
+
+
+@pytest.mark.parametrize(
+    "secret,glued",
+    [
+        ("live_123456789_AbCdEfGhIjKlMnOpQrSt", "?bandwidthtest=true"),
+        ("abcd-efgh-ijkl-mnop-qrst", ";server=auto"),
+        ("a1b2-c3d4-e5f6-g7h8-i9j0", "/live"),
+    ],
+)
+def test_canonical_twitch_youtube_glued_keys_scrub_second_file(
+    tmp_path: Path, secret: str, glued: str
+) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    (source / "basic/profiles/default/service.json").write_text(
+        json.dumps({"key": secret + glued}), encoding="ascii"
+    )
+    (source / "basic/profiles/default/basic.ini").write_text(
+        "[General]\nComment=" + secret + "\n", encoding="ascii"
+    )
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        contents = b"\n".join(archive.read(name) for name in archive.namelist())
+    assert secret.encode("ascii") not in contents
+
+
+def test_alternating_advss_fixture_removes_lone_and_cross_file_secrets(tmp_path: Path) -> None:
+    source = fixture(tmp_path / "obs")
+    destination = tmp_path / "out"
+    destination.mkdir()
+    advss = {
+        "macros": [
+            {
+                "action": {
+                    "type": "http",
+                    "headers": [
+                        {"header": "Authorization"},
+                        {"header": "Bearer LoneAdvssJWT987654321"},
+                    ],
+                    "params": [{"param": "api_key"}, {"param": "CrossAdvssParam987654321"}],
+                }
+            },
+            {
+                "action": {
+                    "type": "run",
+                    "args": [{"arg": "--password"}, {"arg": "AdvssRunPassword987654321"}],
+                }
+            },
+        ]
+    }
+    (source / "basic/scenes/main.json").write_text(json.dumps(advss), encoding="ascii")
+    (source / "logs/2026-01-02.txt").write_text(
+        'sent HTTP request with headers "[Authorization, Bearer LoneAdvssJWT987654321]"\n',
+        encoding="ascii",
+    )
+    result = create_backup(source, destination)
+    with zipfile.ZipFile(result.archive) as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+    all_data = b"\n".join(members.values())
+    for secret in (
+        "LoneAdvssJWT987654321",
+        "CrossAdvssParam987654321",
+        "AdvssRunPassword987654321",
+    ):
+        assert secret.encode("ascii") not in all_data
+    cleaned = json.loads(members["basic/scenes/main.json"])
+    assert cleaned["macros"][0]["action"]["headers"][1]["header"] == "Bearer <REDACTED>"

@@ -9,7 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-RULE_VERSION = 25
+RULE_VERSION = 26
 REDACTED = "<REDACTED>"
 _QUOTE_DELIMITER = (
     r"(?:\\*['\"]|`|&(?:quot|apos|ldquo|rdquo|lsquo|rsquo);|"
@@ -56,8 +56,8 @@ _JSON_OBJECT_START = re.compile(r'\{\s*(?:"|})')
 _JSON_ARRAY_START = re.compile(r'\[\s*(?:"|\[|\{|\]|-|[0-9]|(?:true|false|null)(?=[ \t\r\n,\]]))')
 _JSON_OPENING = re.compile(r"[\{\[]")
 _FREE_NAME = (
-    r"(?:\\{0,8}+[\"']?[A-Za-z0-9_.-]++\\{0,8}+[\"']?|"
-    r"%22[A-Za-z0-9_.-]++%22|%27[A-Za-z0-9_.-]++%27)"
+    r"(?:\\{0,8}+[\"']?[A-Za-z0-9_.-]{1,128}+\\{0,8}+[\"']?|"
+    r"%22[A-Za-z0-9_.-]{1,128}+%22|%27[A-Za-z0-9_.-]{1,128}+%27)"
 )
 _SENSITIVE_NAME_CORE = (
     r"(?:[A-Za-z0-9_.-]*?(?:password|passwd|pwd|secret|token|passphrase|cookie(?:s|2)?|"
@@ -118,12 +118,12 @@ _STREAMELEMENTS_TOKEN = re.compile(
     r"([^/?#\s\"'<>]+)"
 )
 _DISCORD_WEBHOOK_TOKEN = re.compile(
-    r"(?i)(https?://(?:www\.)?(?:discord|discordapp)\.com/api/webhooks/\d+/)"
+    r"(?i)(https?://(?:(?:www|ptb|canary)\.)?(?:discord|discordapp)\.com/api(?:/v\d+)?/webhooks/\d+/)"
     r"([^/?#\s\"'<>]+)"
 )
 _SLACK_WEBHOOK_TOKEN = re.compile(
-    r"(?i)(https?://hooks\.slack\.com/services/[A-Z0-9]+/[A-Z0-9]+/)"
-    r"([^/?#\s\"'<>]+)"
+    r"(?i)(https?://hooks\.slack\.com/(?:services|workflows|triggers)/(?:[^/?#\s]+/)*)"
+    r"([^/?#\s\"'<>]+)(?=[?#\s\"'<>]|$)"
 )
 _SCHEME_NAMES = frozenset(
     [
@@ -238,23 +238,37 @@ def _is_challenge_realm_match(match: re.Match[str]) -> bool:
 
 def _header_pair_keys(value: dict[str, Any]) -> tuple[str, str] | None:
     """Return name/value member keys for a credential header pair object."""
-    aliases = {"value", "val", "v", "headervalue", "content", "data", "text", "string"}
+    aliases = {
+        "value",
+        "val",
+        "v",
+        "headervalue",
+        "content",
+        "data",
+        "text",
+        "string",
+        "defaultvalue",
+    }
     value_key = next(
         (
             key
             for key, child in value.items()
             if isinstance(key, str)
-            and key.casefold() in aliases
-            and isinstance(child, (str, list, int, float))
+            and re.sub(r"[^a-z0-9]", "", key.casefold()) in aliases
+            and isinstance(child, (str, list, dict, int, float))
         ),
         None,
     )
     if value_key is None:
         return None
+    if isinstance(value[value_key], str) and _is_obs_key_enum(value[value_key]):
+        return None
     name_aliases = {
         "name",
         "header",
         "headername",
+        "headerkey",
+        "n",
         "key",
         "field",
         "label",
@@ -264,7 +278,10 @@ def _header_pair_keys(value: dict[str, Any]) -> tuple[str, str] | None:
         "parameter",
     }
     for name_key, name in value.items():
-        if not isinstance(name_key, str) or name_key.casefold() not in name_aliases:
+        if (
+            not isinstance(name_key, str)
+            or re.sub(r"[^a-z0-9]", "", name_key.casefold()) not in name_aliases
+        ):
             continue
         if not isinstance(name, str):
             continue
@@ -272,15 +289,38 @@ def _header_pair_keys(value: dict[str, Any]) -> tuple[str, str] | None:
             len(name) > 128 or not re.fullmatch(r"(?i)[A-Za-z][A-Za-z0-9_.-]*", name)
         ):
             continue
-        if _is_sensitive_header_name(name):
+        if _is_sensitive_name(name):
             return name_key, value_key
     return None
+
+
+def _header_pair_value_keys(value: dict[str, Any], name_key: str) -> set[str]:
+    aliases = {
+        "value",
+        "val",
+        "v",
+        "headervalue",
+        "content",
+        "data",
+        "text",
+        "string",
+        "defaultvalue",
+    }
+    name = value.get(name_key)
+    if not isinstance(name, str) or not _is_sensitive_name(name):
+        return set()
+    return {
+        key
+        for key, child in value.items()
+        if isinstance(key, str)
+        and re.sub(r"[^a-z0-9]", "", key.casefold()) in aliases
+        and isinstance(child, (str, list, int, float, dict))
+    }
 
 
 def _is_sensitive_header_name(name: str) -> bool:
     normalized = re.sub(r"[-_ ]", "", name.casefold())
     suffixes = (
-        "key",
         "token",
         "secret",
         "password",
@@ -289,20 +329,146 @@ def _is_sensitive_header_name(name: str) -> bool:
         "authentication",
         "authenticate",
     )
+    del suffixes
     return (
-        normalized in _CREDENTIAL_NAMES
-        or normalized in {"setcookie", "cookie2", "setcookie2"}
-        or normalized.endswith(suffixes)
+        normalized in {"setcookie", "cookie2", "setcookie2"}
+        or normalized.endswith(
+            (
+                "token",
+                "secret",
+                "password",
+                "passwd",
+                "authorization",
+                "authentication",
+                "authenticate",
+            )
+        )
+        or (normalized.endswith("key") and any(separator in name for separator in ("-", "_", " ")))
+        or _is_sensitive_key(name)
     )
 
 
+def _is_sensitive_name(name: str) -> bool:
+    """Shared field/header-name predicate for redaction and independent verification."""
+    return _is_sensitive_key(name) or _is_sensitive_header_name(name)
+
+
 def _header_pair_list(value: list[Any]) -> bool:
-    return len(value) == 2 and isinstance(value[0], str) and _is_sensitive_header_name(value[0])
+    return len(value) >= 2 and isinstance(value[0], str) and _is_sensitive_name(value[0])
+
+
+def _alternating_list_name(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict) and len(value) == 1:
+        item = next(iter(value.values()))
+        return item if isinstance(item, str) else None
+    return None
+
+
+def _alternating_sensitive_name(name: str, next_value: Any) -> bool:
+    if name in {"-p", "-P"}:
+        return isinstance(next_value, str) and _looks_like_key_material(next_value)
+    option = re.fullmatch(r"--?([A-Za-z0-9_.-]+)", name)
+    if option:
+        name = option.group(1)
+    return _is_sensitive_name(name)
+
+
+def _scheme_redacted_value(value: Any, counts: dict[str, int] | None = None) -> Any:
+    if not isinstance(value, str):
+        if isinstance(value, (dict, list)):
+            return _redact_object(value, counts if counts is not None else {}, set())
+        return REDACTED
+    token = resolve_credential_token(value, 0)
+    if (
+        token is not None
+        and token[0] > 0
+        and value[token[0] : token[1]] not in {":", "="}
+        and _has_scheme_prefix(value, token[0])
+    ):
+        if counts is not None:
+            counts["credential_field"] = counts.get("credential_field", 0) + 1
+        return value[: token[0]] + REDACTED + value[token[1] :]
+    if counts is not None:
+        counts["credential_field"] = counts.get("credential_field", 0) + 1
+    return REDACTED
+
+
+def _has_scheme_prefix(value: str, end: int) -> bool:
+    prefix = value[:end]
+    if not prefix or not prefix[-1].isspace():
+        return False
+    candidate = prefix.strip().lstrip("([{<\"'`")
+    parts = candidate.split()
+    return bool(parts) and all(_normalize_scheme_candidate(part) in _SCHEME_NAMES for part in parts)
+
+
+def _redact_pair_payload(
+    value: Any, counts: dict[str, int], secrets: set[str], *, preserve_scheme: bool = False
+) -> Any:
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, dict):
+        return {
+            key: _redact_pair_payload(child, counts, secrets, preserve_scheme=preserve_scheme)
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        result = list(value)
+        first = (
+            1
+            if result
+            and isinstance(result[0], str)
+            and _normalize_scheme_candidate(result[0]) in _SCHEME_NAMES
+            else 0
+        )
+        for index in range(first, len(result)):
+            result[index] = _redact_pair_payload(result[index], counts, secrets)
+        return result
+    if preserve_scheme:
+        return _scheme_redacted_value(value, counts)
+    counts["credential_field"] = counts.get("credential_field", 0) + 1
+    return REDACTED
+
+
+def _alternating_list_shape(value: list[Any]) -> bool:
+    if not value or len(value) % 2:
+        return False
+    if all(isinstance(item, str) for item in value):
+        return True
+    keys = [next(iter(item)) for item in value if isinstance(item, dict) and len(item) == 1]
+    return len(keys) == len(value) and len(set(keys)) == 1
+
+
+def _bracketed_pair_matches(text: str) -> list[tuple[int, int, str]]:
+    found: list[tuple[int, int, str]] = []
+    for group in re.finditer(r"\[([^\]\r\n]*)\]", text):
+        if any(char in group.group(1) for char in "{}:"):
+            continue
+        pieces = group.group(1).split(",")
+        for index in range(0, len(pieces) - 1, 2):
+            name = pieces[index].strip().strip("\"'")
+            value = pieces[index + 1].strip().strip("\"'")
+            if _alternating_sensitive_name(name, value):
+                relative = group.group(1).find(
+                    pieces[index + 1], sum(len(p) + 1 for p in pieces[: index + 1])
+                )
+                start = (
+                    group.start(1)
+                    + relative
+                    + len(pieces[index + 1])
+                    - len(pieces[index + 1].lstrip())
+                )
+                found.append((start, start + len(value), value))
+    return found
 
 
 def _header_pair_value_redacted(value: Any) -> bool:
     if value == REDACTED or value is None or isinstance(value, bool):
         return True
+    if isinstance(value, dict):
+        return all(_sensitive_field_value_redacted(child) for child in value.values())
     if not isinstance(value, list):
         return False
     first = (
@@ -312,7 +478,16 @@ def _header_pair_value_redacted(value: Any) -> bool:
         and _normalize_scheme_candidate(value[0]) in _SCHEME_NAMES
         else 0
     )
-    return all(item in (REDACTED, None, True, False) for item in value[first:])
+    return all(
+        item in (REDACTED, None, True, False)
+        or (isinstance(item, dict) and not has_unredacted_fields(item))
+        or (isinstance(item, list) and _header_pair_value_redacted(item))
+        for item in value[first:]
+    )
+
+
+def _is_obs_key_enum(value: str) -> bool:
+    return value in _OBS_KEY_NAMES or bool(re.fullmatch(r"OBS_KEY_0x[0-9A-F]{2}", value))
 
 
 def _sensitive_field_value_redacted(value: Any) -> bool:
@@ -329,6 +504,17 @@ def _sensitive_field_value_redacted(value: Any) -> bool:
                     _clean_credential_literal(_before_named_parameter(value[token[0] : token[1]]))
                     == REDACTED
                 )
+    if isinstance(value, dict):
+        return all(_sensitive_field_value_redacted(child) for child in value.values())
+    if isinstance(value, list):
+        first = (
+            1
+            if value
+            and isinstance(value[0], str)
+            and _normalize_scheme_candidate(value[0]) in _SCHEME_NAMES
+            else 0
+        )
+        return all(_sensitive_field_value_redacted(child) for child in value[first:])
     return False
 
 
@@ -497,17 +683,39 @@ def _normalize_scheme_candidate(token: str) -> str:
 
 
 def _clean_credential_literal(token: str) -> str:
+    if re.search(
+        r"(?i)(?:%22|&quot;|&#0*34;|&#x0*22;|%27|&apos;|&#0*39;|&#x0*27;|[\"'])"
+        + re.escape(REDACTED)
+        + r"(?:%22|&quot;|&#0*34;|&#x0*22;|%27|&apos;|&#0*39;|&#x0*27;|[\"'])"
+        + r"(?=$|[,;)}\] \t])",
+        token,
+    ):
+        return REDACTED
+    wrapped = token.strip()
+    for _ in range(8):
+        if _unquote(wrapped) == REDACTED:
+            return REDACTED
+        if not wrapped or wrapped[-1] not in ",.;:!?)]}":
+            break
+        wrapped = wrapped[:-1]
     unquoted = _unquote(token)
-    marker_candidate = unquoted.lstrip("([{<\"'`").rstrip(".,;:)]}>!?\"'`")
+    marker_candidate = unquoted.lstrip("><=([{\"'`\u201c\u2018").rstrip(
+        ".,;:)]}>!?\"'`\u201c\u201d\u2018\u2019"
+    )
     if unquoted == REDACTED or (unquoted != "REDACTED" and marker_candidate == "REDACTED"):
         return REDACTED
     if unquoted.startswith(REDACTED) and all(
         char in ".,;:)]" for char in unquoted[len(REDACTED) :]
     ):
         return REDACTED
-    if not unquoted or (unquoted[0] not in "\\([{<\"'`" and unquoted[-1] not in "\\.,;:)]}>!?\"'`"):
+    if not unquoted or (
+        unquoted[0] not in "\\><=([{\"'`\u201c\u2018"
+        and unquoted[-1] not in "\\.,;:)]}>!?\"'`\u201c\u201d\u2018\u2019"
+    ):
         return unquoted
-    return unquoted.lstrip("\\([{<\"'`").rstrip("\\.,;:)]}>!?\"'`")
+    return unquoted.lstrip("\\><=([{\"'`\u201c\u2018").rstrip(
+        "\\.,;:)]}>!?\"'`\u201c\u201d\u2018\u2019"
+    )
 
 
 @lru_cache(maxsize=4096)
@@ -533,7 +741,7 @@ def _credential_literal_candidates(token: str) -> set[str]:
                 and _looks_like_key_material(candidate)
                 and not _is_hostname_or_module_like(candidate)
                 and not _is_benign_shape(candidate)
-                and not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*([_-][A-Za-z0-9]+)+", candidate)
+                and not _is_parameter_identifier(candidate)
             ):
                 candidates.add(candidate)
                 if len(candidates) >= 8:
@@ -541,6 +749,53 @@ def _credential_literal_candidates(token: str) -> set[str]:
         if len(candidates) >= 8:
             break
     return candidates
+
+
+_PARAMETER_IDENTIFIERS = frozenset(
+    {
+        "token_type",
+        "expires_in",
+        "session_id",
+        "access_token",
+        "refresh_token",
+        "client_id",
+        "redirect_uri",
+        "scope",
+        "state",
+        "region",
+        "server",
+        "bandwidthtest",
+        "response_type",
+        "grant_type",
+        "code_challenge",
+        "expires",
+        "code_verifier",
+        "client_secret",
+        "redirect",
+        "error_description",
+    }
+)
+
+
+def _is_parameter_identifier(value: str) -> bool:
+    if value.casefold() in _PARAMETER_IDENTIFIERS:
+        return True
+    if re.fullmatch(r"live_\d{5,}_[A-Za-z0-9]{10,}", value):
+        return False
+    if re.fullmatch(r"[a-z0-9]{4}(?:-[a-z0-9]{4}){3,4}", value):
+        return False
+    if (
+        len(value) >= 12
+        and any(char.isdigit() for char in value)
+        and any(char.isalpha() for char in value)
+    ):
+        return False
+    if any(char.isupper() for char in value) and any(char.isdigit() for char in value):
+        return False
+    return (
+        bool(re.fullmatch(r"[a-z][a-z_]*(?:-[a-z]+)?(?:[_-][a-z]+){0,2}", value))
+        and len(value) < 20
+    )
 
 
 def _is_benign_shape(value: str) -> bool:
@@ -785,7 +1040,7 @@ def _hotkey_key_exempt(  # noqa: PLR0911
         return True
     if not isinstance(value, str):
         return False
-    return value in _OBS_KEY_NAMES
+    return _is_obs_key_enum(value)
 
 
 # Identifier names from OBS_HOTKEY and OBS_MOUSE_BUTTON entries in
@@ -1349,7 +1604,8 @@ def _strong_credential_values(value: Any, context: tuple[str, ...] = ()) -> set[
     if isinstance(value, dict):
         pair = _header_pair_keys(value)
         if pair is not None:
-            values.update(_credential_literals(value[pair[1]]))
+            for pair_value_key in _header_pair_value_keys(value, pair[0]):
+                values.update(_credential_literals(value[pair_value_key]))
         for key, child in value.items():
             if pair is not None and key == pair[0]:
                 continue
@@ -1448,6 +1704,9 @@ def _is_sensitive_key(key: str, context: tuple[str, ...] = (), value: Any = None
         "oauth",
         "bearer",
         "auth",
+        "wspass",
+        "authcode",
+        "refresh",
     }:
         return True
     if normalized in {
@@ -1460,7 +1719,15 @@ def _is_sensitive_key(key: str, context: tuple[str, ...] = (), value: Any = None
     if context and context[-1] == "__url_query__" and normalized in {"auth", "sig"}:
         return True
     # Credential suffixes apply regardless of lowercase compound prefixes.
-    if normalized.endswith(("password", "passwd", "secret", "token")):
+    if normalized.endswith(("password", "passwd", "secret", "token", "oauth", "jwt")):
+        return True
+    if normalized.endswith("pw") and (
+        len(normalized) == 2 or re.search(r"[_-]pw$", key, re.I) or re.search(r"[a-z]Pw$", key)
+    ):
+        return True
+    if normalized.endswith("pass") and (
+        len(normalized) == 4 or re.search(r"[_-]pass$", key, re.I) or re.search(r"[a-z]Pass$", key)
+    ):
         return True
     # Preserve the existing explicit/generic key recognition without treating
     # ordinary OBS settings such as keyint and key_color as credentials.
@@ -1494,7 +1761,7 @@ def _unquote(value: str) -> str:
     for opening, closing in (
         ("&ldquo;", "&rdquo;"),
         ("&lsquo;", "&rsquo;"),
-        ("“", "”"),
+        ("\u201c", "\u201d"),
         ("\u2018", "\u2019"),
     ):
         if value.casefold().startswith(opening.casefold()) and value.casefold().endswith(
@@ -1525,7 +1792,7 @@ def _quoted_redacted(value: str) -> str:  # noqa: PLR0911
     for opening, closing in (
         ("&ldquo;", "&rdquo;"),
         ("&lsquo;", "&rsquo;"),
-        ("“", "”"),
+        ("\u201c", "\u201d"),
         ("\u2018", "\u2019"),
     ):
         if value.casefold().startswith(opening.casefold()) and value.casefold().endswith(
@@ -1743,6 +2010,14 @@ def _query_value_is_redacted(value: str) -> bool:
         or bool(re.match(r"[&;][A-Za-z0-9_.-]+=", following))
         or bool(re.fullmatch(r"[<>\"'`.,;:!?)]}]*", following))
     )
+
+
+def _query_value_line_tail(text: str, end: int) -> str:
+    boundaries = [
+        position for position in (text.find("\n", end), text.find("\r", end)) if position >= 0
+    ]
+    line_end = min(boundaries) if boundaries else len(text)
+    return text[end:line_end]
 
 
 def _has_sensitive_query_assignment(text: str) -> bool:
@@ -2139,6 +2414,16 @@ def _redact_free_text_credential_spans(text: str, counts: dict[str, int]) -> str
     return "".join(pieces)
 
 
+def _redact_bracketed_pairs(text: str, counts: dict[str, int]) -> str:
+    replacements: list[tuple[int, int, str]] = []
+    for start, end, value in _bracketed_pair_matches(text):
+        replacement = _scheme_redacted_value(value, counts)
+        replacements.append((start, end, replacement))
+    for start, end, replacement in reversed(replacements):
+        text = text[:start] + replacement + text[end:]
+    return text
+
+
 def _redact_token_preserving_delimiters(raw: str) -> str:
     cleaned = _clean_credential_literal(raw)
     if cleaned == REDACTED:
@@ -2209,6 +2494,8 @@ def _embedded_secrets(text: str) -> set[str]:  # noqa: PLR0912
             if _cookie_pair_promotable(pair.group(1), pair.group(2)):
                 values.update(_credential_literal_candidates(pair.group(2)))
     if _SENSITIVE_NAME_HINT.search(text):
+        for _start, _end, value in _bracketed_pair_matches(text):
+            values.update(_credential_literals(value))
         for match in _CLI_ASSIGNMENT.finditer(_mask_urls(text)):
             option = re.match(r"--?([A-Za-z0-9_.-]+)", match.group(1))
             if option and _is_sensitive_key(option.group(1)):
@@ -2491,13 +2778,14 @@ def _credential_literals(value: Any) -> set[str]:  # noqa: PLR0911
     return set()
 
 
-def _credential_values(value: Any, context: tuple[str, ...] = ()) -> set[str]:
+def _credential_values(value: Any, context: tuple[str, ...] = ()) -> set[str]:  # noqa: PLR0912
     """Collect credential literals transiently so duplicate values can be checked."""
     values: set[str] = set()
     if isinstance(value, dict):
         pair = _header_pair_keys(value)
         if pair is not None:
-            values.update(_credential_literals(value[pair[1]]))
+            for pair_value_key in _header_pair_value_keys(value, pair[0]):
+                values.update(_credential_literals(value[pair_value_key]))
         for key, child in value.items():
             if pair is not None and key == pair[0]:
                 continue
@@ -2514,6 +2802,24 @@ def _credential_values(value: Any, context: tuple[str, ...] = ()) -> set[str]:
     elif isinstance(value, list):
         if _header_pair_list(value):
             values.update(_credential_literals(value[1]))
+            return {literal for literal in values if not _never_promote_literal(literal)}
+        if _alternating_list_shape(value):
+            index = 0
+            while index + 1 < len(value):
+                name = _alternating_list_name(value[index])
+                candidate = (
+                    _alternating_list_name(value[index + 1])
+                    if isinstance(value[index + 1], dict)
+                    else value[index + 1]
+                )
+                if name is not None and _alternating_sensitive_name(name, candidate):
+                    values.update(_credential_literals(candidate))
+                    index += 2
+                else:
+                    values.update(_credential_values(value[index], context))
+                    index += 1
+            if index < len(value):
+                values.update(_credential_values(value[index], context))
             return {literal for literal in values if not _never_promote_literal(literal)}
         for child in value:
             values.update(_credential_values(child, context))
@@ -2610,7 +2916,7 @@ def _scrub_text(text: str, secrets: set[str]) -> str:
 
 
 def _redact_embedded(  # noqa: PLR0912, PLR0915
-    text: str, counts: dict[str, int], secrets: set[str] | None = None
+    text: str, counts: dict[str, int], secrets: set[str] | None = None, *, ini_mode: bool = False
 ) -> str:
     broken_backslash = _BROKEN_BACKSLASH_ASSIGNMENT.fullmatch(text)
     if broken_backslash and _is_sensitive_key(broken_backslash.group("name")):
@@ -2639,7 +2945,9 @@ def _redact_embedded(  # noqa: PLR0912, PLR0915
         )
 
     text, escaped_json = _protect_escaped_json(text, counts, secrets or set())
-    text = _redact_free_text_credential_spans(text, counts)
+    text = _redact_bracketed_pairs(text, counts)
+    if not ini_mode:
+        text = _redact_free_text_credential_spans(text, counts)
 
     def replace(match: re.Match[str], *, check_noncredential: bool = True) -> str:
         raw_value = match.group(2)
@@ -2761,8 +3069,10 @@ def _redact_embedded(  # noqa: PLR0912, PLR0915
 
         text = _sub_outside_json(text, _STREAMELEMENTS_TOKEN, redact_elements)
     if (
-        "discord.com/api/webhooks/" in text.casefold()
-        or "discordapp.com/api/webhooks/" in text.casefold()
+        ".discord.com/api" in text.casefold()
+        or ".discordapp.com/api" in text.casefold()
+        or "https://discord.com/api" in text.casefold()
+        or "https://discordapp.com/api" in text.casefold()
     ):
 
         def redact_discord(match: re.Match[str]) -> str:
@@ -2770,7 +3080,10 @@ def _redact_embedded(  # noqa: PLR0912, PLR0915
             return f"{match.group(1)}{REDACTED}"
 
         text = _sub_outside_json(text, _DISCORD_WEBHOOK_TOKEN, redact_discord)
-    if "hooks.slack.com/services/" in text.casefold():
+    if any(
+        f"hooks.slack.com/{path}/" in text.casefold()
+        for path in ("services", "workflows", "triggers")
+    ):
 
         def redact_slack(match: re.Match[str]) -> str:
             counts["credential_pattern"] = counts.get("credential_pattern", 0) + 1
@@ -2846,8 +3159,9 @@ def _redact_embedded(  # noqa: PLR0912, PLR0915
             text = _sub_overlapping_assignments(text, replace_match)
         else:
             text = _sub_outside_json(text, pattern, replace_match)
-    for marker, fragment in escaped_json.items():
-        text = text.replace(marker, fragment)
+    if escaped_json:
+        marker_pattern = re.compile("|".join(re.escape(marker) for marker in escaped_json))
+        text = marker_pattern.sub(lambda match: escaped_json[match.group(0)], text)
     return text
 
 
@@ -2917,26 +3231,10 @@ def _redact_object(  # noqa: PLR0911, PLR0912
     if isinstance(value, dict):
         result: dict[str, Any] = {}
         pair = _header_pair_keys(value)
+        pair_values = _header_pair_value_keys(value, pair[0]) if pair is not None else set()
         for key, child in value.items():
-            if pair is not None and key == pair[1]:
-                if isinstance(child, list):
-                    items = list(child)
-                    first = (
-                        1
-                        if items
-                        and isinstance(items[0], str)
-                        and _normalize_scheme_candidate(items[0]) in _SCHEME_NAMES
-                        else 0
-                    )
-                    for index in range(first, len(items)):
-                        if isinstance(items[index], (str, int, float)) and not isinstance(
-                            items[index], bool
-                        ):
-                            items[index] = REDACTED
-                    result[key] = items
-                else:
-                    result[key] = REDACTED
-                counts["credential_field"] = counts.get("credential_field", 0) + 1
+            if pair is not None and key in pair_values:
+                result[key] = _redact_pair_payload(child, counts, secrets)
                 continue
             if pair is not None and key == pair[0]:
                 result[key] = child
@@ -2959,31 +3257,42 @@ def _redact_object(  # noqa: PLR0911, PLR0912
         return result
     if isinstance(value, list):
         if _header_pair_list(value):
-            name, child = value
-            if isinstance(child, list):
-                items = list(child)
-                first = (
-                    1
-                    if items
-                    and isinstance(items[0], str)
-                    and _normalize_scheme_candidate(items[0]) in _SCHEME_NAMES
-                    else 0
-                )
-                for index in range(first, len(items)):
-                    if not isinstance(items[index], (bool, type(None), dict, list)):
-                        items[index] = REDACTED
-                return [name, items]
-            if isinstance(child, str):
-                token = resolve_credential_token(child, 0)
-                if token is not None and any(
-                    _scheme_word(part) for part in re.findall(r"[^\s]+", child[: token[0]])
+            name, child = value[0], value[1]
+            return [
+                name,
+                _redact_pair_payload(child, counts, secrets, preserve_scheme=True),
+                *value[2:],
+            ]
+        if _alternating_list_shape(value):
+            list_result = list(value)
+            index = 0
+            while index + 1 < len(list_result):
+                name = _alternating_list_name(list_result[index])
+                next_item = list_result[index + 1]
+                if name is not None and _alternating_sensitive_name(
+                    name, _alternating_list_name(next_item) or next_item
                 ):
-                    child = child[: token[0]] + REDACTED + child[token[1] :]
+                    if isinstance(next_item, dict) and len(next_item) == 1:
+                        item_key = next(iter(next_item))
+                        next_item = {
+                            item_key: _redact_pair_payload(
+                                next_item[item_key], counts, secrets, preserve_scheme=True
+                            )
+                        }
+                        list_result[index + 1] = next_item
+                    else:
+                        list_result[index + 1] = _redact_pair_payload(
+                            next_item, counts, secrets, preserve_scheme=True
+                        )
+                    index += 2
                 else:
-                    child = REDACTED
-            elif not isinstance(child, (bool, type(None), dict, list)):
-                child = REDACTED
-            return [name, child]
+                    list_result[index] = _redact_object(
+                        list_result[index], counts, secrets, context
+                    )
+                    index += 1
+            if index < len(list_result):
+                list_result[index] = _redact_object(list_result[index], counts, secrets, context)
+            return list_result
         return [_redact_object(child, counts, secrets, context) for child in value]
     if isinstance(value, str):
         if value in secrets:
@@ -2993,15 +3302,27 @@ def _redact_object(  # noqa: PLR0911, PLR0912
             if value != REDACTED:
                 counts["credential_field"] = counts.get("credential_field", 0) + 1
             return REDACTED
+        token = resolve_credential_token(value, 0)
+        if (
+            token is not None
+            and token[0] > 0
+            and value[token[0] : token[1]] not in {":", "="}
+            and _has_scheme_prefix(value, token[0])
+        ):
+            counts["credential_field"] = counts.get("credential_field", 0) + 1
+            value = value[: token[0]] + REDACTED + value[token[1] :]
         return _scrub_text(_redact_embedded(value, counts, secrets), secrets)
     return value
 
 
-def has_unredacted_fields(value: Any, context: tuple[str, ...] = ()) -> bool:  # noqa: PLR0911
+def has_unredacted_fields(value: Any, context: tuple[str, ...] = ()) -> bool:  # noqa: PLR0911, PLR0912
     """Check parsed JSON for recognized credential keys with remaining values."""
     if isinstance(value, dict):
         pair = _header_pair_keys(value)
-        if pair is not None and not _header_pair_value_redacted(value[pair[1]]):
+        if pair is not None and any(
+            not _sensitive_field_value_redacted(value[key])
+            for key in _header_pair_value_keys(value, pair[0])
+        ):
             return True
         for key, child in value.items():
             if pair is not None and key == pair[0]:
@@ -3018,6 +3339,27 @@ def has_unredacted_fields(value: Any, context: tuple[str, ...] = ()) -> bool:  #
     elif isinstance(value, list):
         if _header_pair_list(value) and not _sensitive_field_value_redacted(value[1]):
             return True
+        if _alternating_list_shape(value):
+            index = 0
+            while index + 1 < len(value):
+                name = _alternating_list_name(value[index])
+                next_value = value[index + 1]
+                plain_next = (
+                    _alternating_list_name(next_value)
+                    if isinstance(next_value, dict)
+                    else next_value
+                )
+                if name is not None and _alternating_sensitive_name(name, plain_next):
+                    if not _sensitive_field_value_redacted(plain_next):
+                        return True
+                    index += 2
+                else:
+                    if has_unredacted_fields(value[index], context) or has_unredacted_fields(
+                        next_value, context
+                    ):
+                        return True
+                    index += 2
+            return False
         return any(has_unredacted_fields(child, context) for child in value)
     elif isinstance(value, str):
         return has_unredacted_embedded_json(value)
@@ -3041,7 +3383,9 @@ def has_unredacted_embedded_json(text: str) -> bool:  # noqa: PLR0911, PLR0912
         _is_sensitive_key(match.group(2), ("__url_query__",))
         and _unquote(_query_value_parts(match.group(3))[0]).casefold()
         not in {"null", "undefined", "none", "nil", "true", "false"}
-        and not _query_value_is_redacted(match.group(3) + text[match.end(3) :])
+        and not _query_value_is_redacted(
+            match.group(3) + _query_value_line_tail(text, match.end(3))
+        )
         for match in _URL_QUERY_SECRET.finditer(text)
     ):
         return True
@@ -3287,7 +3631,7 @@ def redact_file_with_secrets(path: Path) -> tuple[dict[str, int], int, set[str]]
             if _is_weak_camel_key(match.group(1)) and _looks_like_key_material(value):
                 weak_secrets.add(value)
         clean = _redact_ini(text, path.name, counts, secrets)
-        clean = _scrub_text(_redact_embedded(clean, counts, secrets), secrets)
+        clean = _scrub_text(_redact_embedded(clean, counts, secrets, ini_mode=True), secrets)
         path.write_text(clean, encoding="utf-8", newline="")
     elif suffix == ".txt":
         text = read_text_safely(path)

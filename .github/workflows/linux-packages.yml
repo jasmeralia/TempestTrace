@@ -180,12 +180,21 @@ jobs:
                 done
                 if [[ -z "$window_id" ]]; then cat "$RUNNER_TEMP/tempesttrace-flatpak.log"; exit 1; fi
                 xdotool windowfocus --sync "$window_id"
+                echo "Flatpak window $window_id; focus: $(xdotool getwindowfocus getwindowname 2>/dev/null || true)"
                 # OBS combo, OBS chooser, Dropbox chooser, then the default Create Backup button.
                 xdotool key --clearmodifiers Tab Tab Tab Return
                 for _ in $(seq 1 90); do
                   archive_count=$(find "$FLATPAK_TEST_OUTPUT" -maxdepth 1 -type f \
                     -name "TempestTrace-*.zip" ! -name "*.incomplete.zip" | wc -l)
                   [[ "$archive_count" -ge "$FLATPAK_TEST_EXPECTED" ]] && exit 0
+                  if ! kill -0 "$app_pid" 2>/dev/null; then
+                    if wait "$app_pid"; then
+                      echo "Flatpak app exited with status 0 before creating the archive"
+                    else
+                      echo "Flatpak app exited with status $? before creating the archive"
+                    fi
+                    break
+                  fi
                   sleep 1
                 done
                 echo "Flatpak backup timed out; visible windows:"

@@ -10,12 +10,53 @@ on:
 permissions:
   contents: read
 
-# Serialize retries of one commit without dropping releases for other commits.
+# Keep version allocation and package builds ordered across master merges.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.sha }}
-  cancel-in-progress: false
+  group: ${{ github.event_name == 'pull_request' && format('tempesttrace-pr-{0}', github.event.pull_request.number) || 'tempesttrace-build-release' }}
+  queue: max
 
 jobs:
+  resolve-release:
+    name: Resolve release version
+    runs-on: ubuntu-latest
+    outputs:
+      is_release: ${{ steps.release.outputs.is_release }}
+      create_tag: ${{ steps.release.outputs.create_tag }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - name: Detect a failed release retry
+        id: retry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && github.run_attempt > 1
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          previous_attempt=$((GITHUB_RUN_ATTEMPT - 1))
+          failed_builds=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${previous_attempt}/jobs" \
+            --paginate \
+            --jq '[.jobs[] | select(.conclusion == "failure" and (.name | startswith("Build ") or startswith("Linux packages ("))) | .name] | unique | .[]')
+          if [ -n "$failed_builds" ]; then
+            echo 'failed=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'failed=false' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Resolve version and release mode
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          GITHUB_SHA: ${{ github.sha }}
+          RETRY_FAILED_RELEASE: ${{ steps.retry.outputs.failed || 'false' }}
+        run: python scripts/release_info.py
+
   lint-and-test:
     name: Lint & Test
     runs-on: ubuntu-latest
@@ -31,6 +72,10 @@ jobs:
           cache-dependency-path: |
             requirements-dev.txt
             pyproject.toml
+      - name: Install Qt system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0
       - name: Install dependencies
         run: make deps
       - name: Lint
@@ -64,31 +109,54 @@ jobs:
           report_type: test_results
           fail_ci_if_error: true
 
+  create-release-tag:
+    name: Create or resolve version tag
+    needs: [resolve-release, lint-and-test]
+    if: needs.resolve-release.outputs.is_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Create tag on the triggering commit
+        if: needs.resolve-release.outputs.create_tag == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ needs.resolve-release.outputs.tag_name }}
+        run: |
+          ref="repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG_NAME}"
+          if existing_sha=$(gh api "$ref" --jq '.object.sha' 2>/dev/null); then
+            test "$existing_sha" = "$GITHUB_SHA"
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
+              --method POST \
+              --field "ref=refs/tags/${TAG_NAME}" \
+              --field "sha=${GITHUB_SHA}"
+          fi
+      - name: Confirm tag points to this build
+        env:
+          TAG_NAME: ${{ needs.resolve-release.outputs.tag_name }}
+        run: |
+          git fetch --force origin "refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}"
+          test "$(git rev-parse "refs/tags/${TAG_NAME}^{commit}")" = "${GITHUB_SHA}"
+
   windows-release:
     name: Build Windows installer
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-    needs: lint-and-test
+    needs: [lint-and-test, resolve-release, create-release-tag]
+    if: >-
+      needs.lint-and-test.result == 'success' &&
+      needs.resolve-release.outputs.is_release == 'true' &&
+      needs.create-release-tag.result == 'success'
     runs-on: windows-latest
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 0
-      - name: Check implementation readiness
-        id: ready
-        shell: pwsh
-        run: |
-          # The marker is added only after all platform build jobs and the final
-          # all-assets release job exist. This job never publishes by itself.
-          if ((Test-Path build/TempestTrace.spec) -and (Test-Path build/installer.nsi) -and (Test-Path build/release-ready)) {
-            "value=true" >> $env:GITHUB_OUTPUT
-          } else {
-            Write-Host "Release pipeline incomplete: no executable or release is published."
-            "value=false" >> $env:GITHUB_OUTPUT
-          }
+          ref: ${{ needs.resolve-release.outputs.is_release == 'true' && format('refs/tags/{0}', needs.resolve-release.outputs.tag_name) || github.sha }}
       - uses: actions/setup-python@v7
-        if: steps.ready.outputs.value == 'true'
         with:
           python-version: '3.14'
           cache: pip
@@ -96,26 +164,19 @@ jobs:
             requirements-dev.txt
             pyproject.toml
       - name: Install dependencies
-        if: steps.ready.outputs.value == 'true'
         run: python -m pip install -r requirements-dev.txt
       - name: Build one-file executable
-        if: steps.ready.outputs.value == 'true'
         shell: pwsh
+        env:
+          APP_VERSION: ${{ needs.resolve-release.outputs.tag_name }}
         run: python -m PyInstaller build/TempestTrace.spec --distpath dist --workpath build/tmp
       - name: Smoke-test executable
-        if: steps.ready.outputs.value == 'true'
         shell: pwsh
         run: |
           if (-not (Test-Path dist/TempestTrace.exe)) { throw "Missing Windows executable" }
-          & ./dist/TempestTrace.exe --smoke-test
-          if ($LASTEXITCODE -ne 0) { throw "Windows executable smoke test failed" }
-      - name: Resolve next tag
-        if: steps.ready.outputs.value == 'true'
-        id: version
-        shell: pwsh
-        run: python scripts/release_info.py
+          $proc = Start-Process -FilePath (Resolve-Path 'dist/TempestTrace.exe').Path -ArgumentList '--smoke-test' -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { throw "Windows executable smoke test failed with exit code $($proc.ExitCode)" }
       - name: Ensure NSIS
-        if: steps.ready.outputs.value == 'true'
         shell: pwsh
         run: |
           $nsisX86 = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
@@ -125,10 +186,9 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "NSIS installation failed" }
           }
       - name: Build NSIS installer
-        if: steps.ready.outputs.value == 'true'
         shell: pwsh
         env:
-          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.tag_name }}
         run: |
           $nsis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
           if (-not (Test-Path $nsis)) { $nsis = "${env:ProgramFiles}\NSIS\makensis.exe" }
@@ -139,10 +199,9 @@ jobs:
             throw "Missing NSIS installer"
           }
       - name: Smoke-test NSIS install and uninstall
-        if: steps.ready.outputs.value == 'true'
         shell: pwsh
         env:
-          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_TAG: ${{ needs.resolve-release.outputs.tag_name }}
         run: |
           $installDir = Join-Path $env:RUNNER_TEMP 'TempestTrace-nsis-smoke'
           $installer = (Resolve-Path "dist/TempestTrace-Setup-$env:RELEASE_TAG.exe").Path
@@ -151,28 +210,142 @@ jobs:
           $app = Join-Path $installDir 'TempestTrace.exe'
           if (-not (Test-Path $app)) { throw "Installed executable is missing" }
           if (-not (Test-Path (Join-Path $installDir 'LICENSE'))) { throw "Installed license is missing" }
-          & $app --smoke-test
-          if ($LASTEXITCODE -ne 0) { throw "Installed executable smoke test failed" }
+          $smoke = Start-Process -FilePath $app -ArgumentList '--smoke-test' -Wait -PassThru
+          if ($smoke.ExitCode -ne 0) { throw "Installed executable smoke test failed with exit code $($smoke.ExitCode)" }
           $uninstaller = Join-Path $installDir 'Uninstall.exe'
           $uninstall = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassThru
           if ($uninstall.ExitCode -ne 0) { throw "NSIS silent uninstall failed" }
           if (Test-Path $app) { throw "Uninstall left the executable installed" }
           if (Test-Path (Join-Path $installDir 'LICENSE')) { throw "Uninstall left the license installed" }
       - name: Create SHA-256 checksum
-        if: steps.ready.outputs.value == 'true'
         shell: pwsh
         run: |
-          $assets = @(Get-Item -LiteralPath "dist/TempestTrace-Setup-${{ steps.version.outputs.tag }}.exe" -ErrorAction Stop)
+          $assets = @(Get-Item -LiteralPath "dist/TempestTrace-Setup-${{ needs.resolve-release.outputs.tag_name }}.exe" -ErrorAction Stop)
           foreach ($asset in $assets) {
             $hash = (Get-FileHash $asset.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
             "$hash  $($asset.Name)" | Set-Content "$($asset.FullName).sha256"
           }
       - name: Preserve installer for final release job
-        if: steps.ready.outputs.value == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: windows-installer
           path: |
-            dist/TempestTrace-Setup-${{ steps.version.outputs.tag }}.exe
-            dist/TempestTrace-Setup-${{ steps.version.outputs.tag }}.exe.sha256
+            dist/TempestTrace-Setup-${{ needs.resolve-release.outputs.tag_name }}.exe
+            dist/TempestTrace-Setup-${{ needs.resolve-release.outputs.tag_name }}.exe.sha256
           if-no-files-found: error
+
+  linux-packages:
+    name: Build and smoke-test Linux packages
+    needs: [lint-and-test, resolve-release, create-release-tag]
+    if: >-
+      needs.lint-and-test.result == 'success' &&
+      needs.resolve-release.outputs.is_release == 'true' &&
+      needs.create-release-tag.result == 'success'
+    uses: ./.github/workflows/linux-packages.yml
+    with:
+      app_version: ${{ needs.resolve-release.outputs.is_release == 'true' && needs.resolve-release.outputs.tag_name || '' }}
+
+  publish-release:
+    name: Verify and publish complete beta release
+    needs:
+      - resolve-release
+      - create-release-tag
+      - windows-release
+      - linux-packages
+    if: >-
+      needs.resolve-release.outputs.is_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    env:
+      TAG_NAME: ${{ needs.resolve-release.outputs.tag_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ needs.resolve-release.outputs.tag_name }}
+      - uses: actions/download-artifact@v7
+        with:
+          name: windows-installer
+          path: release-assets/windows
+      - uses: actions/download-artifact@v7
+        with:
+          name: linux-packages-amd64
+          path: release-assets/linux-amd64
+      - uses: actions/download-artifact@v7
+        with:
+          name: linux-packages-arm64
+          path: release-assets/linux-arm64
+      - name: Verify package matrix and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="TempestTrace-Setup-${TAG_NAME}.exe"
+          test -f "release-assets/windows/${expected}"
+          test -f "release-assets/windows/${expected}.sha256"
+          (cd release-assets/windows && sha256sum --check --strict "${expected}.sha256")
+          cp "release-assets/windows/${expected}" release-assets/
+          for arch in amd64 arm64; do
+            folder="release-assets/linux-${arch}"
+            test -f "${folder}/SHA256SUMS"
+            (cd "$folder" && sha256sum --check --strict SHA256SUMS)
+            for suffix in deb rpm AppImage flatpak snap; do
+              asset="TempestTrace-${TAG_NAME}-linux-${arch}.${suffix}"
+              test -f "${folder}/${asset}"
+              cp "${folder}/${asset}" release-assets/
+            done
+          done
+          (cd release-assets && sha256sum TempestTrace-* > SHA256SUMS)
+          (cd release-assets && sha256sum --check --strict SHA256SUMS)
+          count=$(find release-assets -maxdepth 1 -type f -name 'TempestTrace-*' | wc -l)
+          test "$count" -eq 11
+      - name: Create release if absent; verify existing assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t assets < <(find release-assets -maxdepth 1 -type f \
+            \( -name 'TempestTrace-*' -o -name 'SHA256SUMS' \) -print | sort)
+          if ! gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            notes_file="$RUNNER_TEMP/supported-platforms.md"
+            printf '%s\n' \
+              '## Supported platforms' \
+              '' \
+              '- Windows 10/11 x64 NSIS installer.' \
+              '- Linux amd64/arm64 built on Ubuntu 24.04. DEB, RPM, and AppImage require glibc 2.39 or newer; Flatpak and Snap use pinned runtimes.' \
+              '- RPM smoke-tested on Fedora 42.' \
+              '- Snap requires `sudo snap connect tempesttrace:obs-config`.' \
+              '- Flatpak and Snap are sideloaded packages with no configured remote or store channel.' \
+              > "$notes_file"
+            gh release create "$TAG_NAME" "${assets[@]}" \
+              --verify-tag --prerelease --notes-file "$notes_file" --generate-notes
+            exit 0
+          fi
+
+          # Existing assets are immutable: verify same-name assets byte-for-byte
+          # and upload only missing names. Release prerelease/stable status is
+          # metadata and never controls this retry path.
+          mapfile -t existing_names < <(
+            gh release view "$TAG_NAME" --json assets --jq '.assets[].name'
+          )
+          missing=()
+          mkdir -p release-assets/existing
+          for asset_path in "${assets[@]}"; do
+            asset_name=${asset_path#release-assets/}
+            if printf '%s\n' "${existing_names[@]}" | grep -Fxq "$asset_name"; then
+              gh release download "$TAG_NAME" --pattern "$asset_name" \
+                --dir release-assets/existing
+              local_file_hash=$(sha256sum "$asset_path" | cut -d ' ' -f 1)
+              remote_file_hash=$(sha256sum "release-assets/existing/$asset_name" | cut -d ' ' -f 1)
+              if [[ "$local_file_hash" != "$remote_file_hash" ]]; then
+                echo "::error::Published asset $asset_name differs from the immutable build artifact."
+                exit 1
+              fi
+            else
+              missing+=("$asset_path")
+            fi
+          done
+          if (( ${#missing[@]} )); then
+            gh release upload "$TAG_NAME" "${missing[@]}"
+          fi

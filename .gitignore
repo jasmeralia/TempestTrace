@@ -15,3 +15,4 @@ build/tmp/
 .env
 *.ini
 *.json.bak
+.kanna/

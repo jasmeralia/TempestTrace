@@ -1,6 +1,13 @@
 # TempestTrace design and implementation plan
 
-Status: design; implementation has not started. Source task: Odoo project.task 583,
+Status: implementation in progress. The path adapters, collector, redaction, PyQt
+window, verified updater, Linux package definitions, and cross-platform CI workflows
+are implemented with synthetic fixtures. The full package workflows have not yet run
+in GitHub Actions. Each successful master build will publish a beta prerelease after
+the Windows and Linux CI package builds and smoke tests pass; hands-on installation,
+collection, update, sandbox, and streaming checks validate that beta before Morgan
+promotes it to stable.
+Source task: Odoo project.task 583,
 "Build TempestTrace: Safe OBS Diagnostic Backup."
 
 ## Goal and boundaries
@@ -88,11 +95,176 @@ paths on real Windows and Linux installations before shipping.
 Redact only the staged copies. Parse JSON structurally and INI files by section/key;
 do not apply broad string replacements to scene or profile files. Preserve every
 non-secret value, key order where practical, scene/source object, and diagnostic
-setting. Start with explicit sensitive fields such as OBS service `key`,
-`bearer_token`, `password`, authentication tokens, and client secrets. Scan logs for
+setting. Classify free-text assignment and URL query names with the same sensitive-key
+rules used for JSON and INI fields, including generic `*_key`, `*_token`,
+`*_password`, and `*_secret` names. Redact URL userinfo passwords while preserving
+the user name and URL structure. Preserve booleans and `null` under sensitive-looking
+JSON keys; redact strings and numbers, and replace objects or arrays wholesale.
+Start with explicit sensitive fields such as OBS service `key`, `bearer_token`,
+`password`, authentication tokens, and client secrets. Redact stream-key
+path segments of RTMP-family URLs and SRT `passphrase`/`streamid` values. Scan logs for
 known credential patterns and redact matching values while keeping the surrounding
 diagnostic line. Maintain a versioned field/path rule list and fixtures taken from
 synthetic OBS data; never commit Rin's real configuration or log samples.
+For cross-file literal scans, first redact every collected file and gather eligible
+credential literals, then scrub and verify every staged file before promotion. The
+redaction rules are versioned (currently version 25). Free-text assignments, URL query
+and fragment values, CLI arguments, and next-line credentials are promoted only when
+they look like key material (at least eight characters and containing a digit or
+non-letter). Authorization and Proxy-Authorization credential tokens after a
+recognized scheme, explicit JSON/INI credential fields, URL userinfo passwords, and
+recognized webhook/widget path tokens are promoted without that heuristic. Cookie and
+Set-Cookie headers are redacted as a whole, including quoted headers preceded by an
+opening parenthesis or bracket. Cookie pair values are promoted only when
+the value passes the key-material heuristic and does not have a benign version, locale,
+time-zone/path, date/time, boolean, number, or hostname shape; credential-like
+cookie names do not bypass that gate.
+Standard cookie attributes such as Domain, Path, Expires, Max-Age, SameSite, Secure,
+HttpOnly, Priority, and Partitioned are never promoted. Bare Authorization or Cookie
+values with no recognized scheme or credential-like cookie pair use the normal
+key-material gate. Free-text values are still redacted in place even when they are not
+promoted for cross-file matching.
+Never promote known authorization scheme names, OBS hotkey enum names,
+resolution/quality tokens, placeholders, parenthesized values, or an exact redaction
+marker.
+
+One credential-token resolver is shared by redaction, harvesting, and verification.
+After a sensitive label separator it skips spaces, tabs, newline and indentation
+continuations, including blank lines, then skips up to four case-insensitive scheme
+words before selecting the next whitespace-free token as the credential. Scheme words
+are unquoted, one wrapped leading opener is ignored, and trailing punctuation runs are
+ignored for recognition. A following
+sensitive label ending in a colon or equals sign starts a new assignment and is not
+consumed as a scheme or credential. An unindented continuation is
+accepted only when it contains one whitespace-free token; a timestamp-prefixed log
+line is not part of the value. YAML block markers `|`, `>`, `|-`, `>-`, `|+`, and `>+`
+(optionally followed by an indentation digit) count as empty same-line values, so an
+indented following line can hold the credential. An empty block marker with no
+continuation credential is an empty value and does not make verification fail.
+Continuation tokens are still redacted in place, but are promoted across files only
+when the token is alone on its line, or follows only recognized scheme words there,
+passes the key-material gate, and is not a timestamp, name=value assignment, URL, OBS
+enum, or resolution/quality token.
+Harvested literals remove only a leading or trailing run of credential punctuation;
+punctuation inside the literal is preserved. Each harvested token contributes its full
+cleaned literal and up to seven separator-delimited candidates. Separators include
+commas, semicolons, pipes, ampersands, hashes, query punctuation, colons, slashes,
+quotes, brackets, braces, angle brackets, backticks, whitespace, and selected encoded
+forms (`%26`, `%2C`, `%3B`, `%7C`, `%23`, `%3F`). Candidate components and values from
+`name=value` components must pass the source promotion gate. Hostname-shaped values,
+encoder/module names in derived candidates, and short plain words are rejected. The
+full token remains available so real secrets containing separators still match exactly.
+Candidate search is bounded to eight values per token. The source token span is redacted
+whole.
+Sensitive JSON strings beginning with a recognized authentication scheme also contribute
+the resolved token. Header arrays represented as name/value objects redact and harvest
+the sibling value when the name is sensitive; unrelated pairs remain untouched.
+`WWW-Authenticate`, `Proxy-Authenticate`, and `Authentication` are recognized sensitive
+headers. Challenge text such as `Bearer realm="api"` remains when its resolved value
+does not pass the credential gate.
+For scheme-prefixed and continuation
+values, the label, scheme words, line breaks, and indentation are preserved while the
+credential token is replaced. Cookie pair headers keep their existing whole-value
+redaction. Authorization whole-line rewriting harvests the resolved token before
+removing the rest of that line. Verification requires the resolved credential token itself to equal
+`<REDACTED>` after stripping one matching surrounding quote or backtick; redacting only
+a neighboring scheme word is not sufficient. Cross-file values are matched with a
+single compiled alternation per file, with longest values first and the same
+provenance and boundary rules used by the verifier.
+
+Also inspect valid JSON objects and arrays embedded in INI values, log lines, and
+string-valued JSON fields. Redact credential fields within those fragments and scan
+quoted credential assignments in malformed JSON-like text. The final verifier must
+reject either form if credentials remain. Preserve OBS hotkey `key` values only at
+the binding field in `OBSBasic.*` JSON-valued INI assignments, including multiline
+values; nested settings named `key` remain sensitive. Leave credential-free embedded
+JSON text byte-for-byte intact.
+
+The hotkey `key` exemption is value-based: empty values, recognized `OBS_HOTKEY`
+and `OBS_MOUSE_BUTTON` names, and `OBS_KEY_0x` followed by exactly two hexadecimal
+digits are preserved in a valid hotkey binding. A `settings` ancestor makes `key`
+sensitive.
+Unquoted URL query and fragment values end at whitespace, end of text, or a following
+named parameter. Quotes and angle brackets end a value only when they are closing
+delimiters. Authorization assignments accept quoted names and values, preserve known
+scheme words, and redact the resolved credential token, including credentials after
+multiple schemes and credentials on indented continuation lines.
+Cross-file scrubbing covers raw, percent-encoded, JSON `\\u`, and `\\x` escaped
+forms of known literals in every file. RTMP harvesting examines eligible stream-key
+segments in the path, excludes resolution and quality tokens, and accepts segments of
+at least 16 characters, mixed alphanumeric segments, or hex-letter segments of at
+least eight characters. Mixed case alone does not qualify. Weak-source literals
+from RTMP paths and generic camelCase `*Key` fields match case-sensitively; literals
+from explicit credential fields remain case-insensitive. In-place URL redaction
+continues to accept alphabetic stream-key segments of eight or more characters, or
+segments of at least four characters containing a non-letter. URL userinfo passwords
+are redacted through the last `@` in the token, while numeric host ports, bracketed
+IPv6 authorities, and path `@` values are preserved. Literal matching treats
+underscore as a separator, uses alphanumeric boundaries for ordinary values, and
+permits long high-entropy values containing digits inside longer identifiers. Exact
+OBS hotkey enum names are exempt only in valid hotkey binding contexts. Matching
+JSON numbers are replaced only when their canonical rendering equals a harvested
+numeric credential. Log matching for numeric credentials requires an exact token
+boundary and does not treat adjacent decimal points or minus signs as boundaries.
+Unlisted camelCase `*Key` values are redacted only when they look like key material.
+Track strong and weak provenance per literal: any explicit credential source makes a
+literal strong even if the same characters also occur in a weak RTMP or camelCase
+source. Strong literals match case-insensitively; literals found only in weak sources
+remain case-sensitive. Redact Discord webhook token segments after the numeric ID on
+`discord.com`, `discordapp.com`, `ptb.discord.com`, `canary.discord.com`, and their
+`www` forms, including versioned API paths. Redact the final token segment on
+`hooks.slack.com/services`, `/workflows`, and `/triggers`, while retaining the host,
+path prefix, and webhook IDs.
+Sensitive URL fragment parameter values and StreamElements, Discord, and Slack widget
+tokens are harvested for cross-file scrubbing, along with existing Streamlabs tokens.
+Escaped quoted JSON values in logs are unwrapped consistently by redaction and
+verification.
+
+Header arrays represented as name/value objects redact and harvest the sibling value
+when the name is sensitive; unrelated pairs remain untouched. Pair aliases are matched
+without regard to case and accept snake_case and camelCase forms. Name-like fields
+include name, header, headerName, headerKey, field, label, k, id, n, and param;
+value-like fields include value, val, v, headerValue, content, data, text, string, and
+defaultValue. Two-element name/value arrays and ADVSS alternating name/value lists are
+supported. Header names use header-specific suffix rules, so X-Api-Key is sensitive
+without changing generic JSON classification of SortKey. String lists are redacted
+element-wise while retaining a recognized leading scheme word. The exact generic
+JSON/INI field names pass, oauth, bearer, auth, refresh, authCode, and the documented
+password, pw, oauth, and jwt suffix forms are sensitive; broader names such as session,
+pin, code, and signature are not. Derived candidates reject known parameter names and
+benign-shaped values; percent-encoded byte escapes are separators, and only value sides
+of name=value components are considered.
+
+For serialized JSON, verification is structural: inspect sensitive keys and scan
+decoded string values, never property names. For INI, classify assignments by key
+and parse JSON-valued assignments before checking decoded values, never section names
+or keys. Keep independent raw-text verification for logs and generated reports.
+Reject excessively nested JSON and text lines above the safe scan limit rather than
+risking an incomplete scan.
+
+Known limits: TempestTrace recognizes labels from a fixed vocabulary and a fixed set
+of storage shapes: JSON field names, header name/value pairs and alternating lists, URL
+query and fragment parameters, free-text `name=value` and `name: value` assignments,
+and known widget or webhook providers (Streamlabs, StreamElements, Discord including
+PTB and Canary, and Slack). Unknown labels and storage layouts are copied as is. An
+unlabeled second copy is scrubbed only when its value matches a value harvested from
+one of those recognized sources. Review the ZIP before sharing it, especially when OBS
+plugins use custom HTTP headers or store credentials in plugin-specific layouts.
+
+Large logs with many token-bearing URLs or escaped JSON can take minutes per file.
+Cancel takes effect between files. A local 4 MiB `create_backup` benchmark measured
+about 10.1 seconds for benign input and 25.1 seconds for dense token input; results vary
+with hardware and file contents. Empty password assignments in INI files are preserved
+without consuming a following section or assignment. Unusual multi-line INI values can
+still cause a neighboring line to be blanked. Ordinary words can be blanked when a
+logged cookie or form body resembles credential material. The path, encoding, nesting,
+and size limits described above also apply. Free-text parsing does not recognize tab
+separators or `=>`; free-text labels named `auth`, `oauth`, `bearer`, or `pass` are not
+recognized as assignments, although these names are handled in structured fields.
+
+Free-text credential assignments redact the full non-whitespace token. URL query
+redaction preserves a following named parameter such as `&region=us` while absorbing
+punctuation into the credential value when it does not begin another parameter.
 
 Streamlabs source settings must remain equivalent to the original at the parsed JSON
 subtree level, with one exception: values matching a known credential pattern (stream
@@ -109,17 +281,20 @@ free of secret values. Report counts and file paths, never removed values.
 
 ## Output safety and layout
 
-Stage the collected and redacted files in a uniquely named incomplete folder within
-the target parent, and verify them there. Include a completion marker in the
-manifest before compressing the verified staging tree into the final timestamped
-ZIP file, then remove the staging folder. Write the ZIP under an incomplete name
-first and rename it to its final name only once it is fully written; a failed or
-cancelled run leaves an explicitly named incomplete ZIP (or staging folder, if
-compression never started) that the UI offers to remove, and it must never
-masquerade as a complete backup. Do not overwrite an existing run. Record source
-relative path, output relative path, size, checksum, redaction categories/counts,
-read consistency, and warning state for each file. Avoid storing the Windows user
-name or raw absolute OBS path in the manifest unless required to explain a failure.
+Copy each source file into a private OS temporary directory outside the selected
+backup destination, then redact and verify it there. Only verified sanitized bytes
+may be copied into a uniquely named incomplete staging folder within the target
+parent; a Dropbox sync must never see raw OBS bytes. Include a completion marker in
+the manifest before compressing the verified staging tree into the final
+timestamped ZIP file, then remove the staging folder. Write the ZIP under an
+incomplete name first and rename it to its final name only once it is fully written;
+a failed or cancelled run leaves an explicitly named incomplete ZIP (or sanitized
+staging folder, if compression never started) that the UI offers to remove, and it
+must never masquerade as a complete backup. Do not overwrite an existing run.
+Record source relative path, output relative path, size, checksum, redaction
+categories/counts, read consistency, and warning state for each file. Avoid storing
+the Windows user name or raw absolute OBS path in the manifest unless required to
+explain a failure.
 
 ## Updates and release channels
 
@@ -128,8 +303,8 @@ name or raw absolute OBS path in the manifest unless required to explain a failu
   provide **Help > Check for Updates** for an explicit check. A failed or offline
   check leaves collection usable. Do not contact any service during collection.
 - Ignore drafts and select the highest compatible release with a matching asset for
-  the current OS and architecture. Stable installations default to stable releases;
-  beta installations keep receiving beta updates unless the user opts out. Show
+  the current OS and architecture. Offer stable releases by default for every install;
+  include prereleases only when the user opts into beta updates in Preferences. Show
   current and offered versions, stable/beta label, release notes, download size, and
   an explicit **Download and Update** action. Do not install silently.
 - Embed the CI-created version tag in each binary and compare versions with a
@@ -153,27 +328,42 @@ name or raw absolute OBS path in the manifest unless required to explain a failu
   verified local package and the appropriate user-approved package-manager action;
   do not claim that `apt`, `dnf`, `flatpak update`, or Snap refresh will discover a
   future GitHub asset on its own. For Flatpak, update the installed app from a new
-  local bundle and retain the app data; for Snap, document the required local-install
+  local bundle and retain the app data. Download its temporary update package under
+  the app's writable XDG cache; DEB, RPM, and Snap downloads use `~/Downloads`.
+  For Snap, document the required local-install
   trust mode and confinement. Never overwrite a managed package from inside the app
   or invoke a privileged package command silently.
   [Flatpak's single-file bundle guide](https://docs.flatpak.org/en/latest/single-file-bundles.html)
   distinguishes bundles from updateable remotes, and
   [Snap's install-mode guide](https://snapcraft.io/docs/explanation/snap-development/install-modes/)
   documents the trust and confinement flags for local snaps.
-- Once the release-ready gate is enabled, every successful master build publishes a
-  GitHub prerelease with validated assets. After Rin validates a real backup, Morgan
-  manually edits that same release to remove its prerelease designation; no new tag
-  or rebuild is needed. CI must never
-  promote automatically or downgrade a manually promoted release on rerun. Keep the
-  current `v0.1.N` tag strategy, with `N` based on master commit position, during
-  beta development and revise it deliberately when defining the first stable version.
+- After lint and tests pass on an untagged master commit, CI allocates and creates the
+  next patch tag in the `v0.1.x` beta series, beginning at `v0.1.0`, then builds the
+  Windows installer and every Linux format/architecture from that same tag. Serialize
+  release builds. Retry an actual build failure with GitHub's **Re-run failed jobs**;
+  it reuses the workflow's tag and successful platform artifacts. A rerun after success
+  must not rebuild packages or consume a version. The next master merge gets the next
+  patch version.
+- After every successful master build, publish a beta prerelease once Windows and every
+  Linux package/architecture job pass and the complete asset/checksum validation
+  succeeds. PR updates run lint and synthetic tests; package builds run only after a
+  master merge. A tag may exist without a release if a package build fails; retry only
+  an actual Windows or Linux package build failure and reuse that tag. A rerun after
+  success does not rebuild packages or consume a version. Existing release assets are
+  immutable to CI: retry publication by
+  verifying same-name assets and adding only missing files. Changing a release from
+  prerelease to stable does not control this behavior. CI never changes release status
+  or replaces existing assets. Morgan promotes the validated release manually without
+  changing its tag or assets.
 
 ## Architecture and toolchain
 
-- Python 3 with PyQt6, following StormFuse's small dark desktop UI and worker-thread
-  pattern. Keep pure collection/redaction code separate from Qt, so it runs in
-  Linux CI and can be tested with fixture trees. Use `pathlib` and separate Windows
-  and Linux path adapters; the GUI only coordinates the plan and displays results.
+- Python 3 with PyQt6, following GaleFling's dark palette and component styling plus
+  StormFuse's small desktop UI and worker-thread pattern. Use the shared GaleFling
+  color and typography tokens throughout the interface. Keep pure collection and
+  redaction code separate from Qt so it runs in Linux CI and can be tested with fixture
+  trees. Use `pathlib` and separate Windows and Linux path adapters; the GUI only
+  coordinates the plan and displays results.
 - Suggested modules: `paths` (OBS/Dropbox discovery), `inventory` (allowlist and size
   checks), `snapshot` (read-only copies and consistency), `redaction` (JSON, INI, log
   rules), `verify` (output scan and manifest), `package` (compress the verified
@@ -199,7 +389,15 @@ name or raw absolute OBS path in the manifest unless required to explain a failu
   distribution and glibc floor in release notes. The Linux
   packages must grant or request access to OBS's config tree and the chosen Dropbox
   folder; test Flatpak portals and Snap filesystem access rather than assuming sandbox
-  access. No FFmpeg dependency is needed.
+  access. Flatpak must keep the user's home read-only, grant OBS config and Dropbox
+  metadata paths read-only, and allow writes to the default `~/Dropbox` destination.
+  Relocated or custom destinations need a tested, user-approved portal grant before
+  claiming support. No FFmpeg dependency is needed.
+  Build Linux amd64 and arm64 packages on Ubuntu 24.04 with a glibc 2.39 floor for
+  DEB, RPM, and AppImage; smoke-test RPM installation on Fedora 42. Flatpak and Snap
+  use pinned runtimes. Release notes state these tested platforms and the glibc floor,
+  and identify Flatpak/Snap as sideloaded packages with no configured remote or store
+  channel. Snap users connect `tempesttrace:obs-config` with sudo for OBS access.
 - Run a Windows smoke test of the built `.exe`, including launch from Explorer and
   a synthetic OBS/Dropbox fixture. Silently install the NSIS asset in CI, smoke-test
   the installed executable, uninstall, and verify removal of installed files.
@@ -239,6 +437,11 @@ the initial baseline, and collector tests must maintain those targets.
 
 ## Delivery stages
 
+The current implementation covers the initial synthetic path discovery, allowlisted
+snapshot, redaction, ZIP and manifest workflow, and the basic desktop collection flow.
+It does not yet satisfy the complete acceptance list below. Keep this status current as
+the remaining updater and packaging stages are implemented and tested.
+
 1. **Repository foundation:** README, this design, license and contributor guidance,
    Dependabot for pip and GitHub Actions, CODEOWNERS, PR CI, branch protection,
    automatic Copilot review, and required conversation resolution. Configure
@@ -262,18 +465,15 @@ the initial baseline, and collector tests must maintain those targets.
 5. **Updates and beta channel:** write failing tests for release selection, channel
    preference, checksum validation, interrupted downloads, update rollback, and
    platform-specific application before implementing the updater and UI.
-6. **Release:** expand the current Windows-only workflow to build and smoke-test all
-   required Linux assets before adding the `build/release-ready` marker and enabling
-   publication. A final release job must depend on successful Windows and every Linux
-   package/architecture job, verify the complete asset matrix and checksums, and only
-   then create the tag and publish assets. A failed or missing package job must leave
-   no partial release. After CI passes on a master merge, derive a stable version tag
-   from that commit's first-parent position on master, create the tag in CI, and serialize
-   retries by commit SHA without replacing builds for other master commits;
-   publish the Windows NSIS setup installer and Linux assets as a
-   GitHub beta prerelease with generated notes and SHA-256 checksums. Morgan promotes
-   the validated release manually without changing its tag or assets. Never publish a
-   release from the design-only foundation or without Windows and Linux smoke tests.
+6. **Release:** build and smoke-test the Windows installer and all required Linux
+   assets after each master merge. A final release job depends on successful Windows
+   and every Linux package/architecture job, verifies the complete asset matrix and
+   checksums, then publishes the Windows NSIS setup installer and Linux assets as a
+   GitHub beta prerelease with generated notes and SHA-256 checksums. A failed or
+   missing package job leaves no partial release. Serialize builds and retry actual
+   failed jobs against the same tag without replacing existing assets. Morgan validates
+   a prerelease and promotes that same release to stable without changing its tag or
+   assets.
 
 ## Acceptance checks
 

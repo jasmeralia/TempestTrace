@@ -1,6 +1,6 @@
 PYTHON ?= python3
 
-.PHONY: deps lint lintfix test
+.PHONY: deps lint lintfix test screenshots
 
 deps:
 	$(PYTHON) -m pip install -r requirements-dev.txt
@@ -16,3 +16,6 @@ lintfix:
 
 test:
 	$(PYTHON) -m pytest tests/ --cov=src/tempesttrace --cov=scripts --cov-report=term-missing --cov-report=xml:coverage.xml --junitxml=junit.xml
+
+screenshots: deps
+	QT_QPA_PLATFORM=offscreen $(PYTHON) tools/screenshots/generate_readme_screenshots.py

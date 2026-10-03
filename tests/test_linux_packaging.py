@@ -86,3 +86,64 @@ def test_release_workflow_includes_supported_platform_notes() -> None:
         "sideloaded",
     ):
         assert note in workflow
+
+
+def test_flatpak_build_init_uses_documented_argument_order() -> None:
+    """`flatpak build-init DIRECTORY APPNAME SDK RUNTIME [BRANCH]` takes one branch, not two."""
+    script = Path("packaging/linux/build-packages.sh").read_text(encoding="utf-8")
+    start = script.index("flatpak build-init")
+    command = script[start : script.index("\n    install", start)].replace("\\\n", " ")
+    tokens = command.split()
+    positionals = [token for token in tokens[2:] if not token.startswith("--")]
+
+    assert positionals == [
+        '"$dir"',
+        "io.github.jasmeralia.TempestTrace",
+        "org.freedesktop.Sdk",
+        "org.freedesktop.Platform",
+        "26.08",
+    ]
+
+
+def test_linux_package_workflow_can_be_dispatched_for_manual_validation() -> None:
+    workflow = Path(".github/workflows/linux-packages.yml").read_text(encoding="utf-8")
+
+    assert "workflow_dispatch:" in workflow
+    assert "workflow_call:" in workflow
+
+
+def test_native_packages_declare_qt_graphics_dependencies() -> None:
+    script = Path("packaging/linux/build-packages.sh").read_text(encoding="utf-8")
+    deb_control = script.split('cat > "$root/DEBIAN/control" <<EOF', 1)[1].split("\nEOF", 1)[0]
+    rpm_spec = script.split('cat > "$top/SPECS/tempesttrace.spec" <<EOF', 1)[1].split("\nEOF", 1)[0]
+    snapcraft = script.split('cat > "$dir/snapcraft.yaml" <<EOF', 1)[1].split("\nEOF", 1)[0]
+
+    depends = next(line for line in deb_control.splitlines() if line.startswith("Depends: "))
+    for package in ("libegl1", "libgl1"):
+        assert package in depends.split(": ", 1)[1].split(", ")
+
+    requires = [line.split()[-1] for line in rpm_spec.splitlines() if line.startswith("Requires:")]
+    assert {"libglvnd-egl", "libglvnd-glx"} <= set(requires)
+
+    staged = snapcraft.split("stage-packages:", 1)[1]
+    for package in ("libegl1", "libgl1", "libfontconfig1", "libxcb-shape0"):
+        assert f"      - {package}\n" in staged + "\n"
+
+
+def test_appimage_smoke_installs_host_graphics_after_deb_smoke() -> None:
+    workflow = Path(".github/workflows/linux-packages.yml").read_text(encoding="utf-8")
+    deb_install = workflow.index('sudo apt-get install --yes --no-install-recommends "./$package"')
+    graphics_install = workflow.index("sudo apt-get install --yes libegl1 libgl1 libxcb1")
+    appimage_smoke = workflow.index(
+        'APPIMAGE_EXTRACT_AND_RUN=1 QT_QPA_PLATFORM=offscreen "$appimage"'
+    )
+
+    assert deb_install < graphics_install < appimage_smoke
+
+
+def test_flatpak_prefers_runtime_libxkbcommon_over_bundled_copy() -> None:
+    """The PyInstaller-bundled libxkbcommon segfaults in Qt's XCB key handling in the sandbox."""
+    script = Path("packaging/linux/build-packages.sh").read_text(encoding="utf-8")
+    finish = script[script.index("flatpak build-finish") : script.index("flatpak build-export")]
+
+    assert "--env=LD_PRELOAD=/usr/lib/${flatpak_arch}-linux-gnu/libxkbcommon.so.0" in finish

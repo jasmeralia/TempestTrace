@@ -7,6 +7,14 @@ on:
         description: Shared release version tag, such as v0.1.12
         required: false
         type: string
+  # Manual validation of the full Linux package matrix without merging or tagging. Leave
+  # app_version empty to build a 0.0.0+<sha> development version from the selected ref.
+  workflow_dispatch:
+    inputs:
+      app_version:
+        description: Optional release tag to build, such as v0.1.12 (empty builds the selected ref)
+        required: false
+        type: string
 permissions:
   contents: read
 
@@ -90,11 +98,19 @@ jobs:
           echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
       - name: Build Linux packages
         run: packaging/linux/build-packages.sh dist/linux
+      - name: Preserve Flatpak for manual crash investigation
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v7
+        with:
+          name: flatpak-debug-${{ matrix.arch }}
+          path: dist/linux/*.flatpak
+          if-no-files-found: error
+          retention-days: 1
       - name: Smoke-test DEB install and uninstall
         run: |
           package=$(find dist/linux -maxdepth 1 -name '*.deb' -print -quit)
           test -n "$package"
-          sudo apt-get install --yes "./$package"
+          sudo apt-get install --yes --no-install-recommends "./$package"
           QT_QPA_PLATFORM=offscreen /usr/bin/tempesttrace --smoke-test
           sudo apt-get remove --yes tempesttrace
           test ! -e /usr/bin/tempesttrace
@@ -151,7 +167,17 @@ jobs:
             local expected_archives=$1
             FLATPAK_TEST_OUTPUT="$output" FLATPAK_TEST_EXPECTED="$expected_archives" \
               xvfb-run -a bash -euc '
+                flatpak run --user --command=/bin/sh io.github.jasmeralia.TempestTrace -c '\''
+                  printf "Flatpak HOME=%s XDG_CONFIG_HOME=%s\n" "$HOME" "$XDG_CONFIG_HOME"
+                  for path in "$HOME/.config/obs-studio" \
+                    "$HOME/.var/app/com.obsproject.Studio/config/obs-studio" \
+                    "$HOME/.dropbox/info.json" "$HOME/Dropbox"; do
+                    if test -e "$path"; then echo "visible: $path"; else echo "missing: $path"; fi
+                  done
+                  test -w "$HOME/Dropbox" && echo "Dropbox writable in sandbox"
+                '\''
                 flatpak run --user --command=tempesttrace --env=QT_QPA_PLATFORM=xcb \
+                  --env=PYTHONFAULTHANDLER=1 \
                   io.github.jasmeralia.TempestTrace >"$RUNNER_TEMP/tempesttrace-flatpak.log" 2>&1 &
                 app_pid=$!
                 trap "kill \$app_pid 2>/dev/null || true" EXIT
@@ -163,14 +189,29 @@ jobs:
                 done
                 if [[ -z "$window_id" ]]; then cat "$RUNNER_TEMP/tempesttrace-flatpak.log"; exit 1; fi
                 xdotool windowfocus --sync "$window_id"
+                echo "Flatpak window $window_id; focus: $(xdotool getwindowfocus getwindowname 2>/dev/null || true)"
                 # OBS combo, OBS chooser, Dropbox chooser, then the default Create Backup button.
                 xdotool key --clearmodifiers Tab Tab Tab Return
                 for _ in $(seq 1 90); do
                   archive_count=$(find "$FLATPAK_TEST_OUTPUT" -maxdepth 1 -type f \
                     -name "TempestTrace-*.zip" ! -name "*.incomplete.zip" | wc -l)
                   [[ "$archive_count" -ge "$FLATPAK_TEST_EXPECTED" ]] && exit 0
+                  if ! kill -0 "$app_pid" 2>/dev/null; then
+                    if wait "$app_pid"; then
+                      echo "Flatpak app exited with status 0 before creating the archive"
+                    else
+                      echo "Flatpak app exited with status $? before creating the archive"
+                    fi
+                    break
+                  fi
                   sleep 1
                 done
+                echo "Flatpak backup timed out; visible windows:"
+                while read -r id; do
+                  xdotool getwindowname "$id" 2>/dev/null || true
+                done < <(xdotool search --onlyvisible --name ".*" 2>/dev/null || true)
+                echo "Dropbox output entries:"
+                find "$FLATPAK_TEST_OUTPUT" -maxdepth 1 -printf "%f %s bytes\n"
                 cat "$RUNNER_TEMP/tempesttrace-flatpak.log"
                 exit 1
               '
@@ -332,6 +373,8 @@ jobs:
           rpm -qp --info dist/linux/*.rpm
           appimage=$(find dist/linux -maxdepth 1 -name '*.AppImage' -print -quit)
           test -n "$appimage"
+          # The AppImage uses host GL/EGL/XCB libraries rather than bundling drivers.
+          sudo apt-get install --yes libegl1 libgl1 libxcb1
           APPIMAGE_EXTRACT_AND_RUN=1 QT_QPA_PLATFORM=offscreen "$appimage" --smoke-test
       - name: Create SHA-256 checksums
         run: (cd dist/linux && sha256sum -- * > SHA256SUMS)

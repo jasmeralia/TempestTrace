@@ -43,7 +43,8 @@ Section: utils
 Priority: optional
 Architecture: $arch
 Maintainer: TempestTrace contributors
-Depends: libc6 (>= 2.39), libx11-6, libxcb1, libxkbcommon-x11-0, libxcb-cursor0, libxcb-icccm4, libxcb-image0, libxcb-keysyms1, libxcb-render-util0, libxcb-xinerama0, libxcb-xkb1
+Depends: libc6 (>= 2.39), libx11-6, libxcb1, libxkbcommon-x11-0, libxcb-cursor0, libxcb-icccm4, libxcb-image0, libxcb-keysyms1, libxcb-render-util0, libxcb-xinerama0, libxcb-xkb1, libegl1, libgl1
+Recommends: libwayland-cursor0, libwayland-egl1
 Description: Safe OBS diagnostic backup utility
  Creates a redacted diagnostic archive without modifying OBS configuration.
 EOF
@@ -72,6 +73,10 @@ Requires:       xcb-util-wm
 Requires:       xcb-util-image
 Requires:       xcb-util-keysyms
 Requires:       xcb-util-renderutil
+Requires:       libglvnd-glx
+Requires:       libglvnd-egl
+Recommends:     libwayland-cursor
+Recommends:     libwayland-egl
 %description
 Creates a redacted diagnostic archive without modifying OBS configuration.
 %install
@@ -128,15 +133,17 @@ build_flatpak() {
     local dir=$work/flatpak-build
     local repo=$work/flatpak-repo
     flatpak build-init --arch="$flatpak_arch" "$dir" \
-        io.github.jasmeralia.TempestTrace org.freedesktop.Platform 26.08 \
-        org.freedesktop.Sdk 26.08
+        io.github.jasmeralia.TempestTrace org.freedesktop.Sdk org.freedesktop.Platform 26.08
     install -D -m 0755 "$app/usr/bin/tempesttrace" "$dir/files/bin/tempesttrace"
     install -D -m 0644 "$app/usr/share/applications/io.github.jasmeralia.TempestTrace.desktop" \
         "$dir/files/share/applications/io.github.jasmeralia.TempestTrace.desktop"
     install -D -m 0644 "$app/usr/share/icons/hicolor/256x256/apps/io.github.jasmeralia.TempestTrace.png" \
         "$dir/files/share/icons/hicolor/256x256/apps/io.github.jasmeralia.TempestTrace.png"
     # Keep OBS/config files read-only and limit writes to the default Dropbox destination.
+    # The PyInstaller-bundled libxkbcommon segfaults in Qt's XCB key handling; use the pinned
+    # runtime's copy for this Flatpak only.
     flatpak build-finish --command=tempesttrace --socket=wayland --socket=fallback-x11 \
+        --env=LD_PRELOAD=/usr/lib/${flatpak_arch}-linux-gnu/libxkbcommon.so.0 \
         --share=ipc --share=network --device=dri --filesystem=home:ro \
         --filesystem=xdg-config/obs-studio:ro \
         --filesystem='~/.var/app/com.obsproject.Studio/config/obs-studio:ro' \
@@ -192,6 +199,12 @@ parts:
       - libxcb-render-util0
       - libxcb-xinerama0
       - libxcb-xkb1
+      - libegl1
+      - libgl1
+      - libfontconfig1
+      - libxcb-shape0
+      - libwayland-cursor0
+      - libwayland-egl1
 EOF
     (cd "$dir" && snapcraft pack --destructive-mode --output \
         "$output_dir/TempestTrace-v${version_bare}-linux-${arch}.snap")

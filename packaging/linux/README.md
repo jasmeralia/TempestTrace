@@ -30,14 +30,33 @@ the complete package matrix and checksums, then publishes a beta prerelease.
   not connect it automatically.
 
 The binary is frozen with PyInstaller on Ubuntu 24.04, so its glibc
-floor is glibc 2.39. DEB, RPM, and AppImage builds depend on Qt platform plugins
-and system libraries supplied by the target machine; the package metadata is a
-starting point and still needs testing on each promised distribution. Fedora
-42 is the RPM install smoke-test container. Release notes identify Windows 10/11 x64,
-Ubuntu 24.04 amd64/arm64, the glibc floor for DEB/RPM/AppImage, and Fedora 42 RPM smoke
+floor is glibc 2.39. DEB and RPM declare their Qt graphics libraries as package
+dependencies, including EGL and OpenGL. Their Wayland libraries are recommended
+because the CI smoke tests use X11 and offscreen Qt. The strict Snap stages its Qt
+graphics and Wayland support libraries; its `opengl` plug grants GPU access but does
+not supply `libEGL.so.1` or `libGL.so.1` by itself. The Flatpak uses the pinned
+Freedesktop 26.08 runtime, which supplies those libraries. Fedora 42 is the RPM
+install smoke-test container. Release notes identify Windows 10/11 x64, Ubuntu
+24.04 amd64/arm64, the glibc floor for DEB/RPM/AppImage, and Fedora 42 RPM smoke
 coverage. Flatpak and Snap are sideloaded without a configured remote or store channel.
-The Flatpak and Snap assets use their core24/Freedesktop 26.08 runtimes rather than
-the host glibc.
+
+The AppImage uses graphics and display libraries from the host rather than bundling
+copies that could conflict with the host's display server or GPU driver. Install the
+following packages if they are absent (a normal desktop may already have them):
+
+| Distribution | AppImage host packages |
+| --- | --- |
+| Ubuntu 24.04 and Debian 13 | `libxcb1 libgl1 libegl1` |
+| Fedora 42 | `libxcb libglvnd-glx libglvnd-egl` |
+| Arch Linux | `libxcb libglvnd` |
+| openSUSE Tumbleweed | `libxcb1 libglvnd` |
+
+A graphical desktop session is also needed for normal use. `QT_QPA_PLATFORM=offscreen`
+is for CI smoke tests. Wayland support may need its Wayland cursor and EGL libraries
+from the distribution; those libraries are common on Wayland desktops. The AppImage
+library inventory was checked on x86_64 clean containers for these distributions;
+the CI package workflow remains the acceptance check for the release-built binary
+on both architectures.
 
 ## Access and validation limits
 

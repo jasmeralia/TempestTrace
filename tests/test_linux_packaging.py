@@ -110,3 +110,32 @@ def test_linux_package_workflow_can_be_dispatched_for_manual_validation() -> Non
 
     assert "workflow_dispatch:" in workflow
     assert "workflow_call:" in workflow
+
+
+def test_native_packages_declare_qt_graphics_dependencies() -> None:
+    script = Path("packaging/linux/build-packages.sh").read_text(encoding="utf-8")
+    deb_control = script.split('cat > "$root/DEBIAN/control" <<EOF', 1)[1].split("\nEOF", 1)[0]
+    rpm_spec = script.split('cat > "$top/SPECS/tempesttrace.spec" <<EOF', 1)[1].split("\nEOF", 1)[0]
+    snapcraft = script.split('cat > "$dir/snapcraft.yaml" <<EOF', 1)[1].split("\nEOF", 1)[0]
+
+    depends = next(line for line in deb_control.splitlines() if line.startswith("Depends: "))
+    for package in ("libegl1", "libgl1"):
+        assert package in depends.split(": ", 1)[1].split(", ")
+
+    requires = [line.split()[-1] for line in rpm_spec.splitlines() if line.startswith("Requires:")]
+    assert {"libglvnd-egl", "libglvnd-glx"} <= set(requires)
+
+    staged = snapcraft.split("stage-packages:", 1)[1]
+    for package in ("libegl1", "libgl1", "libfontconfig1", "libxcb-shape0"):
+        assert f"      - {package}\n" in staged + "\n"
+
+
+def test_appimage_smoke_installs_host_graphics_after_deb_smoke() -> None:
+    workflow = Path(".github/workflows/linux-packages.yml").read_text(encoding="utf-8")
+    deb_install = workflow.index('sudo apt-get install --yes --no-install-recommends "./$package"')
+    graphics_install = workflow.index("sudo apt-get install --yes libegl1 libgl1 libxcb1")
+    appimage_smoke = workflow.index(
+        'APPIMAGE_EXTRACT_AND_RUN=1 QT_QPA_PLATFORM=offscreen "$appimage"'
+    )
+
+    assert deb_install < graphics_install < appimage_smoke

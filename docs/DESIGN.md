@@ -2,9 +2,8 @@
 
 Status: implementation in progress. The path adapters, collector, redaction, PyQt
 window, verified updater, Linux package definitions, and cross-platform CI workflows
-are implemented with synthetic fixtures. The full package workflows have not yet run
-in GitHub Actions. Each successful master build will publish a beta prerelease after
-the Windows and Linux CI package builds and smoke tests pass; hands-on installation,
+are implemented with synthetic fixtures. CI publishes a beta prerelease only after
+the Windows and Linux package builds and smoke tests pass; hands-on installation,
 collection, update, sandbox, and streaming checks validate that beta before Morgan
 promotes it to stable.
 Source task: Odoo project.task 583,
@@ -108,7 +107,7 @@ diagnostic line. Maintain a versioned field/path rule list and fixtures taken fr
 synthetic OBS data; never commit Rin's real configuration or log samples.
 For cross-file literal scans, first redact every collected file and gather eligible
 credential literals, then scrub and verify every staged file before promotion. The
-redaction rules are versioned (currently version 25). Free-text assignments, URL query
+redaction rules are versioned (currently version 26). Free-text assignments, URL query
 and fragment values, CLI arguments, and next-line credentials are promoted only when
 they look like key material (at least eight characters and containing a digit or
 non-letter). Authorization and Proxy-Authorization credential tokens after a

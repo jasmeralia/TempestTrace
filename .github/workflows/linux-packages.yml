@@ -102,7 +102,7 @@ jobs:
         run: |
           package=$(find dist/linux -maxdepth 1 -name '*.deb' -print -quit)
           test -n "$package"
-          sudo apt-get install --yes "./$package"
+          sudo apt-get install --yes --no-install-recommends "./$package"
           QT_QPA_PLATFORM=offscreen /usr/bin/tempesttrace --smoke-test
           sudo apt-get remove --yes tempesttrace
           test ! -e /usr/bin/tempesttrace
@@ -340,6 +340,8 @@ jobs:
           rpm -qp --info dist/linux/*.rpm
           appimage=$(find dist/linux -maxdepth 1 -name '*.AppImage' -print -quit)
           test -n "$appimage"
+          # The AppImage uses host GL/EGL/XCB libraries rather than bundling drivers.
+          sudo apt-get install --yes libegl1 libgl1 libxcb1
           APPIMAGE_EXTRACT_AND_RUN=1 QT_QPA_PLATFORM=offscreen "$appimage" --smoke-test
       - name: Create SHA-256 checksums
         run: (cd dist/linux && sha256sum -- * > SHA256SUMS)

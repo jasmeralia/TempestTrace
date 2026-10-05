@@ -264,15 +264,15 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: refs/tags/${{ needs.resolve-release.outputs.tag_name }}
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: windows-installer
           path: release-assets/windows
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: linux-packages-amd64
           path: release-assets/linux-amd64
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: linux-packages-arm64
           path: release-assets/linux-arm64

@@ -10,7 +10,7 @@ requires-python = ">=3.14"
 license = "GPL-3.0-or-later"
 authors = [{name = "Morgan Blackthorne", email = "morgan@windsofstorm.net"}]
 # PyQt 6.12.0 ships QtGui stubs with invalid positional-only parameter order.
-dependencies = ["PyQt6>=6.6,<6.12"]
+dependencies = ["PyQt6>=6.6,<6.13"]
 
 [project.scripts]
 tempesttrace = "tempesttrace.ui:main"
